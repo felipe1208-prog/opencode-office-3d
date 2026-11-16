@@ -58,6 +58,7 @@ import {
   OPENCODE_CLI_COMMANDS,
   buildOpenCodeSetupReport,
 } from "./opencode/openCodeTemplates";
+import { renderSafeMarkdown } from "./utils/safeMarkdown";
 
 const canvasRef = ref(null);
 const loadProgress = ref(0);
@@ -1917,8 +1918,16 @@ onBeforeUnmount(() => {
                       {{ entry.content.length }} chars
                     </span>
                   </summary>
-                  <div class="px-3 pb-2.5 pt-2 text-[11px] text-[#D1D5DB] whitespace-pre-wrap leading-relaxed border-t border-white/[0.06] max-h-48 overflow-y-auto select-text">
-                    {{ entry.content || "Analizando problema..." }}
+                  <div
+                    v-if="entry.content"
+                    v-html="renderSafeMarkdown(entry.content)"
+                    class="px-3 pb-2.5 pt-2 text-[11px] text-[#D1D5DB] space-y-1.5 border-t border-white/[0.06] max-h-48 overflow-y-auto select-text"
+                  ></div>
+                  <div
+                    v-else
+                    class="px-3 pb-2.5 pt-2 text-[11px] text-[#9CA3AF] leading-relaxed border-t border-white/[0.06] select-text"
+                  >
+                    Analizando problema...
                   </div>
                 </details>
 
@@ -1978,8 +1987,16 @@ onBeforeUnmount(() => {
                       {{ entry.status === "running" ? "Escribiendo..." : "Respuesta" }}
                     </span>
                   </div>
-                  <div class="text-xs text-[#F3F4F6] whitespace-pre-wrap leading-relaxed select-text">
-                    {{ entry.content }}
+                  <div
+                    v-if="entry.content"
+                    v-html="renderSafeMarkdown(entry.content)"
+                    class="text-xs text-[#F3F4F6] space-y-1.5 select-text"
+                  ></div>
+                  <div
+                    v-else
+                    class="text-xs text-[#9CA3AF] leading-relaxed select-text"
+                  >
+                    Escribiendo respuesta...
                   </div>
                 </div>
 

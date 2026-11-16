@@ -39,6 +39,7 @@ const TOOL_LABELS_ES = {
   list: "Listando directorio",
   ls: "Listando directorio",
   task: "Delegando subtarea",
+  subagent: "Delegando subtarea",
   question: "Esperando respuesta en CLI",
   webfetch: "Consultando docs",
   fetch: "Consultando docs",
@@ -106,6 +107,20 @@ function formatToolTarget(input = {}) {
     return input.description.trim().slice(0, 40);
   }
   return null;
+}
+
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function hasWordToken(normalizedText, token) {
+  if (!normalizedText || !token) return false;
+  const rx = new RegExp(`(^|[^a-z0-9])${escapeRegExp(token)}([^a-z0-9]|$)`);
+  return rx.test(normalizedText);
+}
+
+function isDelegationToolName(toolName) {
+  return toolName === "task" || toolName === "subagent";
 }
 
 export class OpenCodeBridgeClient {
@@ -552,12 +567,52 @@ export class OpenCodeBridgeClient {
     for (const [agentId, aliasList] of Object.entries(this.config.aliases)) {
       for (const alias of aliasList) {
         const cleanAlias = normalizeToken(alias);
-        if (cleanAlias.length >= 2 && normalized.includes(cleanAlias)) {
+        if (cleanAlias.length >= 2 && hasWordToken(normalized, cleanAlias)) {
           return agentId;
         }
       }
     }
 
+    return null;
+  }
+
+  _inferSubagentFromText(rawText) {
+    if (!rawText || typeof rawText !== "string") return null;
+    const direct = this.resolveAgentId(rawText);
+    if (direct) return direct;
+
+    const text = rawText.trim();
+    if (
+      /\.(tsx|jsx|vue|svelte|css|scss|html)\b/i.test(text) ||
+      /\buse[A-Z][A-Za-z0-9]*\.(ts|js|tsx|jsx)\b/.test(text) ||
+      /\b(react|component|componentes?|vista|estilos?|webgl|three\.?js|tailwind|hook|hud)\b/i.test(
+        text,
+      )
+    ) {
+      return "frontend";
+    }
+    if (
+      /\.(spec|test)\.[tj]sx?\b/i.test(text) ||
+      /\b(playwright|vitest|jest|cypress|pruebas?|tests?|auditor[ií]a|qa)\b/i.test(
+        text,
+      )
+    ) {
+      return "qa";
+    }
+    if (
+      /\.(cs|csproj|py|go|rs|java|rb|php|sql)\b/i.test(text) ||
+      /\b(Program\.cs|Startup\.cs|controller|middleware|endpoint|database|base de datos|migration|backend|servidor)\b/i.test(
+        text,
+      )
+    ) {
+      return "backend";
+    }
+    if (
+      /\.(sh|bash|ps1|dockerfile|ya?ml|toml)\b/i.test(text) ||
+      /\b(docker|ci\/cd|deploy|script|cli|systemd|nginx|infra)\b/i.test(text)
+    ) {
+      return "systems";
+    }
     return null;
   }
 
@@ -778,29 +833,45 @@ export class OpenCodeBridgeClient {
     const callKey = part?.callID || part?.id || props?.id || null;
     const toolName = String(part?.tool || props?.name || "").toLowerCase();
 
-    // Nivel 1: part.agent o argumento subagent_type dentro de tool === "task"
+    // Nivel 1: part.agent o argumento dentro de herramientas de delegación (task / subagent)
     const partInput = part?.state?.input || part?.input || props?.input || {};
     const partMeta = part?.state?.metadata || part?.metadata || props?.metadata || {};
+    const isDelegation = isDelegationToolName(toolName);
     const tier1Candidate =
       part?.agent ||
-      (toolName === "task"
-        ? partInput.subagent_type || partInput.agent || partMeta.agent
+      (isDelegation
+        ? partInput.subagent_type ||
+          partInput.agent ||
+          partInput.target ||
+          partInput.delegate ||
+          partMeta.agent
         : null);
 
-    const tier1Resolved = this.resolveAgentId(tier1Candidate);
+    const tier1Resolved =
+      this.resolveAgentId(tier1Candidate) ||
+      (isDelegation
+        ? this._inferSubagentFromText(
+            partInput.description ||
+              partInput.title ||
+              partInput.prompt ||
+              partInput.task ||
+              partMeta.title ||
+              "",
+          )
+        : null);
     if (tier1Resolved) {
       if (callKey) this.taskCallsByPartId.set(callKey, tier1Resolved);
       if (partMeta.sessionId) {
         this.taskCallsByChildSession.set(partMeta.sessionId, tier1Resolved);
         this.sessionAgentMap.set(partMeta.sessionId, tier1Resolved);
       }
-      if (sessionId && part?.agent && toolName !== "task") {
+      if (sessionId && part?.agent && !isDelegation) {
         this.sessionAgentMap.set(sessionId, part.agent);
       }
       return tier1Resolved;
     }
 
-    // Si pertenece a un callID previo de tool="task"
+    // Si pertenece a un callID previo de tool="task" o "subagent"
     const knownPartAgent = callKey ? this.taskCallsByPartId.get(callKey) || null : null;
     if (knownPartAgent) return knownPartAgent;
 
@@ -898,7 +969,8 @@ export class OpenCodeBridgeClient {
     // Si es sesión hija, cachear si el título o agent ya identifica un subagente
     if (parentID) {
       const resolvedChild =
-        this.resolveAgentId(agentHint) || this.resolveAgentId(title);
+        this.resolveAgentId(agentHint) ||
+        this._inferSubagentFromText(title);
       if (resolvedChild) {
         this.taskCallsByChildSession.set(sessionObj.id, resolvedChild);
       }
@@ -988,11 +1060,12 @@ export class OpenCodeBridgeClient {
         eventType === "session.tool.error" ||
         eventType === "session.tool.failed";
 
+      const isDelegation = isDelegationToolName(toolName);
       const agentId = this._resolveEventAgentId(eventType, props);
       if (!agentId) return null;
 
       let parentAgentForTask = null;
-      if (toolName === "task") {
+      if (isDelegation) {
         parentAgentForTask =
           this.resolveAgentId(this.sessionAgentMap.get(sessionId)) ||
           this.resolveAgentId(this.sessionsById.get(sessionId)?.agent) ||
@@ -1003,7 +1076,7 @@ export class OpenCodeBridgeClient {
         if (parentAgentForTask && parentAgentForTask !== agentId) {
           const coordLabel = `Coordinando @${agentId}`;
           const topic = file || input.description || `Subtarea @${agentId}`;
-          if (!isFinished && !isError) {
+          if (!isError) {
             this._emitDelegationEvent({
               sessionId,
               hostAgentId: parentAgentForTask,
@@ -1024,7 +1097,7 @@ export class OpenCodeBridgeClient {
             phase: "working",
             label: coordLabel,
             file,
-            delegationEvent: !isFinished && !isError,
+            delegationEvent: !isError,
           });
         }
       } else if (sessionId) {
@@ -1032,14 +1105,14 @@ export class OpenCodeBridgeClient {
       }
 
       const logTarget =
-        toolName === "task" && parentAgentForTask && parentAgentForTask !== agentId
+        isDelegation && parentAgentForTask && parentAgentForTask !== agentId
           ? `@${agentId}${file ? ` · ${file}` : ""}`
           : file || (typeof input.description === "string" ? input.description.slice(0, 40) : null);
 
       this._upsertToolLogEntry(sessionId || this.activeSessionId, {
         callKey,
         agentId:
-          toolName === "task" && parentAgentForTask ? parentAgentForTask : agentId,
+          isDelegation && parentAgentForTask ? parentAgentForTask : agentId,
         toolName,
         target: logTarget,
         status: isError ? "error" : isFinished ? "done" : "running",
@@ -1092,6 +1165,26 @@ export class OpenCodeBridgeClient {
         return agentId;
       }
 
+      if (isFinished && isDelegation && parentAgentForTask !== agentId) {
+        this._emitLiveKanbanSync({
+          sessionId,
+          agentId,
+          status: "done",
+          title: "Subtarea completada",
+          file,
+        });
+        this._queueAgentTask(
+          agentId,
+          {
+            status: "passed",
+            label: "Subtarea completada",
+            file,
+          },
+          { immediate: true },
+        );
+        return agentId;
+      }
+
       const baseLabel = TOOL_LABELS_ES[toolName] || `Tool: ${toolName}`;
       const label = isFinished ? `${baseLabel} ✓` : baseLabel;
 
@@ -1108,7 +1201,7 @@ export class OpenCodeBridgeClient {
         label,
         file,
         delegationEvent:
-          toolName === "task" &&
+          isDelegation &&
           Boolean(parentAgentForTask && parentAgentForTask !== agentId && !isFinished),
       });
       return agentId;
@@ -1469,9 +1562,10 @@ export class OpenCodeBridgeClient {
         const isDone = stateStatus === "completed";
         const isErr = stateStatus === "error";
 
+        const isDelegation = isDelegationToolName(toolName);
         let parentAgent = null;
-        // Si tool="task" delega a un subagente, también notificar al agente primario
-        if (toolName === "task") {
+        // Si tool="task" o "subagent" delega a un subagente, notificar también al agente primario
+        if (isDelegation) {
           parentAgent =
             this.resolveAgentId(
               this.sessionAgentMap.get(part.sessionID) ||
@@ -1480,7 +1574,7 @@ export class OpenCodeBridgeClient {
           if (parentAgent && parentAgent !== agentId) {
             const coordLabel = `Coordinando @${agentId}`;
             const topic = file || input.description || `Subtarea @${agentId}`;
-            if (!isDone && !isErr) {
+            if (!isErr) {
               this._emitDelegationEvent({
                 sessionId: part.sessionID || sessionId,
                 hostAgentId: parentAgent,
@@ -1501,7 +1595,7 @@ export class OpenCodeBridgeClient {
               phase: "working",
               label: coordLabel,
               file,
-              delegationEvent: !isDone && !isErr,
+              delegationEvent: !isErr,
             });
           }
         } else if (sessionId) {
@@ -1509,13 +1603,13 @@ export class OpenCodeBridgeClient {
         }
 
         const logTarget =
-          toolName === "task" && parentAgent && parentAgent !== agentId
+          isDelegation && parentAgent && parentAgent !== agentId
             ? `@${agentId}${file ? ` · ${file}` : ""}`
             : file || (typeof input.description === "string" ? input.description.slice(0, 40) : null);
 
         this._upsertToolLogEntry(part.sessionID || sessionId || this.activeSessionId, {
           callKey,
-          agentId: toolName === "task" && parentAgent ? parentAgent : agentId,
+          agentId: isDelegation && parentAgent ? parentAgent : agentId,
           toolName,
           target: logTarget,
           status: isErr ? "error" : isDone ? "done" : "running",
@@ -1558,7 +1652,7 @@ export class OpenCodeBridgeClient {
             },
             { immediate: true },
           );
-        } else if (stateStatus === "completed" && toolName === "task") {
+        } else if (stateStatus === "completed" && isDelegation) {
           this._emitLiveKanbanSync({
             sessionId,
             agentId,
@@ -1590,7 +1684,7 @@ export class OpenCodeBridgeClient {
             label,
             file,
             delegationEvent:
-              toolName === "task" && Boolean(parentAgent && parentAgent !== agentId && !isDone),
+              isDelegation && Boolean(parentAgent && parentAgent !== agentId && !isDone),
           });
         }
         return agentId;
