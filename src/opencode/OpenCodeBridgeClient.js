@@ -1491,18 +1491,112 @@ export class OpenCodeBridgeClient {
     });
   }
 
+  _resolveSchemaRef(spec, schema, seen = new Set()) {
+    if (!schema || typeof schema !== "object") return null;
+    if (schema.$ref && typeof schema.$ref === "string") {
+      if (seen.has(schema.$ref)) return null;
+      seen.add(schema.$ref);
+      const match = schema.$ref.match(/^#\/components\/schemas\/(.+)$/);
+      if (match && spec?.components?.schemas?.[match[1]]) {
+        return this._resolveSchemaRef(spec, spec.components.schemas[match[1]], seen);
+      }
+    }
+    if (Array.isArray(schema.allOf)) {
+      const mergedProps = {};
+      const mergedReq = [];
+      for (const item of schema.allOf) {
+        const resolved = this._resolveSchemaRef(spec, item, seen);
+        if (resolved?.properties) Object.assign(mergedProps, resolved.properties);
+        if (Array.isArray(resolved?.required)) mergedReq.push(...resolved.required);
+      }
+      return { type: "object", properties: mergedProps, required: mergedReq };
+    }
+    if (Array.isArray(schema.anyOf) || Array.isArray(schema.oneOf)) {
+      const variants = schema.anyOf || schema.oneOf;
+      for (const v of variants) {
+        const resolved = this._resolveSchemaRef(spec, v, seen);
+        if (resolved?.properties) return resolved;
+      }
+    }
+    return schema;
+  }
+
+  _extractBodySchemaInfo(spec, operation) {
+    const rawBody = operation?.requestBody;
+    if (!rawBody) return null;
+    const rawSchema =
+      rawBody?.content?.["application/json"]?.schema ||
+      rawBody?.content?.["*/*"]?.schema ||
+      null;
+    const resolved = this._resolveSchemaRef(spec, rawSchema);
+    if (!resolved || typeof resolved !== "object") return { hasBody: true, props: [] };
+    const props = resolved.properties ? Object.keys(resolved.properties) : [];
+    const required = Array.isArray(resolved.required) ? resolved.required : [];
+    return { hasBody: true, props, required };
+  }
+
+  async _extractHttpError(resp, fallbackText) {
+    try {
+      const text = await resp.text();
+      if (!text) return fallbackText;
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        return `${fallbackText}: ${text.trim().slice(0, 140)}`;
+      }
+      if (!parsed || typeof parsed !== "object") return fallbackText;
+
+      const issueList =
+        parsed.issues ||
+        parsed.errors ||
+        parsed.error?.issues ||
+        parsed.error?.errors ||
+        null;
+      if (Array.isArray(issueList) && issueList.length > 0) {
+        const summary = issueList
+          .slice(0, 2)
+          .map((i) => {
+            const field = Array.isArray(i?.path) ? i.path.join(".") : i?.path || "";
+            const msg = i?.message || i?.code || "inválido";
+            return field ? `${field}: ${msg}` : msg;
+          })
+          .join("; ");
+        return `${fallbackText} (${summary.slice(0, 140)})`;
+      }
+
+      const detail =
+        (typeof parsed.error === "string" && parsed.error) ||
+        parsed.error?.data?.message ||
+        parsed.error?.message ||
+        parsed.data?.message ||
+        (typeof parsed.message === "string" && parsed.message) ||
+        (typeof parsed.detail === "string" && parsed.detail) ||
+        null;
+      if (detail) {
+        return `${fallbackText}: ${String(detail).slice(0, 140)}`;
+      }
+      return `${fallbackText}: ${text.trim().slice(0, 140)}`;
+    } catch {
+      return fallbackText;
+    }
+  }
+
   async _discoverOpenApiCapabilities(baseUrl = this.getActiveBaseUrl(), signal) {
     const defaults = {
       discoveredFrom: "defaults",
+      createSessionProps: ["title"],
       promptPaths: [
         `${this.apiPrefix}/session/{sessionID}/prompt`,
         `${this.apiPrefix}/session/{sessionID}/prompt_async`,
         `${this.apiPrefix}/session/{sessionID}/message`,
       ],
+      promptBodySchemas: {},
       interruptPaths: [
         `${this.apiPrefix}/session/{sessionID}/interrupt`,
         `${this.apiPrefix}/session/{sessionID}/abort`,
       ],
+      interruptBodyInfo: {},
       permissionListPaths: [
         `${this.apiPrefix}/session/{sessionID}/permission`,
         `${this.apiPrefix}/permission`,
@@ -1512,6 +1606,7 @@ export class OpenCodeBridgeClient {
         `${this.apiPrefix}/permission/{requestID}/reply`,
         `${this.apiPrefix}/session/{sessionID}/permissions/{requestID}`,
       ],
+      permissionReplySchemas: {},
       formListPaths: [`${this.apiPrefix}/session/{sessionID}/form`],
     };
 
@@ -1537,24 +1632,37 @@ export class OpenCodeBridgeClient {
       }
 
       const promptFound = [];
+      const promptBodySchemas = {};
       const interruptFound = [];
+      const interruptBodyInfo = {};
       const permListFound = [];
       const permReplyFound = [];
+      const permissionReplySchemas = {};
       const formListFound = [];
+      let createSessionProps = defaults.createSessionProps;
 
       for (const [rawPath, methods] of Object.entries(paths)) {
         if (!methods || typeof methods !== "object") continue;
         const norm = this._normalizeDiscoveredPath(rawPath);
         if (methods.post) {
-          if (/\/session\/\{[^}]+\}\/(prompt|prompt_async|message)$/i.test(rawPath)) {
+          if (/^(\/api)?\/session$/i.test(rawPath)) {
+            const info = this._extractBodySchemaInfo(spec, methods.post);
+            if (info?.props?.length) createSessionProps = info.props;
+          } else if (/\/session\/\{[^}]+\}\/(prompt|prompt_async|message)$/i.test(rawPath)) {
             promptFound.push(norm);
+            const info = this._extractBodySchemaInfo(spec, methods.post);
+            if (info) promptBodySchemas[norm] = info;
           } else if (/\/session\/\{[^}]+\}\/(interrupt|abort)$/i.test(rawPath)) {
             interruptFound.push(norm);
+            const info = this._extractBodySchemaInfo(spec, methods.post);
+            interruptBodyInfo[norm] = Boolean(info?.hasBody);
           } else if (
             /\/permission\/\{[^}]+\}\/reply$/i.test(rawPath) ||
             /\/session\/\{[^}]+\}\/permissions\/\{[^}]+\}$/i.test(rawPath)
           ) {
             permReplyFound.push(norm);
+            const info = this._extractBodySchemaInfo(spec, methods.post);
+            if (info) permissionReplySchemas[norm] = info;
           }
         }
         if (methods.get) {
@@ -1596,10 +1704,14 @@ export class OpenCodeBridgeClient {
 
       this.capabilities = {
         discoveredFrom: "openapi.json",
+        createSessionProps,
         promptPaths: dedup(promptFound, defaults.promptPaths),
+        promptBodySchemas,
         interruptPaths: dedup(interruptFound, defaults.interruptPaths),
+        interruptBodyInfo,
         permissionListPaths: dedup(permListFound, defaults.permissionListPaths),
         permissionReplyPaths: dedup(permReplyFound, defaults.permissionReplyPaths),
+        permissionReplySchemas,
         formListPaths: dedup(formListFound, defaults.formListPaths),
       };
       return this.capabilities;
@@ -1650,40 +1762,114 @@ export class OpenCodeBridgeClient {
 
   async createSession({ title = "", agent = "architect" } = {}) {
     const baseUrl = this.getActiveBaseUrl();
-    const body = {};
-    if (title && String(title).trim()) body.title = String(title).trim().slice(0, 64);
-    if (agent) body.agent = agent;
+    const caps =
+      this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
+    const allowed = new Set(caps.createSessionProps || ["title"]);
 
-    const resp = await fetch(`${baseUrl}${this.apiPrefix}/session`, {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        ...this._buildAuthHeaders(),
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(6000),
-    });
-
-    const ct = (resp.headers.get("content-type") || "").toLowerCase();
-    if (!resp.ok) {
-      throw new Error(
-        resp.status === 401
-          ? "Autenticación requerida (401)"
-          : `Error HTTP ${resp.status} creando sesión`,
-      );
+    const primaryBody = {};
+    if (title && String(title).trim() && (allowed.has("title") || allowed.size === 0)) {
+      primaryBody.title = String(title).trim().slice(0, 64);
     }
-    if (!ct.includes("application/json")) {
-      throw new Error("OpenCode devolvió HTML en lugar de JSON al crear sesión");
+    if (agent && allowed.has("agent")) {
+      primaryBody.agent = agent;
     }
 
-    const session = await resp.json();
-    if (session?.id) {
-      this._upsertSessionRecord({ ...session, agent: session.agent || agent });
-      this.activeSessionId = session.id;
-      this._emitConnectionState();
+    const candidates =
+      Object.keys(primaryBody).length > 0 ? [primaryBody, {}] : [{}];
+
+    let lastErr = "No se pudo crear la sesión";
+    for (const payload of candidates) {
+      const resp = await fetch(`${baseUrl}${this.apiPrefix}/session`, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          ...this._buildAuthHeaders(),
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(6000),
+      });
+
+      if (resp.status === 400 || resp.status === 422) {
+        lastErr = await this._extractHttpError(
+          resp,
+          `HTTP ${resp.status} creando sesión`,
+        );
+        continue;
+      }
+
+      const ct = (resp.headers.get("content-type") || "").toLowerCase();
+      if (!resp.ok) {
+        throw new Error(
+          resp.status === 401
+            ? "Autenticación requerida (401)"
+            : await this._extractHttpError(resp, `Error HTTP ${resp.status} creando sesión`),
+        );
+      }
+      if (!ct.includes("application/json")) {
+        throw new Error("OpenCode devolvió HTML en lugar de JSON al crear sesión");
+      }
+
+      const session = await resp.json();
+      if (session?.id) {
+        if (agent) this.sessionAgentMap.set(session.id, agent);
+        this._upsertSessionRecord({ ...session, agent: session.agent || agent });
+        this.activeSessionId = session.id;
+        this._emitConnectionState();
+      }
+      return session;
     }
-    return session;
+
+    throw new Error(lastErr);
+  }
+
+  _buildPromptPayloads(template, cleanText, agent, caps) {
+    const schema = caps?.promptBodySchemas?.[template];
+    const props = schema?.props || [];
+    const hasText = props.includes("text");
+    const hasParts = props.includes("parts");
+    const hasMessage = props.includes("message");
+    const hasContent = props.includes("content");
+    const allowsAgent = props.length === 0 || props.includes("agent");
+
+    const candidates = [];
+    const pushUnique = (obj) => {
+      const key = JSON.stringify(obj);
+      if (!candidates.some((c) => JSON.stringify(c) === key)) {
+        candidates.push(obj);
+      }
+    };
+
+    const partsBody = { parts: [{ type: "text", text: cleanText }] };
+    const textBody = { text: cleanText };
+
+    if (hasText && !hasParts) {
+      if (agent && allowsAgent) pushUnique({ agent, ...textBody });
+      pushUnique(textBody);
+      if (agent) pushUnique({ agent, ...partsBody });
+      pushUnique(partsBody);
+    } else if (hasParts && !hasText) {
+      if (agent && allowsAgent) pushUnique({ agent, ...partsBody });
+      pushUnique(partsBody);
+      if (agent) pushUnique({ agent, ...textBody });
+      pushUnique(textBody);
+    } else {
+      if (agent && allowsAgent) pushUnique({ agent, ...partsBody });
+      if (agent && allowsAgent) pushUnique({ agent, ...textBody });
+      pushUnique(partsBody);
+      pushUnique(textBody);
+    }
+
+    if (hasMessage) {
+      if (agent && allowsAgent) pushUnique({ agent, message: cleanText });
+      pushUnique({ message: cleanText });
+    }
+    if (hasContent) {
+      if (agent && allowsAgent) pushUnique({ agent, content: cleanText });
+      pushUnique({ content: cleanText });
+    }
+
+    return candidates;
   }
 
   async sendPrompt({ sessionId = null, agent = "architect", text = "" } = {}) {
@@ -1719,11 +1905,6 @@ export class OpenCodeBridgeClient {
       });
     }
 
-    const body = {
-      ...(agent ? { agent } : {}),
-      parts: [{ type: "text", text: cleanText }],
-    };
-
     const controller = new AbortController();
     this.promptAbortControllers.add(controller);
 
@@ -1733,33 +1914,108 @@ export class OpenCodeBridgeClient {
       ...this._buildAuthHeaders(),
     };
 
+    let lastHttpError = null;
+
     try {
       for (const template of caps.promptPaths) {
         const path = this._fillEndpointTemplate(template, {
           sessionID: targetSessionId,
         });
+        const payloadCandidates = this._buildPromptPayloads(
+          template,
+          cleanText,
+          agent,
+          caps,
+        );
 
-        const fetchPromise = fetch(`${baseUrl}${path}`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
+        for (const body of payloadCandidates) {
+          const fetchPromise = fetch(`${baseUrl}${path}`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
 
-        // Si el endpoint /prompt mantiene la petición abierta durante el turno,
-        // no bloqueamos la UI: esperamos hasta 1500ms por errores tempranos (404/401/400)
-        // o respuesta inmediata, y si sigue abierto confirmamos el envío en curso.
-        const raceOutcome = await Promise.race([
-          fetchPromise
-            .then((resp) => ({ settled: true, resp }))
-            .catch((err) => ({ settled: true, err })),
-          new Promise((resolve) =>
-            setTimeout(() => resolve({ settled: false }), 1500),
-          ),
-        ]);
+          // Si el endpoint /prompt mantiene la petición abierta durante el turno,
+          // no bloqueamos la UI: esperamos hasta 1500ms por errores tempranos (404/401/400)
+          // o respuesta inmediata, y si sigue abierto confirmamos el envío en curso.
+          const raceOutcome = await Promise.race([
+            fetchPromise
+              .then((resp) => ({ settled: true, resp }))
+              .catch((err) => ({ settled: true, err })),
+            new Promise((resolve) =>
+              setTimeout(() => resolve({ settled: false }), 1500),
+            ),
+          ]);
 
-        if (!raceOutcome.settled) {
-          this.busySessions.set(targetSessionId, agent || "architect");
+          if (!raceOutcome.settled) {
+            this.busySessions.set(targetSessionId, agent || "architect");
+            this._emitLiveKanbanSync({
+              sessionId: targetSessionId,
+              agentId: this.resolveAgentId(agent) || "architect",
+              status: "in_progress",
+              title: cleanText.slice(0, 48),
+            });
+            this._queueAgentTask(this.resolveAgentId(agent) || "architect", {
+              status: "started",
+              label: "Procesando prompt",
+              file: null,
+            });
+            fetchPromise
+              .catch((lateErr) => {
+                if (lateErr?.name !== "AbortError") {
+                  this.lastError = lateErr?.message || "Error en prompt OpenCode";
+                  this._emitConnectionState();
+                }
+              })
+              .finally(() => {
+                this.promptAbortControllers.delete(controller);
+              });
+            return {
+              ok: true,
+              pending: true,
+              sessionId: targetSessionId,
+              endpoint: path,
+            };
+          }
+
+          if (raceOutcome.err) {
+            if (raceOutcome.err?.name === "AbortError") {
+              return { ok: false, aborted: true, error: "Envío cancelado" };
+            }
+            throw raceOutcome.err;
+          }
+
+          const resp = raceOutcome.resp;
+          if (resp.status === 404 || resp.status === 405) {
+            break;
+          }
+          const ct = (resp.headers.get("content-type") || "").toLowerCase();
+          if (ct.includes("text/html")) {
+            break;
+          }
+          if (resp.status === 400 || resp.status === 422) {
+            lastHttpError = await this._extractHttpError(
+              resp,
+              `HTTP ${resp.status} en ${path}`,
+            );
+            continue;
+          }
+          if (!resp.ok) {
+            return {
+              ok: false,
+              status: resp.status,
+              error:
+                resp.status === 401
+                  ? "Credenciales Basic Auth inválidas (401)"
+                  : await this._extractHttpError(resp, `HTTP ${resp.status} en ${path}`),
+            };
+          }
+
+          this.busySessions.set(
+            targetSessionId,
+            this.resolveAgentId(agent) || "architect",
+          );
           this._emitLiveKanbanSync({
             sessionId: targetSessionId,
             agentId: this.resolveAgentId(agent) || "architect",
@@ -1768,77 +2024,18 @@ export class OpenCodeBridgeClient {
           });
           this._queueAgentTask(this.resolveAgentId(agent) || "architect", {
             status: "started",
-            label: "Procesando prompt",
+            label: "Prompt recibido",
             file: null,
           });
-          fetchPromise
-            .catch((lateErr) => {
-              if (lateErr?.name !== "AbortError") {
-                this.lastError = lateErr?.message || "Error en prompt OpenCode";
-                this._emitConnectionState();
-              }
-            })
-            .finally(() => {
-              this.promptAbortControllers.delete(controller);
-            });
-          return {
-            ok: true,
-            pending: true,
-            sessionId: targetSessionId,
-            endpoint: path,
-          };
+          return { ok: true, sessionId: targetSessionId, endpoint: path };
         }
-
-        if (raceOutcome.err) {
-          if (raceOutcome.err?.name === "AbortError") {
-            return { ok: false, aborted: true, error: "Envío cancelado" };
-          }
-          throw raceOutcome.err;
-        }
-
-        const resp = raceOutcome.resp;
-        if (resp.status === 404 || resp.status === 405) {
-          continue;
-        }
-        const ct = (resp.headers.get("content-type") || "").toLowerCase();
-        if (ct.includes("text/html")) {
-          continue;
-        }
-        if (!resp.ok) {
-          const errJson = await resp.json().catch(() => null);
-          return {
-            ok: false,
-            status: resp.status,
-            error:
-              errJson?.error ||
-              errJson?.message ||
-              (resp.status === 401
-                ? "Credenciales Basic Auth inválidas (401)"
-                : `HTTP ${resp.status} en ${path}`),
-          };
-        }
-
-        this.busySessions.set(
-          targetSessionId,
-          this.resolveAgentId(agent) || "architect",
-        );
-        this._emitLiveKanbanSync({
-          sessionId: targetSessionId,
-          agentId: this.resolveAgentId(agent) || "architect",
-          status: "in_progress",
-          title: cleanText.slice(0, 48),
-        });
-        this._queueAgentTask(this.resolveAgentId(agent) || "architect", {
-          status: "started",
-          label: "Prompt recibido",
-          file: null,
-        });
-        return { ok: true, sessionId: targetSessionId, endpoint: path };
       }
 
       return {
         ok: false,
-        error: "No se encontró un endpoint compatible (/prompt o /message)",
+        error:
+          lastHttpError ||
+          "No se encontró un endpoint compatible (/prompt o /message)",
       };
     } catch (err) {
       return {
@@ -1865,47 +2062,70 @@ export class OpenCodeBridgeClient {
       this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
     const headers = {
       Accept: "application/json",
-      "Content-Type": "application/json",
       ...this._buildAuthHeaders(),
     };
+
+    let lastHttpError = null;
 
     for (const template of caps.interruptPaths) {
       const path = this._fillEndpointTemplate(template, {
         sessionID: sessionId,
       });
-      try {
-        const resp = await fetch(`${baseUrl}${path}`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({}),
-          signal: AbortSignal.timeout(4000),
-        });
-        const ct = (resp.headers.get("content-type") || "").toLowerCase();
-        if (resp.status === 404 || resp.status === 405 || ct.includes("text/html")) {
-          continue;
-        }
-        if (!resp.ok) {
-          return { ok: false, error: `HTTP ${resp.status} al detener sesión` };
-        }
-        const agentId =
-          this.busySessions.get(sessionId) ||
-          this.resolveAgentId(this.sessionAgentMap.get(sessionId)) ||
-          "architect";
-        this._releaseSessionNow(sessionId, agentId, {
-          status: "passed",
-          label: "Ejecución detenida",
-        });
-        return { ok: true, endpoint: path };
-      } catch (err) {
-        if (err?.name === "TimeoutError") {
-          return { ok: false, error: "Tiempo de espera agotado al detener" };
+      const expectsBody = Boolean(caps.interruptBodyInfo?.[template]);
+      const attemptBodies = expectsBody ? [JSON.stringify({}), undefined] : [undefined, JSON.stringify({})];
+
+      for (const body of attemptBodies) {
+        try {
+          const resp = await fetch(`${baseUrl}${path}`, {
+            method: "POST",
+            headers: body
+              ? { ...headers, "Content-Type": "application/json" }
+              : headers,
+            ...(body ? { body } : {}),
+            signal: AbortSignal.timeout(4000),
+          });
+          const ct = (resp.headers.get("content-type") || "").toLowerCase();
+          if (resp.status === 404 || resp.status === 405 || ct.includes("text/html")) {
+            break;
+          }
+          if (resp.status === 400 || resp.status === 422) {
+            lastHttpError = await this._extractHttpError(
+              resp,
+              `HTTP ${resp.status} al detener sesión`,
+            );
+            continue;
+          }
+          if (!resp.ok) {
+            return {
+              ok: false,
+              error: await this._extractHttpError(
+                resp,
+                `HTTP ${resp.status} al detener sesión`,
+              ),
+            };
+          }
+          const agentId =
+            this.busySessions.get(sessionId) ||
+            this.resolveAgentId(this.sessionAgentMap.get(sessionId)) ||
+            "architect";
+          this._releaseSessionNow(sessionId, agentId, {
+            status: "passed",
+            label: "Ejecución detenida",
+          });
+          return { ok: true, endpoint: path };
+        } catch (err) {
+          if (err?.name === "TimeoutError") {
+            return { ok: false, error: "Tiempo de espera agotado al detener" };
+          }
         }
       }
     }
 
     return {
       ok: false,
-      error: "No se encontró endpoint /interrupt o /abort en OpenCode",
+      error:
+        lastHttpError ||
+        "No se encontró endpoint /interrupt o /abort en OpenCode",
     };
   }
 
@@ -1926,7 +2146,7 @@ export class OpenCodeBridgeClient {
       ...this._buildAuthHeaders(),
     };
 
-    const bodyCandidates = [{ response: validResp }, { reply: validResp }];
+    let lastHttpError = null;
 
     for (const template of caps.permissionReplyPaths) {
       if (template.includes("{sessionID}") && !item.sessionID) continue;
@@ -1934,6 +2154,11 @@ export class OpenCodeBridgeClient {
         sessionID: item.sessionID || "",
         requestID: requestId,
       });
+
+      const schemaProps = caps.permissionReplySchemas?.[template]?.props || [];
+      const bodyCandidates = schemaProps.includes("reply")
+        ? [{ reply: validResp }, { response: validResp }]
+        : [{ response: validResp }, { reply: validResp }];
 
       for (const payload of bodyCandidates) {
         try {
@@ -1948,12 +2173,19 @@ export class OpenCodeBridgeClient {
             break;
           }
           if (resp.status === 400 || resp.status === 422) {
+            lastHttpError = await this._extractHttpError(
+              resp,
+              `HTTP ${resp.status} al responder permiso`,
+            );
             continue;
           }
           if (!resp.ok) {
             return {
               ok: false,
-              error: `Error HTTP ${resp.status} al responder permiso`,
+              error: await this._extractHttpError(
+                resp,
+                `Error HTTP ${resp.status} al responder permiso`,
+              ),
             };
           }
 
@@ -1987,7 +2219,9 @@ export class OpenCodeBridgeClient {
 
     return {
       ok: false,
-      error: "No se encontró endpoint compatible de permisos (/permission/.../reply)",
+      error:
+        lastHttpError ||
+        "No se encontró endpoint compatible de permisos (/permission/.../reply)",
     };
   }
 
