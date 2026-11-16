@@ -6,18 +6,28 @@ const STORAGE_KEY = "oficina3d:opencode_config:v1";
 const WATCHDOG_SILENCE_MS = 30000;
 const WATCHDOG_CHECK_INTERVAL_MS = 5000;
 const AGENT_THROTTLE_MS = 250;
+const IDLE_DEBOUNCE_MS = 3000;
 
 const TOOL_LABELS_ES = {
   read: "Leyendo código",
+  view: "Leyendo código",
   edit: "Editando archivo",
+  multi_edit: "Editando archivos",
+  apply_patch: "Aplicando parche",
   write: "Escribiendo código",
   patch: "Aplicando parche",
   bash: "Ejecutando terminal",
+  shell: "Ejecutando terminal",
+  run: "Ejecutando comando",
   grep: "Buscando referencias",
+  search: "Buscando código",
   glob: "Explorando archivos",
+  find: "Explorando archivos",
   list: "Listando directorio",
+  ls: "Listando directorio",
   task: "Delegando subtarea",
   webfetch: "Consultando docs",
+  fetch: "Consultando docs",
   todowrite: "Actualizando plan",
 };
 
@@ -82,8 +92,12 @@ export class OpenCodeBridgeClient {
     this.watchdogTimer = null;
     this.reconnectTimer = null;
 
-    // Registros de resolución 3-niveles (task / parentID / root)
+    // Registros de resolución 3-niveles (task / parentID / root) + mapa v2 sessionID -> agent
+    this.idleDebounceMs = IDLE_DEBOUNCE_MS;
     this.sessionsById = new Map();
+    this.sessionAgentMap = new Map();
+    this.busySessions = new Map();
+    this.sessionIdleTimers = new Map();
     this.taskCallsByChildSession = new Map();
     this.taskCallsByPartId = new Map();
     this.activeAgents = new Set();
@@ -273,51 +287,132 @@ export class OpenCodeBridgeClient {
     return null;
   }
 
+  _extractSessionId(props = {}) {
+    return (
+      props?.sessionID ||
+      props?.sessionId ||
+      props?.part?.sessionID ||
+      props?.info?.sessionID ||
+      props?.info?.id ||
+      props?.session?.id ||
+      null
+    );
+  }
+
+  _cancelSessionIdleTimer(sessionId) {
+    if (!sessionId) return;
+    const existing = this.sessionIdleTimers.get(sessionId);
+    if (existing) {
+      clearTimeout(existing);
+      this.sessionIdleTimers.delete(sessionId);
+    }
+  }
+
+  _hasOtherBusySessionForAgent(agentId, excludeSessionId = null) {
+    if (!agentId) return false;
+    for (const [sid, busyAgent] of this.busySessions.entries()) {
+      if (sid !== excludeSessionId && busyAgent === agentId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _releaseSessionNow(
+    sessionId,
+    agentId,
+    { status = "passed", label = "Tarea finalizada", file = null } = {},
+  ) {
+    if (sessionId) {
+      this._cancelSessionIdleTimer(sessionId);
+      this.busySessions.delete(sessionId);
+    }
+    if (agentId && !this._hasOtherBusySessionForAgent(agentId, sessionId)) {
+      this._queueAgentTask(
+        agentId,
+        { status, label, file },
+        { immediate: true },
+      );
+    }
+  }
+
+  _scheduleSessionIdleRelease(
+    sessionId,
+    agentId,
+    { label = "Tarea finalizada", delayMs = this.idleDebounceMs } = {},
+  ) {
+    if (!sessionId) {
+      this._releaseSessionNow(null, agentId, { status: "passed", label });
+      return;
+    }
+
+    this._cancelSessionIdleTimer(sessionId);
+    const waitMs = Math.max(0, Number(delayMs) || 0);
+    const timer = setTimeout(() => {
+      this.sessionIdleTimers.delete(sessionId);
+      this._releaseSessionNow(sessionId, agentId, {
+        status: "passed",
+        label,
+      });
+    }, waitMs);
+    this.sessionIdleTimers.set(sessionId, timer);
+  }
+
   /**
-   * Blindaje 1: Cascada exacta de 3 niveles para distinguir primario vs subagente.
+   * Blindaje 1: Cascada exacta de 3 niveles + mapa sessionID -> agent de API v2.
    */
   _resolveEventAgentId(eventType, props = {}) {
     const part = props.part || props;
-    const sessionId =
-      part?.sessionID ||
-      props.sessionID ||
-      props.info?.id ||
-      props.session?.id ||
-      null;
+    const sessionId = this._extractSessionId(props);
+    const callKey = part?.callID || part?.id || props?.id || null;
+    const toolName = String(part?.tool || props?.name || "").toLowerCase();
 
     // Nivel 1: part.agent o argumento subagent_type dentro de tool === "task"
-    const partInput = part?.state?.input || part?.input || {};
-    const partMeta = part?.state?.metadata || part?.metadata || {};
+    const partInput = part?.state?.input || part?.input || props?.input || {};
+    const partMeta = part?.state?.metadata || part?.metadata || props?.metadata || {};
     const tier1Candidate =
       part?.agent ||
-      (part?.tool === "task"
+      (toolName === "task"
         ? partInput.subagent_type || partInput.agent || partMeta.agent
         : null);
 
     const tier1Resolved = this.resolveAgentId(tier1Candidate);
     if (tier1Resolved) {
-      const partKey = part?.callID || part?.id;
-      if (partKey) this.taskCallsByPartId.set(partKey, tier1Resolved);
+      if (callKey) this.taskCallsByPartId.set(callKey, tier1Resolved);
       if (partMeta.sessionId) {
         this.taskCallsByChildSession.set(partMeta.sessionId, tier1Resolved);
+        this.sessionAgentMap.set(partMeta.sessionId, tier1Resolved);
+      }
+      if (sessionId && part?.agent && toolName !== "task") {
+        this.sessionAgentMap.set(sessionId, part.agent);
       }
       return tier1Resolved;
     }
 
     // Si pertenece a un callID previo de tool="task"
-    const knownPartAgent =
-      this.taskCallsByPartId.get(part?.callID || part?.id) || null;
+    const knownPartAgent = callKey ? this.taskCallsByPartId.get(callKey) || null : null;
     if (knownPartAgent) return knownPartAgent;
 
-    // Evento explícito directo (por webhook /office-event o testing)
-    const directAgent = this.resolveAgentId(props.agentId || props.agent);
-    if (directAgent) return directAgent;
+    // Evento explícito directo (session.step.started / webhook /office-event / testing)
+    const explicitHint = props.agentId || props.agent;
+    const directAgent = this.resolveAgentId(explicitHint);
+    if (directAgent) {
+      if (sessionId && explicitHint) {
+        this.sessionAgentMap.set(sessionId, explicitHint);
+      }
+      return directAgent;
+    }
 
-    // Nivel 2: Metadatos de sesión hija si tiene parentID
+    // Mapa directo sessionID -> agent de OpenCode API v2 (session.step.started)
     if (sessionId) {
+      const mappedHint = this.sessionAgentMap.get(sessionId);
+      const mappedAgent = this.resolveAgentId(mappedHint);
+      if (mappedAgent) return mappedAgent;
+
       const childTaskAgent = this.taskCallsByChildSession.get(sessionId);
       if (childTaskAgent) return childTaskAgent;
 
+      // Nivel 2: Metadatos de sesión hija si tiene parentID
       const session = this.sessionsById.get(sessionId);
       if (session?.parentID) {
         const fromChildMeta =
@@ -375,6 +470,10 @@ export class OpenCodeBridgeClient {
       title,
     });
 
+    if (agentHint) {
+      this.sessionAgentMap.set(sessionObj.id, agentHint);
+    }
+
     // Si es sesión hija, cachear si el título o agent ya identifica un subagente
     if (parentID) {
       const resolvedChild =
@@ -386,17 +485,19 @@ export class OpenCodeBridgeClient {
   }
 
   /**
-   * Normaliza cualquier frame SSE proveniente de OpenCode `/event` o del puente `/office-event`.
+   * Normaliza cualquier frame SSE proveniente de OpenCode `/api/event` (v2 `data` y clásico `properties`)
+   * o del puente `/office-event`.
    */
   ingestEvent(rawEvent) {
     if (!rawEvent || typeof rawEvent !== "object") return null;
 
-    // Algunos proxies/endpoints globales envuelven { directory, payload: { type, properties } }
+    // Algunos proxies/endpoints globales envuelven { directory, payload: { type, data | properties } }
     const evt =
       rawEvent.payload && rawEvent.payload.type ? rawEvent.payload : rawEvent;
 
     const eventType = evt.type || "unknown";
-    const props = evt.properties || evt.data || evt;
+    const props = evt.data || evt.properties || evt;
+    const sessionId = this._extractSessionId(props);
 
     this.eventsReceived += 1;
     this.lastEventAt = Date.now();
@@ -405,6 +506,158 @@ export class OpenCodeBridgeClient {
       return null;
     }
 
+    // --- OpenCode API v2: Flujo session.step.* / session.tool.* / session.*.delta ---
+    if (eventType === "session.step.started") {
+      if (sessionId) {
+        this._cancelSessionIdleTimer(sessionId);
+        if (props.agent) {
+          this.sessionAgentMap.set(sessionId, props.agent);
+          this._upsertSessionRecord({ id: sessionId, agent: props.agent });
+        }
+      }
+
+      const agentId = this._resolveEventAgentId(eventType, props);
+      if (!agentId) return null;
+
+      if (sessionId) {
+        this.busySessions.set(sessionId, agentId);
+      }
+      this._queueAgentTask(agentId, {
+        status: "started",
+        label: "Paso OpenCode activo",
+        file: null,
+      });
+      return agentId;
+    }
+
+    if (
+      eventType === "session.tool.input.started" ||
+      eventType === "session.tool.called" ||
+      eventType === "session.tool.progress" ||
+      eventType === "session.tool.success" ||
+      eventType === "session.tool.completed" ||
+      eventType === "session.tool.error" ||
+      eventType === "session.tool.failed"
+    ) {
+      if (sessionId) {
+        this._cancelSessionIdleTimer(sessionId);
+      }
+
+      const toolName = String(props.name || props.tool || "tool").toLowerCase();
+      const input = props.input || props.args || {};
+      const file = shortFileName(
+        input.path ||
+          input.filePath ||
+          input.file ||
+          input.pattern ||
+          (input.command ? `$ ${String(input.command).slice(0, 24)}` : null),
+      );
+
+      const agentId = this._resolveEventAgentId(eventType, props);
+      if (!agentId) return null;
+
+      if (toolName === "task") {
+        const parentAgent =
+          this.resolveAgentId(this.sessionAgentMap.get(sessionId)) ||
+          this.resolveAgentId(this.sessionsById.get(sessionId)?.agent) ||
+          "architect";
+        if (parentAgent && sessionId) {
+          this.busySessions.set(sessionId, parentAgent);
+        }
+        if (parentAgent && parentAgent !== agentId) {
+          this._queueAgentTask(parentAgent, {
+            status: "started",
+            label: `Coordinando @${agentId}`,
+            file: input.description ? String(input.description).slice(0, 30) : null,
+          });
+        }
+      } else if (sessionId) {
+        this.busySessions.set(sessionId, agentId);
+      }
+
+      if (
+        eventType === "session.tool.error" ||
+        eventType === "session.tool.failed"
+      ) {
+        this._queueAgentTask(
+          agentId,
+          {
+            status: "failed",
+            label: `Fallo en ${toolName}`,
+            file,
+          },
+          { immediate: true },
+        );
+        return agentId;
+      }
+
+      const baseLabel = TOOL_LABELS_ES[toolName] || `Tool: ${toolName}`;
+      const label =
+        eventType === "session.tool.success" || eventType === "session.tool.completed"
+          ? `${baseLabel} ✓`
+          : baseLabel;
+
+      this._queueAgentTask(agentId, {
+        status: "started",
+        label,
+        file,
+      });
+      return agentId;
+    }
+
+    if (
+      eventType === "session.text.delta" ||
+      eventType === "session.reasoning.delta"
+    ) {
+      if (sessionId) {
+        this._cancelSessionIdleTimer(sessionId);
+      }
+      const agentId = this._resolveEventAgentId(eventType, props);
+      if (!agentId) return null;
+
+      if (sessionId) {
+        this.busySessions.set(sessionId, agentId);
+      }
+      this._queueAgentTask(agentId, {
+        status: "started",
+        label:
+          eventType === "session.reasoning.delta"
+            ? "Analizando solución"
+            : "Redactando respuesta",
+        file: null,
+      });
+      return agentId;
+    }
+
+    if (eventType === "session.step.ended") {
+      const agentId = this._resolveEventAgentId(eventType, props);
+      if (!agentId) return null;
+
+      const finish = String(props.finish || props.reason || "").toLowerCase();
+      if (finish === "tool-calls") {
+        // El agente sigue trabajando en el siguiente ciclo de herramientas
+        if (sessionId) {
+          this._cancelSessionIdleTimer(sessionId);
+          this.busySessions.set(sessionId, agentId);
+        }
+        if (!this.activeAgents.has(agentId)) {
+          this._queueAgentTask(agentId, {
+            status: "started",
+            label: "Ejecutando herramientas",
+            file: null,
+          });
+        }
+        return agentId;
+      }
+
+      // Liberar a idle tras debounce de ~3s si no llegan nuevos eventos en este sessionID
+      this._scheduleSessionIdleRelease(sessionId, agentId, {
+        label: "Tarea finalizada",
+      });
+      return agentId;
+    }
+
+    // --- Eventos clásicos / compartidos (session.*, message.*, permission.*) ---
     if (eventType === "session.created" || eventType === "session.updated") {
       const info = props.info || props.session || props;
       this._upsertSessionRecord(info);
@@ -413,6 +666,11 @@ export class OpenCodeBridgeClient {
         info,
       });
       if (resolved && info?.status?.type === "busy") {
+        const sid = info.id || sessionId;
+        if (sid) {
+          this._cancelSessionIdleTimer(sid);
+          this.busySessions.set(sid, resolved);
+        }
         this._queueAgentTask(resolved, {
           status: "started",
           label: info.title ? info.title.slice(0, 32) : "Sesión OpenCode activa",
@@ -428,21 +686,20 @@ export class OpenCodeBridgeClient {
       if (!agentId) return null;
 
       if (statusType === "busy" || statusType === "running") {
+        if (sessionId) {
+          this._cancelSessionIdleTimer(sessionId);
+          this.busySessions.set(sessionId, agentId);
+        }
         this._queueAgentTask(agentId, {
           status: "started",
           label: "Procesando prompt OpenCode",
           file: null,
         });
       } else if (statusType === "idle") {
-        this._queueAgentTask(
-          agentId,
-          {
-            status: "passed",
-            label: "Sesión completada",
-            file: null,
-          },
-          { immediate: true },
-        );
+        this._releaseSessionNow(sessionId, agentId, {
+          status: "passed",
+          label: "Sesión completada",
+        });
       }
       return agentId;
     }
@@ -450,15 +707,10 @@ export class OpenCodeBridgeClient {
     if (eventType === "session.idle") {
       const agentId = this._resolveEventAgentId(eventType, props);
       if (!agentId) return null;
-      this._queueAgentTask(
-        agentId,
-        {
-          status: "passed",
-          label: "Tarea finalizada",
-          file: null,
-        },
-        { immediate: true },
-      );
+      this._releaseSessionNow(sessionId, agentId, {
+        status: "passed",
+        label: "Tarea finalizada",
+      });
       return agentId;
     }
 
@@ -470,19 +722,15 @@ export class OpenCodeBridgeClient {
         props.error?.name ||
         props.message ||
         "Error en sesión OpenCode";
-      this._queueAgentTask(
-        agentId,
-        {
-          status: "failed",
-          label: String(errMsg).slice(0, 34),
-          file: null,
-        },
-        { immediate: true },
-      );
+      this._releaseSessionNow(sessionId, agentId, {
+        status: "failed",
+        label: String(errMsg).slice(0, 34),
+      });
       return agentId;
     }
 
     if (eventType === "permission.updated" || eventType === "permission.asked") {
+      if (sessionId) this._cancelSessionIdleTimer(sessionId);
       const agentId = this._resolveEventAgentId(eventType, props);
       if (!agentId) return null;
       this._queueAgentTask(
@@ -500,18 +748,13 @@ export class OpenCodeBridgeClient {
     if (eventType === "message.updated") {
       const info = props.info || props;
       if (info?.sessionID && info?.agent) {
-        const existing = this.sessionsById.get(info.sessionID) || {
-          id: info.sessionID,
-          parentID: null,
-          title: "",
-        };
-        existing.agent = info.agent;
-        this.sessionsById.set(info.sessionID, existing);
+        this._upsertSessionRecord({ id: info.sessionID, agent: info.agent });
       }
       return this._resolveEventAgentId(eventType, props);
     }
 
     if (eventType === "message.part.updated") {
+      if (sessionId) this._cancelSessionIdleTimer(sessionId);
       const part = props.part || props;
       const agentId = this._resolveEventAgentId(eventType, props);
       if (!agentId) return null;
@@ -531,7 +774,8 @@ export class OpenCodeBridgeClient {
         if (toolName === "task") {
           const parentAgent =
             this.resolveAgentId(
-              this.sessionsById.get(part.sessionID)?.agent,
+              this.sessionAgentMap.get(part.sessionID) ||
+                this.sessionsById.get(part.sessionID)?.agent,
             ) || "architect";
           if (parentAgent && parentAgent !== agentId) {
             this._queueAgentTask(parentAgent, {
@@ -540,6 +784,8 @@ export class OpenCodeBridgeClient {
               file: input.description ? String(input.description).slice(0, 30) : null,
             });
           }
+        } else if (sessionId) {
+          this.busySessions.set(sessionId, agentId);
         }
 
         if (stateStatus === "error") {
@@ -574,6 +820,7 @@ export class OpenCodeBridgeClient {
       }
 
       if (part.type === "text" || part.type === "reasoning") {
+        if (sessionId) this.busySessions.set(sessionId, agentId);
         this._queueAgentTask(agentId, {
           status: "started",
           label:
@@ -681,6 +928,10 @@ export class OpenCodeBridgeClient {
     }
     this.pendingFlushTimers.clear();
     this.pendingAgentBuffer.clear();
+    for (const idleTimer of this.sessionIdleTimers.values()) {
+      clearTimeout(idleTimer);
+    }
+    this.sessionIdleTimers.clear();
   }
 
   async _probeSessionEndpoint(baseUrl, headers, signal) {
@@ -1042,6 +1293,8 @@ export class OpenCodeBridgeClient {
     this._clearThrottleQueues();
     this.activeAgents.clear();
     this.sessionsById.clear();
+    this.sessionAgentMap.clear();
+    this.busySessions.clear();
     this.taskCallsByChildSession.clear();
     this.taskCallsByPartId.clear();
     this.status = "disconnected";
