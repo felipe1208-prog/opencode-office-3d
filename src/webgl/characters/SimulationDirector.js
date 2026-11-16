@@ -78,6 +78,7 @@ export class SimulationDirector {
     this.paused = false;
     this.speedMultiplier = 1; // 1 | 2
     this.agentTimers = new Map();
+    this.liveOwnership = new Map(); // agentId -> { active: boolean, idleCooldown: number }
     this.unsubscribers = [];
 
     this.initTimers();
@@ -94,30 +95,116 @@ export class SimulationDirector {
     }
   }
 
+  isAgentLiveBusy(agentId) {
+    const live = this.liveOwnership.get(agentId);
+    return Boolean(live && (live.active || live.idleCooldown > 0));
+  }
+
+  claimAgentForLiveTask(agentId, { status = "started", label = null, file = null } = {}) {
+    const agent = this.characterManager.getAgent(agentId);
+    if (!agent) return false;
+
+    this.liveOwnership.set(agentId, {
+      active: true,
+      idleCooldown: 0,
+    });
+
+    const timer = this.agentTimers.get(agentId);
+    if (timer) {
+      timer.workCooldown = 16;
+      timer.interactCooldown = 0;
+      timer.waitCooldown = 0;
+    }
+
+    this.monitorSystem?.setMeetingState({ active: false });
+
+    agent.applyTaskFeedback({
+      status,
+      label,
+      onSeated: () => {
+        this.monitorSystem?.setAgentScreenState(agentId, {
+          mode: "WORKING",
+          taskLabel: label || agent.currentActionLabel,
+          taskFile: file,
+        });
+      },
+    });
+    return true;
+  }
+
+  releaseAgentFromLiveTask(
+    agentId,
+    { status = "passed", label = null, file = null, idleCooldownSec = 15 } = {},
+  ) {
+    const agent = this.characterManager.getAgent(agentId);
+    if (!agent) return false;
+
+    const cooldown = Math.max(4, Number(idleCooldownSec) || 15);
+    this.liveOwnership.set(agentId, {
+      active: false,
+      idleCooldown: cooldown,
+    });
+
+    const screenMode = status === "failed" ? "ERROR" : "SUCCESS";
+
+    agent.applyTaskFeedback({
+      status,
+      label,
+      onSeated: () => {
+        this.monitorSystem?.setAgentScreenState(agentId, {
+          mode: screenMode,
+          taskLabel: label || agent.currentActionLabel,
+          taskFile: file,
+        });
+      },
+    });
+    return true;
+  }
+
+  clearAllLiveClaims() {
+    this.liveOwnership.clear();
+  }
+
   bindEventBus() {
     this.unsubscribers.push(
+      officeEventBus.on(OFFICE_EVENTS.OPENCODE_CONNECTION, (payload) => {
+        if (payload?.status === "disconnected") {
+          this.clearAllLiveClaims();
+        }
+      }),
+
       officeEventBus.on(OFFICE_EVENTS.AGENT_TASK, (payload) => {
         const agent = this.characterManager.getAgent(payload.agentId);
         if (!agent) return;
+
+        if (payload.live) {
+          if (payload.status === "started" || payload.status === "working") {
+            this.claimAgentForLiveTask(payload.agentId, payload);
+          } else {
+            this.releaseAgentFromLiveTask(payload.agentId, payload);
+          }
+          return;
+        }
 
         const timer = this.agentTimers.get(payload.agentId);
         if (timer) {
           timer.workCooldown = 14 + Math.random() * 6;
         }
 
-        agent.applyTaskFeedback({
-          status: payload.status || "started",
-          label: payload.label,
-        });
-
         let screenMode = "WORKING";
         if (payload.status === "passed") screenMode = "SUCCESS";
         else if (payload.status === "failed") screenMode = "ERROR";
 
-        this.monitorSystem?.setAgentScreenState(payload.agentId, {
-          mode: screenMode,
-          taskLabel: payload.label || agent.currentActionLabel,
-          taskFile: payload.file,
+        agent.applyTaskFeedback({
+          status: payload.status || "started",
+          label: payload.label,
+          onSeated: () => {
+            this.monitorSystem?.setAgentScreenState(payload.agentId, {
+              mode: screenMode,
+              taskLabel: payload.label || agent.currentActionLabel,
+              taskFile: payload.file,
+            });
+          },
         });
       }),
 
@@ -192,7 +279,9 @@ export class SimulationDirector {
 
   triggerPingPongMatch() {
     const candidates = this.characterManager.characters.filter(
-      (a) => a.state === "WORKING" || a.state === "IDLE",
+      (a) =>
+        !this.isAgentLiveBusy(a.config.id) &&
+        (a.state === "WORKING" || a.state === "IDLE"),
     );
     if (candidates.length < 2) return false;
 
@@ -258,7 +347,9 @@ export class SimulationDirector {
 
   triggerPairChat(agentAId = null, agentBId = null, preferredVenue = null) {
     const pool = this.characterManager.characters.filter(
-      (a) => a.state === "WORKING" || a.state === "IDLE",
+      (a) =>
+        !this.isAgentLiveBusy(a.config.id) &&
+        (a.state === "WORKING" || a.state === "IDLE"),
     );
     const first =
       (agentAId && this.characterManager.getAgent(agentAId)) || pool[0];
@@ -332,6 +423,7 @@ export class SimulationDirector {
   triggerDeskReview(hostAgentId = null, reviewerAgentId = null, topic = "Code Review") {
     const workingAtHome = this.characterManager.characters.filter(
       (a) =>
+        !this.isAgentLiveBusy(a.config.id) &&
         a.state === "WORKING" &&
         a.currentCheckpointId === a.homeCheckpointId &&
         checkpointManager.isAvailable(REVIEW_CHECKPOINT_BY_HOST[a.config.id]),
@@ -348,6 +440,7 @@ export class SimulationDirector {
     const reviewerCandidates = this.characterManager.characters.filter(
       (a) =>
         a.config.id !== host.config.id &&
+        !this.isAgentLiveBusy(a.config.id) &&
         (a.state === "WORKING" || a.state === "IDLE"),
     );
     const reviewer =
@@ -427,8 +520,25 @@ export class SimulationDirector {
     const scaledDelta = delta * this.speedMultiplier;
 
     for (const agent of this.characterManager.characters) {
-      const timer = this.agentTimers.get(agent.config.id);
+      const agentId = agent.config.id;
+      const timer = this.agentTimers.get(agentId);
       if (!timer) continue;
+
+      const live = this.liveOwnership.get(agentId);
+      if (live) {
+        if (live.active) {
+          // Agente bajo ejecución activa de OpenCode: suspender pausas autónomas
+          continue;
+        }
+        if (live.idleCooldown > 0) {
+          // Margen de enfriamiento tras session.idle para prompts encadenados
+          live.idleCooldown -= delta;
+          if (live.idleCooldown > 0) continue;
+
+          this.liveOwnership.delete(agentId);
+          timer.workCooldown = 6 + Math.random() * 8;
+        }
+      }
 
       if (agent.state === "WORKING") {
         timer.workCooldown -= scaledDelta;
@@ -437,7 +547,7 @@ export class SimulationDirector {
           if (agent.socialMode === "DESK_REVIEW") {
             agent.clearSocialContext();
             agent.applyActionProfile("typing");
-            this.monitorSystem?.setAgentScreenState(agent.config.id, {
+            this.monitorSystem?.setAgentScreenState(agentId, {
               mode: "WORKING",
               taskLabel: "Tecleando código",
               partnerName: null,
@@ -455,7 +565,7 @@ export class SimulationDirector {
             officeEventBus.emit(
               OFFICE_EVENTS.AGENT_TASK,
               {
-                agentId: agent.config.id,
+                agentId,
                 status: isSuccess ? "passed" : "failed",
                 label: isSuccess ? sample.label : "Revisando traza de error",
                 file: sample.file,
@@ -463,9 +573,9 @@ export class SimulationDirector {
               "mock-director",
             );
             timer.workCooldown = 11 + Math.random() * 7;
-          } else if (roll < 0.4 && this.triggerPairChat(agent.config.id)) {
+          } else if (roll < 0.4 && this.triggerPairChat(agentId)) {
             timer.workCooldown = 14 + Math.random() * 8;
-          } else if (roll < 0.54 && this.triggerDeskReview(agent.config.id)) {
+          } else if (roll < 0.54 && this.triggerDeskReview(agentId)) {
             timer.workCooldown = 15 + Math.random() * 8;
           } else {
             const availablePool = SOLO_DESTINATIONS.filter((d) =>
@@ -474,7 +584,7 @@ export class SimulationDirector {
             const pool =
               availablePool.length > 0 ? availablePool : SOLO_DESTINATIONS;
             const pick = pool[Math.floor(Math.random() * pool.length)];
-            this.sendAgentTo(agent.config.id, pick.checkpointId, pick.action);
+            this.sendAgentTo(agentId, pick.checkpointId, pick.action);
             timer.workCooldown = 12 + Math.random() * 8;
           }
         }

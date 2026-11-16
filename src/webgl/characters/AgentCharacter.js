@@ -38,6 +38,7 @@ export class AgentCharacter {
     this.socialMode = null; // null | "PAIR_CHAT" | "DESK_REVIEW"
     this.socialPartnerName = null;
     this.overrideRotY = null;
+    this.pendingLiveArrival = null;
 
     this.pendingTimers = new Set();
 
@@ -172,36 +173,44 @@ export class AgentCharacter {
     this.overrideRotY = null;
   }
 
-  applyTaskFeedback({ status = "started", label = null } = {}) {
+  applyTaskFeedback({ status = "started", label = null, onSeated = null } = {}) {
     if (label) this.taskTitle = label;
+
+    const accentColor =
+      status === "passed"
+        ? "#10B981"
+        : status === "failed"
+          ? "#EF4444"
+          : null;
+
+    // Si está fuera del escritorio o aún viajando, ejecutar preempción limpia hacia casa
+    // y diferir el estado WORKING + actualización de monitores hasta sentarse en su silla.
+    if (this.currentCheckpointId !== this.homeCheckpointId || !this.isSeated) {
+      this.returnHome({
+        pendingLiveTask: {
+          status,
+          label,
+          accentColor,
+          onSeated,
+        },
+      });
+      return;
+    }
 
     if (status === "passed") {
       this.taskAccentColor = "#10B981";
       this.currentActionLabel = label || "Pruebas en verde";
-      if (this.currentCheckpointId === this.homeCheckpointId && this.isSeated) {
-        this.applyActionProfile("sittingCheer");
-      } else {
-        this.syncBubble();
-        this.notifyStateChange();
-      }
+      this.applyActionProfile("sittingCheer", { customLabel: this.currentActionLabel });
     } else if (status === "failed") {
       this.taskAccentColor = "#EF4444";
       this.currentActionLabel = label || "Fallo detectado";
-      if (this.currentCheckpointId === this.homeCheckpointId && this.isSeated) {
-        this.applyActionProfile("sittingDisbelief");
-      } else {
-        this.syncBubble();
-        this.notifyStateChange();
-      }
+      this.applyActionProfile("sittingDisbelief", { customLabel: this.currentActionLabel });
     } else {
       this.taskAccentColor = null;
       this.currentActionLabel = label || "Tecleando código";
-      if (this.currentCheckpointId !== this.homeCheckpointId) {
-        this.returnHome();
-      } else {
-        this.applyActionProfile("typing");
-      }
+      this.applyActionProfile("typing", { customLabel: this.currentActionLabel });
     }
+    onSeated?.();
   }
 
   applyActionProfile(actionKey, { customLabel = null } = {}) {
@@ -237,6 +246,7 @@ export class AgentCharacter {
 
     this.clearTimers();
     this.clearSocialContext();
+    this.pendingLiveArrival = null;
     this.taskAccentColor = null;
     if (socialMode) {
       this.socialMode = socialMode;
@@ -244,6 +254,9 @@ export class AgentCharacter {
     }
     this.overrideRotY = overrideRotY;
 
+    if (this.targetCheckpointId && this.targetCheckpointId !== checkpointId) {
+      checkpointManager.release(this.targetCheckpointId, this.config.id);
+    }
     checkpointManager.removeAgentFromAllQueues(this.config.id);
     this.targetCheckpointId = checkpointId;
 
@@ -340,7 +353,31 @@ export class AgentCharacter {
 
       this.scheduleTimer(() => {
         this.model.position.y = cp.pos.y;
-        if (isHome && chosenAction === "typing") {
+        const pending = isHome ? this.pendingLiveArrival : null;
+        if (isHome) this.pendingLiveArrival = null;
+
+        if (pending) {
+          this.state = "WORKING";
+          this.taskTitle = pending.label || this.taskTitle;
+          this.taskAccentColor = pending.accentColor || null;
+          this.currentActionLabel = pending.label || "Tecleando código";
+          this.propSockets.detachAll();
+
+          if (pending.status === "passed") {
+            this.currentActionKey = "sittingCheer";
+            this.animator.play("sittingCheer", 0.2);
+          } else if (pending.status === "failed") {
+            this.currentActionKey = "sittingDisbelief";
+            this.animator.play("sittingDisbelief", 0.2);
+          } else {
+            this.currentActionKey = "typing";
+            this.animator.play("sitToType", 0.2);
+          }
+
+          pending.onSeated?.();
+          this.syncBubble();
+          this.notifyStateChange();
+        } else if (isHome && chosenAction === "typing") {
           this.currentActionKey = "typing";
           this.currentActionLabel = "Tecleando código";
           this.propSockets.detachAll();
@@ -399,14 +436,20 @@ export class AgentCharacter {
     this.returnHome();
   }
 
-  returnHome() {
+  returnHome({ pendingLiveTask = null } = {}) {
     if (!this.homeCheckpointId) return;
     const home = checkpointManager.get(this.homeCheckpointId);
     if (!home) return;
 
     this.clearTimers();
     this.clearSocialContext();
-    this.taskAccentColor = null;
+    this.taskAccentColor = pendingLiveTask?.accentColor || null;
+
+    // Blindaje 3: liberar de inmediato cualquier reserva previa (en viaje, espera o estación)
+    if (this.targetCheckpointId && this.targetCheckpointId !== this.homeCheckpointId) {
+      checkpointManager.release(this.targetCheckpointId, this.config.id);
+      this.targetCheckpointId = null;
+    }
     checkpointManager.removeAgentFromAllQueues(this.config.id);
     if (this.waitingSeatId) {
       checkpointManager.release(this.waitingSeatId, this.config.id);
@@ -414,11 +457,22 @@ export class AgentCharacter {
     }
 
     if (this.currentCheckpointId === this.homeCheckpointId && this.isSeated) {
+      this.pendingLiveArrival = null;
       this.state = "WORKING";
-      this.applyActionProfile("typing");
+      this.taskTitle = pendingLiveTask?.label || this.taskTitle;
+      const customLabel = pendingLiveTask?.label || "Tecleando código";
+      if (pendingLiveTask?.status === "passed") {
+        this.applyActionProfile("sittingCheer", { customLabel });
+      } else if (pendingLiveTask?.status === "failed") {
+        this.applyActionProfile("sittingDisbelief", { customLabel });
+      } else {
+        this.applyActionProfile("typing", { customLabel });
+      }
+      pendingLiveTask?.onSeated?.();
       return;
     }
 
+    this.pendingLiveArrival = pendingLiveTask;
     checkpointManager.reserve(this.homeCheckpointId, this.config.id);
     this.targetCheckpointId = this.homeCheckpointId;
 
@@ -427,6 +481,11 @@ export class AgentCharacter {
         this.arriveAtStation(home, "typing");
       });
     });
+    if (pendingLiveTask?.label) {
+      this.currentActionLabel = `Regresando · ${pendingLiveTask.label}`;
+      this.syncBubble();
+      this.notifyStateChange();
+    }
   }
 
   setDesktopStatus(status) {

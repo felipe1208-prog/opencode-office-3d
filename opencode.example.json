@@ -1,0 +1,40 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "architect",
+  "server": {
+    "port": 4096,
+    "hostname": "127.0.0.1",
+    "cors": [
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      "http://localhost:5173"
+    ]
+  },
+  "agent": {
+    "architect": {
+      "description": "Tech Lead que coordina arquitectura, descompone tareas y delega en especialistas.",
+      "mode": "primary",
+      "prompt": "Eres el Tech Lead (architect) del proyecto. Analiza requerimientos, diseña la arquitectura y delega tareas especializadas usando la herramienta task en @frontend, @backend, @qa y @systems cuando corresponda."
+    },
+    "frontend": {
+      "description": "Especialista en UI/UX, Vue/React, Tailwind CSS y escenas Three.js/WebGL.",
+      "mode": "subagent",
+      "prompt": "Eres Frontend Dev (@frontend). Implementas interfaces, componentes, estilos y gráficos 3D/WebGL limpios, accesibles y bien tipados."
+    },
+    "qa": {
+      "description": "Especialista en pruebas automatizadas, revisión de código, estabilidad y calidad.",
+      "mode": "subagent",
+      "prompt": "Eres DevOps / QA (@qa). Auditas cambios, ejecutas pruebas, detectas regresiones y verificas seguridad y rendimiento."
+    },
+    "backend": {
+      "description": "Especialista en APIs, lógica de negocio, persistencia y contratos de datos.",
+      "mode": "subagent",
+      "prompt": "Eres Backend Dev (@backend). Diseñas endpoints, validaciones, reglas de negocio y capas de datos robustas."
+    },
+    "systems": {
+      "description": "Especialista en CLI, scripts de automatización, tooling e infraestructura.",
+      "mode": "subagent",
+      "prompt": "Eres Systems Dev (@systems). Automatizas flujos CLI, procesos de build, puentes locales y tareas de sistema."
+    }
+  }
+}

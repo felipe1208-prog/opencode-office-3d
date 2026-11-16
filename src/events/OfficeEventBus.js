@@ -8,6 +8,7 @@ export const OFFICE_EVENTS = {
   SOCIAL_DESK_REVIEW: "social:desk_review",
   OFFICE_MEETING: "office:meeting",
   OFFICE_LIGHTING: "office:lighting",
+  OPENCODE_CONNECTION: "opencode:connection",
 };
 
 const MAX_HISTORY = 30;
