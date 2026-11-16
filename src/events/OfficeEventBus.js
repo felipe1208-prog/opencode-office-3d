@@ -9,6 +9,8 @@ export const OFFICE_EVENTS = {
   OFFICE_MEETING: "office:meeting",
   OFFICE_LIGHTING: "office:lighting",
   OPENCODE_CONNECTION: "opencode:connection",
+  OPENCODE_PERMISSION: "opencode:permission",
+  OPENCODE_TASK_SYNC: "opencode:task_sync",
 };
 
 const MAX_HISTORY = 30;

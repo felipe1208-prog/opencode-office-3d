@@ -23,6 +23,14 @@ export const TASK_COLUMNS = [
   { id: "blocked", label: "Bloqueada", accent: "text-rose-300" },
 ];
 
+const DEFAULT_TASK_IDS = new Set([
+  "t-arch-1",
+  "t-front-1",
+  "t-qa-1",
+  "t-back-1",
+  "t-sys-1",
+]);
+
 const DEFAULT_TASKS = [
   {
     id: "t-arch-1",
@@ -30,6 +38,7 @@ const DEFAULT_TASKS = [
     file: "src/events/OfficeEventBus.js",
     assigneeId: "architect",
     status: "in_progress",
+    source: "demo",
     updatedAt: Date.now() - 180000,
   },
   {
@@ -38,6 +47,7 @@ const DEFAULT_TASKS = [
     file: "src/webgl/Experience.js",
     assigneeId: "frontend",
     status: "in_progress",
+    source: "demo",
     updatedAt: Date.now() - 140000,
   },
   {
@@ -46,6 +56,7 @@ const DEFAULT_TASKS = [
     file: "tests/nav-integrity.spec.ts",
     assigneeId: "qa",
     status: "done",
+    source: "demo",
     updatedAt: Date.now() - 100000,
   },
   {
@@ -54,6 +65,7 @@ const DEFAULT_TASKS = [
     file: "src/webgl/interaction/CheckpointManager.js",
     assigneeId: "backend",
     status: "todo",
+    source: "demo",
     updatedAt: Date.now() - 75000,
   },
   {
@@ -62,6 +74,7 @@ const DEFAULT_TASKS = [
     file: "cli/opencode-adapter.ts",
     assigneeId: "systems",
     status: "review",
+    source: "demo",
     updatedAt: Date.now() - 40000,
   },
 ];
@@ -188,12 +201,29 @@ export class TaskBoardManager {
   constructor() {
     this.tasks = this._load();
     this.seq = Date.now();
+    this._bindOpenCodeSync();
+  }
+
+  _bindOpenCodeSync() {
+    officeEventBus.on(OFFICE_EVENTS.OPENCODE_TASK_SYNC, (payload) => {
+      if (!payload || !payload.externalKey) return;
+      this.upsertLiveTask(payload);
+    });
   }
 
   _load() {
     const saved = safeReadStorage(TASK_STORAGE_KEY);
-    if (Array.isArray(saved) && saved.length > 0) {
-      return saved.map((t) => ({ ...t }));
+    if (Array.isArray(saved)) {
+      return saved.map((t) => ({
+        ...t,
+        source:
+          t.source ||
+          (t.externalKey
+            ? "opencode"
+            : DEFAULT_TASK_IDS.has(t.id)
+              ? "demo"
+              : "manual"),
+      }));
     }
     return DEFAULT_TASKS.map((t) => ({ ...t }));
   }
@@ -206,8 +236,14 @@ export class TaskBoardManager {
     return this.tasks.map((t) => ({ ...t }));
   }
 
-  addTask({ title, file = "", assigneeId = "frontend", status = "todo" } = {}) {
-    const cleanTitle = String(title || "").trim().slice(0, 48);
+  addTask({
+    title,
+    file = "",
+    assigneeId = "frontend",
+    status = "todo",
+    source = "manual",
+  } = {}) {
+    const cleanTitle = String(title || "").trim().slice(0, 56);
     if (!cleanTitle) return null;
 
     const validStatus = TASK_COLUMNS.some((c) => c.id === status)
@@ -217,15 +253,73 @@ export class TaskBoardManager {
     const task = {
       id: `t-${++this.seq}`,
       title: cleanTitle,
-      file: String(file || "").trim().slice(0, 42) || "src/workspace/task.ts",
+      file: String(file || "").trim().slice(0, 48) || "src/workspace/task.ts",
       assigneeId,
       status: validStatus,
+      source: source === "opencode" || source === "demo" ? source : "manual",
       updatedAt: Date.now(),
     };
 
     this.tasks.unshift(task);
     this._save();
     this._dispatchTaskEvent(task, "task-board");
+    return { ...task };
+  }
+
+  upsertLiveTask({
+    externalKey,
+    sessionId = null,
+    assigneeId = "architect",
+    title = "",
+    file = null,
+    status = "in_progress",
+  } = {}) {
+    if (!externalKey) return null;
+
+    const validStatus = TASK_COLUMNS.some((c) => c.id === status)
+      ? status
+      : "in_progress";
+    const cleanTitle = String(title || "").trim().slice(0, 56);
+    const cleanFile = file ? String(file).trim().slice(0, 48) : null;
+
+    const existing = this.tasks.find((t) => t.externalKey === externalKey);
+    if (existing) {
+      if (cleanTitle) existing.title = cleanTitle;
+      if (cleanFile) existing.file = cleanFile;
+      if (assigneeId) existing.assigneeId = assigneeId;
+      existing.status = validStatus;
+      existing.source = "opencode";
+      if (sessionId) existing.sessionId = sessionId;
+      existing.updatedAt = Date.now();
+
+      this._save();
+      officeEventBus.emit(
+        OFFICE_EVENTS.TASK_BOARD_SYNC,
+        { action: "live_upsert", task: { ...existing } },
+        "opencode-sync",
+      );
+      return { ...existing };
+    }
+
+    const task = {
+      id: `oc-${++this.seq}`,
+      externalKey,
+      sessionId,
+      source: "opencode",
+      title: cleanTitle || "Ejecutando en OpenCode",
+      file: cleanFile || (sessionId ? `ses:${String(sessionId).slice(0, 14)}` : "OpenCode CLI"),
+      assigneeId: assigneeId || "architect",
+      status: validStatus,
+      updatedAt: Date.now(),
+    };
+
+    this.tasks.unshift(task);
+    this._save();
+    officeEventBus.emit(
+      OFFICE_EVENTS.TASK_BOARD_SYNC,
+      { action: "live_upsert", task: { ...task } },
+      "opencode-sync",
+    );
     return { ...task };
   }
 
@@ -265,8 +359,25 @@ export class TaskBoardManager {
     return this.getTasks();
   }
 
+  clearDemoTasks() {
+    this.tasks = this.tasks.filter(
+      (t) => t.source !== "demo" && !DEFAULT_TASK_IDS.has(t.id),
+    );
+    this._save();
+    officeEventBus.emit(
+      OFFICE_EVENTS.TASK_BOARD_SYNC,
+      { action: "cleared_demo" },
+      "task-board",
+    );
+    return this.getTasks();
+  }
+
   resetTasks() {
-    this.tasks = DEFAULT_TASKS.map((t) => ({ ...t, updatedAt: Date.now() }));
+    const liveTasks = this.tasks.filter((t) => t.source === "opencode");
+    this.tasks = [
+      ...liveTasks,
+      ...DEFAULT_TASKS.map((t) => ({ ...t, updatedAt: Date.now() })),
+    ];
     this._save();
     officeEventBus.emit(
       OFFICE_EVENTS.TASK_BOARD_SYNC,

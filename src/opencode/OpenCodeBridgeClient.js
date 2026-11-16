@@ -26,9 +26,11 @@ const TOOL_LABELS_ES = {
   list: "Listando directorio",
   ls: "Listando directorio",
   task: "Delegando subtarea",
+  question: "Esperando respuesta en CLI",
   webfetch: "Consultando docs",
   fetch: "Consultando docs",
   todowrite: "Actualizando plan",
+  todoread: "Leyendo plan",
 };
 
 function safeReadConfig() {
@@ -69,8 +71,28 @@ function shortFileName(rawPath) {
   const cleaned = rawPath.trim();
   if (!cleaned) return null;
   const parts = cleaned.split(/[\\/]/).filter(Boolean);
-  if (parts.length <= 2) return cleaned;
+  if (parts.length === 0) return null;
+  if (parts.length === 1) return parts[0];
   return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
+}
+
+function formatToolTarget(input = {}) {
+  if (!input || typeof input !== "object") return null;
+  const pathCandidate =
+    input.path || input.filePath || input.file || input.pattern;
+  if (typeof pathCandidate === "string" && pathCandidate.trim()) {
+    return shortFileName(pathCandidate);
+  }
+  if (typeof input.command === "string" && input.command.trim()) {
+    return `$ ${input.command.trim().slice(0, 40)}`;
+  }
+  if (typeof input.url === "string" && input.url.trim()) {
+    return input.url.trim().slice(0, 40);
+  }
+  if (typeof input.description === "string" && input.description.trim()) {
+    return input.description.trim().slice(0, 40);
+  }
+  return null;
 }
 
 export class OpenCodeBridgeClient {
@@ -91,16 +113,21 @@ export class OpenCodeBridgeClient {
     this.abortController = null;
     this.watchdogTimer = null;
     this.reconnectTimer = null;
+    this.promptAbortControllers = new Set();
 
     // Registros de resolución 3-niveles (task / parentID / root) + mapa v2 sessionID -> agent
     this.idleDebounceMs = IDLE_DEBOUNCE_MS;
     this.sessionsById = new Map();
+    this.activeSessionId = null;
     this.sessionAgentMap = new Map();
     this.busySessions = new Map();
     this.sessionIdleTimers = new Map();
     this.taskCallsByChildSession = new Map();
     this.taskCallsByPartId = new Map();
     this.activeAgents = new Set();
+    this.pendingPermissions = new Map();
+    this.liveTaskMeta = new Map(); // externalKey -> { title, file }
+    this.capabilities = null;
 
     // Cola de throttling por agente para proteger CanvasTexture de monitores 3D
     this.lastAgentEmitAt = new Map();
@@ -224,6 +251,18 @@ export class OpenCodeBridgeClient {
     return headers;
   }
 
+  getSessions() {
+    return Array.from(this.sessionsById.values()).sort(
+      (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0),
+    );
+  }
+
+  getPendingPermissions() {
+    return Array.from(this.pendingPermissions.values()).sort(
+      (a, b) => (a.createdAt || 0) - (b.createdAt || 0),
+    );
+  }
+
   getSnapshot() {
     return {
       status: this.status,
@@ -234,6 +273,10 @@ export class OpenCodeBridgeClient {
       lastEventAt: this.lastEventAt,
       activeAgents: Array.from(this.activeAgents),
       sessionsCount: this.sessionsById.size,
+      activeSessionId: this.activeSessionId,
+      sessions: this.getSessions(),
+      pendingPermissions: this.getPendingPermissions(),
+      capabilities: this.capabilities,
     };
   }
 
@@ -318,6 +361,133 @@ export class OpenCodeBridgeClient {
     return false;
   }
 
+  _emitLiveKanbanSync({
+    sessionId = null,
+    agentId = "architect",
+    status = "in_progress",
+    title = "",
+    file = null,
+    preserveTitle = false,
+  } = {}) {
+    if (!agentId) return;
+    const sid = sessionId || this.activeSessionId || "global";
+    const externalKey = `opencode:${sid}:${agentId}`;
+    const prevMeta = this.liveTaskMeta.get(externalKey) || {};
+
+    const resolvedTitle =
+      preserveTitle && prevMeta.title
+        ? prevMeta.title
+        : title || prevMeta.title || "Ejecutando en OpenCode";
+    const resolvedFile = file || prevMeta.file || null;
+
+    if (!preserveTitle && title) {
+      this.liveTaskMeta.set(externalKey, {
+        title: resolvedTitle,
+        file: resolvedFile,
+      });
+    } else if (resolvedFile && !prevMeta.file) {
+      this.liveTaskMeta.set(externalKey, {
+        title: resolvedTitle,
+        file: resolvedFile,
+      });
+    }
+
+    officeEventBus.emit(
+      OFFICE_EVENTS.OPENCODE_TASK_SYNC,
+      {
+        externalKey,
+        sessionId: sid,
+        assigneeId: agentId,
+        status,
+        title: resolvedTitle,
+        file: resolvedFile,
+        source: "opencode",
+      },
+      "opencode-sse",
+    );
+  }
+
+  _emitPermissionsState(added = false, item = null) {
+    officeEventBus.emit(
+      OFFICE_EVENTS.OPENCODE_PERMISSION,
+      {
+        queue: this.getPendingPermissions(),
+        added,
+        item,
+      },
+      "opencode-sse",
+    );
+    this._emitConnectionState();
+  }
+
+  _addPendingPermission(rawPerm, sessionIdHint = null) {
+    if (!rawPerm || typeof rawPerm !== "object") return null;
+    const id =
+      rawPerm.id ||
+      rawPerm.requestID ||
+      rawPerm.permissionID ||
+      rawPerm.callID ||
+      null;
+    if (!id) return null;
+
+    const sessionID =
+      rawPerm.sessionID ||
+      rawPerm.sessionId ||
+      sessionIdHint ||
+      this.activeSessionId ||
+      null;
+    const toolName = String(
+      rawPerm.permission || rawPerm.tool || rawPerm.name || "tool",
+    ).toLowerCase();
+    const targetSummary =
+      formatToolTarget(rawPerm.input || rawPerm.metadata) ||
+      shortFileName(rawPerm.pattern || rawPerm.title) ||
+      (Array.isArray(rawPerm.patterns) && rawPerm.patterns[0]
+        ? shortFileName(rawPerm.patterns[0])
+        : null) ||
+      toolName;
+    const agentId =
+      this._resolveEventAgentId("permission.asked", {
+        ...rawPerm,
+        sessionID,
+      }) || "architect";
+
+    const isNew = !this.pendingPermissions.has(id);
+    const item = {
+      id,
+      sessionID,
+      agentId,
+      toolName,
+      targetSummary,
+      title: rawPerm.title || `Permiso ${toolName}`,
+      createdAt: rawPerm.createdAt || Date.now(),
+    };
+
+    this.pendingPermissions.set(id, item);
+    if (sessionID) {
+      this._cancelSessionIdleTimer(sessionID);
+      this.busySessions.set(sessionID, agentId);
+    }
+
+    this._emitLiveKanbanSync({
+      sessionId: sessionID,
+      agentId,
+      status: "blocked",
+      title: `Permiso CLI: ${toolName}`,
+      file: targetSummary,
+    });
+    this._emitPermissionsState(isNew, item);
+    return item;
+  }
+
+  _removePendingPermission(requestId) {
+    if (!requestId || !this.pendingPermissions.has(requestId)) return false;
+    const removed = this.pendingPermissions.get(requestId);
+    this.pendingPermissions.delete(requestId);
+    this._emitPermissionsState(false, removed);
+    return true;
+  }
+
   _releaseSessionNow(
     sessionId,
     agentId,
@@ -326,6 +496,16 @@ export class OpenCodeBridgeClient {
     if (sessionId) {
       this._cancelSessionIdleTimer(sessionId);
       this.busySessions.delete(sessionId);
+    }
+    if (agentId) {
+      this._emitLiveKanbanSync({
+        sessionId,
+        agentId,
+        status: status === "failed" ? "blocked" : "done",
+        title: label,
+        file,
+        preserveTitle: status !== "failed",
+      });
     }
     if (agentId && !this._hasOtherBusySessionForAgent(agentId, sessionId)) {
       this._queueAgentTask(
@@ -462,13 +642,23 @@ export class OpenCodeBridgeClient {
       null;
     const title = sessionObj.title || prev.title || "";
     const parentID = sessionObj.parentID || prev.parentID || null;
+    const updatedAt =
+      sessionObj.time?.updated ||
+      sessionObj.updatedAt ||
+      prev.updatedAt ||
+      Date.now();
 
     this.sessionsById.set(sessionObj.id, {
       id: sessionObj.id,
       parentID,
       agent: agentHint,
       title,
+      updatedAt,
     });
+
+    if (!this.activeSessionId && !parentID) {
+      this.activeSessionId = sessionObj.id;
+    }
 
     if (agentHint) {
       this.sessionAgentMap.set(sessionObj.id, agentHint);
@@ -510,9 +700,14 @@ export class OpenCodeBridgeClient {
     if (eventType === "session.step.started") {
       if (sessionId) {
         this._cancelSessionIdleTimer(sessionId);
+        if (!this.activeSessionId) this.activeSessionId = sessionId;
         if (props.agent) {
           this.sessionAgentMap.set(sessionId, props.agent);
-          this._upsertSessionRecord({ id: sessionId, agent: props.agent });
+          this._upsertSessionRecord({
+            id: sessionId,
+            agent: props.agent,
+            updatedAt: Date.now(),
+          });
         }
       }
 
@@ -522,6 +717,13 @@ export class OpenCodeBridgeClient {
       if (sessionId) {
         this.busySessions.set(sessionId, agentId);
       }
+      this._emitLiveKanbanSync({
+        sessionId,
+        agentId,
+        status: "in_progress",
+        title: "Paso OpenCode activo",
+        preserveTitle: true,
+      });
       this._queueAgentTask(agentId, {
         status: "started",
         label: "Paso OpenCode activo",
@@ -543,15 +745,10 @@ export class OpenCodeBridgeClient {
         this._cancelSessionIdleTimer(sessionId);
       }
 
-      const toolName = String(props.name || props.tool || "tool").toLowerCase();
+      const rawName = props.name || props.tool || "tool";
+      const toolName = String(rawName).toLowerCase();
       const input = props.input || props.args || {};
-      const file = shortFileName(
-        input.path ||
-          input.filePath ||
-          input.file ||
-          input.pattern ||
-          (input.command ? `$ ${String(input.command).slice(0, 24)}` : null),
-      );
+      const file = formatToolTarget(input);
 
       const agentId = this._resolveEventAgentId(eventType, props);
       if (!agentId) return null;
@@ -565,25 +762,67 @@ export class OpenCodeBridgeClient {
           this.busySessions.set(sessionId, parentAgent);
         }
         if (parentAgent && parentAgent !== agentId) {
+          const coordLabel = `Coordinando @${agentId}`;
+          this._emitLiveKanbanSync({
+            sessionId,
+            agentId: parentAgent,
+            status: "in_progress",
+            title: coordLabel,
+            file,
+          });
           this._queueAgentTask(parentAgent, {
             status: "started",
-            label: `Coordinando @${agentId}`,
-            file: input.description ? String(input.description).slice(0, 30) : null,
+            label: coordLabel,
+            file,
           });
         }
       } else if (sessionId) {
         this.busySessions.set(sessionId, agentId);
       }
 
+      // Preguntas / formularios interactivos (`question`) requieren respuesta en CLI
+      if (toolName === "question") {
+        const isFinished =
+          eventType === "session.tool.success" ||
+          eventType === "session.tool.completed";
+        if (!isFinished) {
+          this._emitLiveKanbanSync({
+            sessionId,
+            agentId,
+            status: "blocked",
+            title: "Esperando respuesta en CLI",
+            file: file || "question",
+          });
+          this._queueAgentTask(
+            agentId,
+            {
+              status: "failed",
+              label: "Esperando respuesta en CLI",
+              file: file || "question",
+            },
+            { immediate: true },
+          );
+          return agentId;
+        }
+      }
+
       if (
         eventType === "session.tool.error" ||
         eventType === "session.tool.failed"
       ) {
+        const errLabel = `Fallo en ${toolName}`;
+        this._emitLiveKanbanSync({
+          sessionId,
+          agentId,
+          status: "blocked",
+          title: errLabel,
+          file,
+        });
         this._queueAgentTask(
           agentId,
           {
             status: "failed",
-            label: `Fallo en ${toolName}`,
+            label: errLabel,
             file,
           },
           { immediate: true },
@@ -597,11 +836,48 @@ export class OpenCodeBridgeClient {
           ? `${baseLabel} ✓`
           : baseLabel;
 
+      this._emitLiveKanbanSync({
+        sessionId,
+        agentId,
+        status: "in_progress",
+        title: baseLabel,
+        file,
+      });
       this._queueAgentTask(agentId, {
         status: "started",
         label,
         file,
       });
+      return agentId;
+    }
+
+    if (eventType.startsWith("session.form.") || eventType === "question.asked") {
+      if (sessionId) this._cancelSessionIdleTimer(sessionId);
+      const agentId = this._resolveEventAgentId(eventType, props);
+      if (!agentId) return null;
+
+      const resolvedForm =
+        eventType.endsWith("replied") ||
+        eventType.endsWith("submitted") ||
+        eventType.endsWith("completed") ||
+        eventType.endsWith("ended");
+
+      this._emitLiveKanbanSync({
+        sessionId,
+        agentId,
+        status: resolvedForm ? "in_progress" : "blocked",
+        title: resolvedForm ? "Formulario respondido" : "Esperando respuesta en CLI",
+        file: formatToolTarget(props.input || props) || "form",
+      });
+      this._queueAgentTask(
+        agentId,
+        {
+          status: resolvedForm ? "started" : "failed",
+          label: resolvedForm ? "Continuando tarea" : "Esperando respuesta en CLI",
+          file: null,
+        },
+        { immediate: !resolvedForm },
+      );
       return agentId;
     }
 
@@ -618,12 +894,20 @@ export class OpenCodeBridgeClient {
       if (sessionId) {
         this.busySessions.set(sessionId, agentId);
       }
+      const label =
+        eventType === "session.reasoning.delta"
+          ? "Analizando solución"
+          : "Redactando respuesta";
+      this._emitLiveKanbanSync({
+        sessionId,
+        agentId,
+        status: "in_progress",
+        title: label,
+        preserveTitle: true,
+      });
       this._queueAgentTask(agentId, {
         status: "started",
-        label:
-          eventType === "session.reasoning.delta"
-            ? "Analizando solución"
-            : "Redactando respuesta",
+        label,
         file: null,
       });
       return agentId;
@@ -661,6 +945,9 @@ export class OpenCodeBridgeClient {
     if (eventType === "session.created" || eventType === "session.updated") {
       const info = props.info || props.session || props;
       this._upsertSessionRecord(info);
+      if (info?.id && !info.parentID) {
+        this.activeSessionId = info.id;
+      }
       const resolved = this._resolveEventAgentId(eventType, {
         ...props,
         info,
@@ -671,12 +958,20 @@ export class OpenCodeBridgeClient {
           this._cancelSessionIdleTimer(sid);
           this.busySessions.set(sid, resolved);
         }
+        const label = info.title ? info.title.slice(0, 32) : "Sesión OpenCode activa";
+        this._emitLiveKanbanSync({
+          sessionId: sid,
+          agentId: resolved,
+          status: "in_progress",
+          title: label,
+        });
         this._queueAgentTask(resolved, {
           status: "started",
-          label: info.title ? info.title.slice(0, 32) : "Sesión OpenCode activa",
+          label,
           file: null,
         });
       }
+      this._emitConnectionState();
       return resolved;
     }
 
@@ -690,6 +985,13 @@ export class OpenCodeBridgeClient {
           this._cancelSessionIdleTimer(sessionId);
           this.busySessions.set(sessionId, agentId);
         }
+        this._emitLiveKanbanSync({
+          sessionId,
+          agentId,
+          status: "in_progress",
+          title: "Procesando prompt OpenCode",
+          preserveTitle: true,
+        });
         this._queueAgentTask(agentId, {
           status: "started",
           label: "Procesando prompt OpenCode",
@@ -729,19 +1031,53 @@ export class OpenCodeBridgeClient {
       return agentId;
     }
 
-    if (eventType === "permission.updated" || eventType === "permission.asked") {
+    if (
+      eventType === "permission.updated" ||
+      eventType === "permission.asked" ||
+      eventType === "session.permission.asked" ||
+      eventType === "session.permission.updated"
+    ) {
       if (sessionId) this._cancelSessionIdleTimer(sessionId);
-      const agentId = this._resolveEventAgentId(eventType, props);
+      const item = this._addPendingPermission(props, sessionId);
+      const agentId = item?.agentId || this._resolveEventAgentId(eventType, props);
       if (!agentId) return null;
       this._queueAgentTask(
         agentId,
         {
           status: "failed",
           label: "Esperando permiso CLI",
-          file: shortFileName(props.pattern || props.title),
+          file: item?.targetSummary || formatToolTarget(props.input || props),
         },
         { immediate: true },
       );
+      return agentId;
+    }
+
+    if (
+      eventType === "permission.replied" ||
+      eventType === "permission.resolved" ||
+      eventType === "session.permission.replied"
+    ) {
+      const reqId = props.requestID || props.permissionID || props.id;
+      const existing = reqId ? this.pendingPermissions.get(reqId) : null;
+      this._removePendingPermission(reqId);
+      const agentId =
+        existing?.agentId || this._resolveEventAgentId(eventType, props);
+      const replyVal = String(props.reply || props.response || "").toLowerCase();
+      if (agentId) {
+        const rejected = replyVal === "reject";
+        this._emitLiveKanbanSync({
+          sessionId: existing?.sessionID || sessionId,
+          agentId,
+          status: rejected ? "blocked" : "in_progress",
+          title: rejected ? "Permiso rechazado" : "Permiso aprobado",
+        });
+        this._queueAgentTask(agentId, {
+          status: rejected ? "failed" : "started",
+          label: rejected ? "Permiso rechazado" : "Permiso aprobado",
+          file: existing?.targetSummary || null,
+        });
+      }
       return agentId;
     }
 
@@ -763,12 +1099,7 @@ export class OpenCodeBridgeClient {
         const toolName = String(part.tool || "tool").toLowerCase();
         const stateStatus = part.state?.status || "running";
         const input = part.state?.input || part.input || {};
-        const file = shortFileName(
-          input.filePath ||
-            input.path ||
-            input.pattern ||
-            (input.command ? `$ ${String(input.command).slice(0, 24)}` : null),
-        );
+        const file = formatToolTarget(input);
 
         // Si tool="task" delega a un subagente, también notificar al agente primario
         if (toolName === "task") {
@@ -778,17 +1109,52 @@ export class OpenCodeBridgeClient {
                 this.sessionsById.get(part.sessionID)?.agent,
             ) || "architect";
           if (parentAgent && parentAgent !== agentId) {
+            const coordLabel = `Coordinando @${agentId}`;
+            this._emitLiveKanbanSync({
+              sessionId: part.sessionID,
+              agentId: parentAgent,
+              status: "in_progress",
+              title: coordLabel,
+              file,
+            });
             this._queueAgentTask(parentAgent, {
               status: "started",
-              label: `Coordinando @${agentId}`,
-              file: input.description ? String(input.description).slice(0, 30) : null,
+              label: coordLabel,
+              file,
             });
           }
         } else if (sessionId) {
           this.busySessions.set(sessionId, agentId);
         }
 
+        if (toolName === "question" && stateStatus !== "completed") {
+          this._emitLiveKanbanSync({
+            sessionId,
+            agentId,
+            status: "blocked",
+            title: "Esperando respuesta en CLI",
+            file: file || "question",
+          });
+          this._queueAgentTask(
+            agentId,
+            {
+              status: "failed",
+              label: "Esperando respuesta en CLI",
+              file: file || "question",
+            },
+            { immediate: true },
+          );
+          return agentId;
+        }
+
         if (stateStatus === "error") {
+          this._emitLiveKanbanSync({
+            sessionId,
+            agentId,
+            status: "blocked",
+            title: `Fallo en ${toolName}`,
+            file,
+          });
           this._queueAgentTask(
             agentId,
             {
@@ -799,6 +1165,13 @@ export class OpenCodeBridgeClient {
             { immediate: true },
           );
         } else if (stateStatus === "completed" && toolName === "task") {
+          this._emitLiveKanbanSync({
+            sessionId,
+            agentId,
+            status: "done",
+            title: "Subtarea completada",
+            file,
+          });
           this._queueAgentTask(
             agentId,
             {
@@ -810,6 +1183,13 @@ export class OpenCodeBridgeClient {
           );
         } else {
           const label = TOOL_LABELS_ES[toolName] || `Tool: ${toolName}`;
+          this._emitLiveKanbanSync({
+            sessionId,
+            agentId,
+            status: "in_progress",
+            title: label,
+            file,
+          });
           this._queueAgentTask(agentId, {
             status: "started",
             label,
@@ -821,12 +1201,20 @@ export class OpenCodeBridgeClient {
 
       if (part.type === "text" || part.type === "reasoning") {
         if (sessionId) this.busySessions.set(sessionId, agentId);
+        const label =
+          part.type === "reasoning"
+            ? "Analizando solución"
+            : "Redactando respuesta";
+        this._emitLiveKanbanSync({
+          sessionId,
+          agentId,
+          status: "in_progress",
+          title: label,
+          preserveTitle: true,
+        });
         this._queueAgentTask(agentId, {
           status: "started",
-          label:
-            part.type === "reasoning"
-              ? "Analizando solución"
-              : "Redactando respuesta",
+          label,
           file: null,
         });
       }
@@ -837,14 +1225,28 @@ export class OpenCodeBridgeClient {
     if (eventType === "office.agent_event" || props.agentId) {
       const agentId = this._resolveEventAgentId(eventType, props);
       if (!agentId) return null;
+      const status = props.status || "started";
+      const file = shortFileName(props.file);
+      this._emitLiveKanbanSync({
+        sessionId,
+        agentId,
+        status:
+          status === "passed"
+            ? "done"
+            : status === "failed"
+              ? "blocked"
+              : "in_progress",
+        title: props.label || "Evento OpenCode",
+        file,
+      });
       this._queueAgentTask(
         agentId,
         {
-          status: props.status || "started",
+          status,
           label: props.label || "Evento OpenCode",
-          file: shortFileName(props.file),
+          file,
         },
-        { immediate: props.status === "passed" || props.status === "failed" },
+        { immediate: status === "passed" || status === "failed" },
       );
       return agentId;
     }
@@ -1067,6 +1469,528 @@ export class OpenCodeBridgeClient {
     }
   }
 
+  _normalizeDiscoveredPath(rawPath) {
+    if (!rawPath) return null;
+    if (rawPath.startsWith("/api/") || rawPath === "/api") return rawPath;
+    return `${this.apiPrefix}${rawPath.startsWith("/") ? rawPath : `/${rawPath}`}`;
+  }
+
+  _fillEndpointTemplate(template, params = {}) {
+    return template.replace(/\{([^}]+)\}/g, (_, key) => {
+      const lower = key.toLowerCase();
+      if (lower.includes("session") || lower === "id") {
+        return encodeURIComponent(params.sessionID || "");
+      }
+      if (lower.includes("request") || lower.includes("permission")) {
+        return encodeURIComponent(params.requestID || "");
+      }
+      if (lower.includes("form")) {
+        return encodeURIComponent(params.formID || "");
+      }
+      return encodeURIComponent(params[key] || "");
+    });
+  }
+
+  async _discoverOpenApiCapabilities(baseUrl = this.getActiveBaseUrl(), signal) {
+    const defaults = {
+      discoveredFrom: "defaults",
+      promptPaths: [
+        `${this.apiPrefix}/session/{sessionID}/prompt`,
+        `${this.apiPrefix}/session/{sessionID}/prompt_async`,
+        `${this.apiPrefix}/session/{sessionID}/message`,
+      ],
+      interruptPaths: [
+        `${this.apiPrefix}/session/{sessionID}/interrupt`,
+        `${this.apiPrefix}/session/{sessionID}/abort`,
+      ],
+      permissionListPaths: [
+        `${this.apiPrefix}/session/{sessionID}/permission`,
+        `${this.apiPrefix}/permission`,
+      ],
+      permissionReplyPaths: [
+        `${this.apiPrefix}/session/{sessionID}/permission/{requestID}/reply`,
+        `${this.apiPrefix}/permission/{requestID}/reply`,
+        `${this.apiPrefix}/session/{sessionID}/permissions/{requestID}`,
+      ],
+      formListPaths: [`${this.apiPrefix}/session/{sessionID}/form`],
+    };
+
+    try {
+      const resp = await fetch(`${baseUrl}/openapi.json`, {
+        headers: {
+          Accept: "application/json",
+          ...this._buildAuthHeaders(),
+        },
+        signal: signal || AbortSignal.timeout(3000),
+      });
+      const ct = (resp.headers.get("content-type") || "").toLowerCase();
+      if (!resp.ok || !ct.includes("application/json")) {
+        this.capabilities = defaults;
+        return defaults;
+      }
+
+      const spec = await resp.json().catch(() => null);
+      const paths = spec?.paths;
+      if (!paths || typeof paths !== "object") {
+        this.capabilities = defaults;
+        return defaults;
+      }
+
+      const promptFound = [];
+      const interruptFound = [];
+      const permListFound = [];
+      const permReplyFound = [];
+      const formListFound = [];
+
+      for (const [rawPath, methods] of Object.entries(paths)) {
+        if (!methods || typeof methods !== "object") continue;
+        const norm = this._normalizeDiscoveredPath(rawPath);
+        if (methods.post) {
+          if (/\/session\/\{[^}]+\}\/(prompt|prompt_async|message)$/i.test(rawPath)) {
+            promptFound.push(norm);
+          } else if (/\/session\/\{[^}]+\}\/(interrupt|abort)$/i.test(rawPath)) {
+            interruptFound.push(norm);
+          } else if (
+            /\/permission\/\{[^}]+\}\/reply$/i.test(rawPath) ||
+            /\/session\/\{[^}]+\}\/permissions\/\{[^}]+\}$/i.test(rawPath)
+          ) {
+            permReplyFound.push(norm);
+          }
+        }
+        if (methods.get) {
+          if (/\/permission$/i.test(rawPath)) {
+            permListFound.push(norm);
+          } else if (/\/session\/\{[^}]+\}\/form$/i.test(rawPath)) {
+            formListFound.push(norm);
+          }
+        }
+      }
+
+      const dedup = (arr, fallback) => [...new Set([...arr, ...fallback])];
+      promptFound.sort((a, b) => {
+        const rank = (p) =>
+          p.endsWith("/prompt") ? 0 : p.endsWith("/prompt_async") ? 1 : 2;
+        return rank(a) - rank(b);
+      });
+      interruptFound.sort((a, b) =>
+        a.endsWith("/interrupt") === b.endsWith("/interrupt")
+          ? 0
+          : a.endsWith("/interrupt")
+            ? -1
+            : 1,
+      );
+      permReplyFound.sort((a, b) =>
+        a.includes("/session/") === b.includes("/session/")
+          ? 0
+          : a.includes("/session/")
+            ? -1
+            : 1,
+      );
+      permListFound.sort((a, b) =>
+        a.includes("/session/") === b.includes("/session/")
+          ? 0
+          : a.includes("/session/")
+            ? -1
+            : 1,
+      );
+
+      this.capabilities = {
+        discoveredFrom: "openapi.json",
+        promptPaths: dedup(promptFound, defaults.promptPaths),
+        interruptPaths: dedup(interruptFound, defaults.interruptPaths),
+        permissionListPaths: dedup(permListFound, defaults.permissionListPaths),
+        permissionReplyPaths: dedup(permReplyFound, defaults.permissionReplyPaths),
+        formListPaths: dedup(formListFound, defaults.formListPaths),
+      };
+      return this.capabilities;
+    } catch {
+      this.capabilities = defaults;
+      return defaults;
+    }
+  }
+
+  async syncSessionPermissions(sessionId = this.activeSessionId, signal) {
+    if (!sessionId) return [];
+    const baseUrl = this.getActiveBaseUrl();
+    const caps = this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl, signal));
+    const headers = {
+      Accept: "application/json",
+      ...this._buildAuthHeaders(),
+    };
+
+    for (const template of caps.permissionListPaths) {
+      const path = this._fillEndpointTemplate(template, { sessionID: sessionId });
+      try {
+        const resp = await fetch(`${baseUrl}${path}`, {
+          headers,
+          signal: signal || AbortSignal.timeout(3000),
+        });
+        const ct = (resp.headers.get("content-type") || "").toLowerCase();
+        if (!resp.ok || !ct.includes("application/json")) continue;
+
+        const data = await resp.json().catch(() => null);
+        const list = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.permissions)
+            ? data.permissions
+            : data && typeof data === "object" && data.id
+              ? [data]
+              : [];
+
+        for (const perm of list) {
+          this._addPendingPermission(perm, sessionId);
+        }
+        return this.getPendingPermissions();
+      } catch {
+        // Probar siguiente ruta candidata
+      }
+    }
+    return this.getPendingPermissions();
+  }
+
+  async createSession({ title = "", agent = "architect" } = {}) {
+    const baseUrl = this.getActiveBaseUrl();
+    const body = {};
+    if (title && String(title).trim()) body.title = String(title).trim().slice(0, 64);
+    if (agent) body.agent = agent;
+
+    const resp = await fetch(`${baseUrl}${this.apiPrefix}/session`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        ...this._buildAuthHeaders(),
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(6000),
+    });
+
+    const ct = (resp.headers.get("content-type") || "").toLowerCase();
+    if (!resp.ok) {
+      throw new Error(
+        resp.status === 401
+          ? "Autenticación requerida (401)"
+          : `Error HTTP ${resp.status} creando sesión`,
+      );
+    }
+    if (!ct.includes("application/json")) {
+      throw new Error("OpenCode devolvió HTML en lugar de JSON al crear sesión");
+    }
+
+    const session = await resp.json();
+    if (session?.id) {
+      this._upsertSessionRecord({ ...session, agent: session.agent || agent });
+      this.activeSessionId = session.id;
+      this._emitConnectionState();
+    }
+    return session;
+  }
+
+  async sendPrompt({ sessionId = null, agent = "architect", text = "" } = {}) {
+    const cleanText = String(text || "").trim();
+    if (!cleanText) {
+      return { ok: false, error: "Escribe una instrucción antes de enviar." };
+    }
+
+    const baseUrl = this.getActiveBaseUrl();
+    const caps =
+      this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
+
+    let targetSessionId = sessionId || this.activeSessionId;
+    if (!targetSessionId) {
+      const created = await this.createSession({
+        title: cleanText.slice(0, 36),
+        agent,
+      });
+      targetSessionId = created?.id;
+    }
+
+    if (!targetSessionId) {
+      return { ok: false, error: "No se pudo obtener una sesión activa." };
+    }
+
+    this.activeSessionId = targetSessionId;
+    if (agent) {
+      this.sessionAgentMap.set(targetSessionId, agent);
+      this._upsertSessionRecord({
+        id: targetSessionId,
+        agent,
+        updatedAt: Date.now(),
+      });
+    }
+
+    const body = {
+      ...(agent ? { agent } : {}),
+      parts: [{ type: "text", text: cleanText }],
+    };
+
+    const controller = new AbortController();
+    this.promptAbortControllers.add(controller);
+
+    const headers = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...this._buildAuthHeaders(),
+    };
+
+    try {
+      for (const template of caps.promptPaths) {
+        const path = this._fillEndpointTemplate(template, {
+          sessionID: targetSessionId,
+        });
+
+        const fetchPromise = fetch(`${baseUrl}${path}`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+
+        // Si el endpoint /prompt mantiene la petición abierta durante el turno,
+        // no bloqueamos la UI: esperamos hasta 1500ms por errores tempranos (404/401/400)
+        // o respuesta inmediata, y si sigue abierto confirmamos el envío en curso.
+        const raceOutcome = await Promise.race([
+          fetchPromise
+            .then((resp) => ({ settled: true, resp }))
+            .catch((err) => ({ settled: true, err })),
+          new Promise((resolve) =>
+            setTimeout(() => resolve({ settled: false }), 1500),
+          ),
+        ]);
+
+        if (!raceOutcome.settled) {
+          this.busySessions.set(targetSessionId, agent || "architect");
+          this._emitLiveKanbanSync({
+            sessionId: targetSessionId,
+            agentId: this.resolveAgentId(agent) || "architect",
+            status: "in_progress",
+            title: cleanText.slice(0, 48),
+          });
+          this._queueAgentTask(this.resolveAgentId(agent) || "architect", {
+            status: "started",
+            label: "Procesando prompt",
+            file: null,
+          });
+          fetchPromise
+            .catch((lateErr) => {
+              if (lateErr?.name !== "AbortError") {
+                this.lastError = lateErr?.message || "Error en prompt OpenCode";
+                this._emitConnectionState();
+              }
+            })
+            .finally(() => {
+              this.promptAbortControllers.delete(controller);
+            });
+          return {
+            ok: true,
+            pending: true,
+            sessionId: targetSessionId,
+            endpoint: path,
+          };
+        }
+
+        if (raceOutcome.err) {
+          if (raceOutcome.err?.name === "AbortError") {
+            return { ok: false, aborted: true, error: "Envío cancelado" };
+          }
+          throw raceOutcome.err;
+        }
+
+        const resp = raceOutcome.resp;
+        if (resp.status === 404 || resp.status === 405) {
+          continue;
+        }
+        const ct = (resp.headers.get("content-type") || "").toLowerCase();
+        if (ct.includes("text/html")) {
+          continue;
+        }
+        if (!resp.ok) {
+          const errJson = await resp.json().catch(() => null);
+          return {
+            ok: false,
+            status: resp.status,
+            error:
+              errJson?.error ||
+              errJson?.message ||
+              (resp.status === 401
+                ? "Credenciales Basic Auth inválidas (401)"
+                : `HTTP ${resp.status} en ${path}`),
+          };
+        }
+
+        this.busySessions.set(
+          targetSessionId,
+          this.resolveAgentId(agent) || "architect",
+        );
+        this._emitLiveKanbanSync({
+          sessionId: targetSessionId,
+          agentId: this.resolveAgentId(agent) || "architect",
+          status: "in_progress",
+          title: cleanText.slice(0, 48),
+        });
+        this._queueAgentTask(this.resolveAgentId(agent) || "architect", {
+          status: "started",
+          label: "Prompt recibido",
+          file: null,
+        });
+        return { ok: true, sessionId: targetSessionId, endpoint: path };
+      }
+
+      return {
+        ok: false,
+        error: "No se encontró un endpoint compatible (/prompt o /message)",
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err?.message || "No se pudo enviar el prompt a OpenCode",
+      };
+    } finally {
+      this.promptAbortControllers.delete(controller);
+    }
+  }
+
+  async interruptSession(sessionId = this.activeSessionId) {
+    for (const ctrl of this.promptAbortControllers) {
+      ctrl.abort();
+    }
+    this.promptAbortControllers.clear();
+
+    if (!sessionId) {
+      return { ok: false, error: "No hay sesión activa para detener." };
+    }
+
+    const baseUrl = this.getActiveBaseUrl();
+    const caps =
+      this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
+    const headers = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...this._buildAuthHeaders(),
+    };
+
+    for (const template of caps.interruptPaths) {
+      const path = this._fillEndpointTemplate(template, {
+        sessionID: sessionId,
+      });
+      try {
+        const resp = await fetch(`${baseUrl}${path}`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({}),
+          signal: AbortSignal.timeout(4000),
+        });
+        const ct = (resp.headers.get("content-type") || "").toLowerCase();
+        if (resp.status === 404 || resp.status === 405 || ct.includes("text/html")) {
+          continue;
+        }
+        if (!resp.ok) {
+          return { ok: false, error: `HTTP ${resp.status} al detener sesión` };
+        }
+        const agentId =
+          this.busySessions.get(sessionId) ||
+          this.resolveAgentId(this.sessionAgentMap.get(sessionId)) ||
+          "architect";
+        this._releaseSessionNow(sessionId, agentId, {
+          status: "passed",
+          label: "Ejecución detenida",
+        });
+        return { ok: true, endpoint: path };
+      } catch (err) {
+        if (err?.name === "TimeoutError") {
+          return { ok: false, error: "Tiempo de espera agotado al detener" };
+        }
+      }
+    }
+
+    return {
+      ok: false,
+      error: "No se encontró endpoint /interrupt o /abort en OpenCode",
+    };
+  }
+
+  async replyPermission(requestId, response = "once") {
+    const item = this.pendingPermissions.get(requestId);
+    if (!item) {
+      return { ok: false, error: "El permiso ya fue resuelto o expiró." };
+    }
+
+    const validResp =
+      response === "always" || response === "reject" ? response : "once";
+    const baseUrl = this.getActiveBaseUrl();
+    const caps =
+      this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
+    const headers = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...this._buildAuthHeaders(),
+    };
+
+    const bodyCandidates = [{ response: validResp }, { reply: validResp }];
+
+    for (const template of caps.permissionReplyPaths) {
+      if (template.includes("{sessionID}") && !item.sessionID) continue;
+      const path = this._fillEndpointTemplate(template, {
+        sessionID: item.sessionID || "",
+        requestID: requestId,
+      });
+
+      for (const payload of bodyCandidates) {
+        try {
+          const resp = await fetch(`${baseUrl}${path}`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(5000),
+          });
+          const ct = (resp.headers.get("content-type") || "").toLowerCase();
+          if (resp.status === 404 || resp.status === 405 || ct.includes("text/html")) {
+            break;
+          }
+          if (resp.status === 400 || resp.status === 422) {
+            continue;
+          }
+          if (!resp.ok) {
+            return {
+              ok: false,
+              error: `Error HTTP ${resp.status} al responder permiso`,
+            };
+          }
+
+          this._removePendingPermission(requestId);
+          const rejected = validResp === "reject";
+          this._emitLiveKanbanSync({
+            sessionId: item.sessionID,
+            agentId: item.agentId,
+            status: rejected ? "blocked" : "in_progress",
+            title: rejected ? "Permiso rechazado" : "Permiso aprobado",
+            file: item.targetSummary,
+          });
+          this._queueAgentTask(
+            item.agentId,
+            {
+              status: rejected ? "failed" : "started",
+              label: rejected ? "Permiso rechazado" : "Permiso aprobado",
+              file: item.targetSummary,
+            },
+            { immediate: rejected },
+          );
+          return { ok: true, endpoint: path };
+        } catch (err) {
+          return {
+            ok: false,
+            error: err?.message || "No se pudo responder el permiso",
+          };
+        }
+      }
+    }
+
+    return {
+      ok: false,
+      error: "No se encontró endpoint compatible de permisos (/permission/.../reply)",
+    };
+  }
+
   async _syncInitialSessions(signal) {
     const baseUrl = this.getActiveBaseUrl();
     const headers = {
@@ -1085,6 +2009,8 @@ export class OpenCodeBridgeClient {
         for (const s of list) this._upsertSessionRecord(s);
       }
 
+      await this._discoverOpenApiCapabilities(baseUrl, signal);
+
       const statusResp = await fetch(`${baseUrl}${this.apiPrefix}/session/status`, {
         headers,
         signal,
@@ -1096,11 +2022,19 @@ export class OpenCodeBridgeClient {
         if (statusMap && typeof statusMap === "object") {
           for (const [sessionId, st] of Object.entries(statusMap)) {
             if (st?.type === "busy") {
+              this.activeSessionId = this.activeSessionId || sessionId;
               const agentId = this._resolveEventAgentId("session.status", {
                 sessionID: sessionId,
                 status: st,
               });
               if (agentId) {
+                this.busySessions.set(sessionId, agentId);
+                this._emitLiveKanbanSync({
+                  sessionId,
+                  agentId,
+                  status: "in_progress",
+                  title: "Sesión OpenCode en curso",
+                });
                 this._queueAgentTask(agentId, {
                   status: "started",
                   label: "Sesión OpenCode en curso",
@@ -1110,6 +2044,14 @@ export class OpenCodeBridgeClient {
             }
           }
         }
+      }
+
+      const targetSessionForPerms =
+        this.activeSessionId || this.getSessions()[0]?.id || null;
+      if (targetSessionForPerms) {
+        await this.syncSessionPermissions(targetSessionForPerms, signal).catch(
+          () => [],
+        );
       }
     } catch (err) {
       if (err?.message?.includes("401")) throw err;
@@ -1290,16 +2232,23 @@ export class OpenCodeBridgeClient {
   disconnect() {
     this.manualDisconnect = true;
     this._abortActiveStream();
+    for (const ctrl of this.promptAbortControllers) {
+      ctrl.abort();
+    }
+    this.promptAbortControllers.clear();
     this._clearThrottleQueues();
     this.activeAgents.clear();
     this.sessionsById.clear();
+    this.activeSessionId = null;
     this.sessionAgentMap.clear();
     this.busySessions.clear();
+    this.pendingPermissions.clear();
+    this.liveTaskMeta.clear();
     this.taskCallsByChildSession.clear();
     this.taskCallsByPartId.clear();
     this.status = "disconnected";
     this.lastError = null;
-    this._emitConnectionState();
+    this._emitPermissionsState(false, null);
   }
 
   dispose() {

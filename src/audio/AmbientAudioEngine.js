@@ -79,6 +79,8 @@ export class AmbientAudioEngine {
         entry.type === OFFICE_EVENTS.OFFICE_MEETING
       ) {
         this.playSoftTick();
+      } else if (entry.type === OFFICE_EVENTS.OPENCODE_PERMISSION && payload?.added) {
+        this.playPermissionAlert();
       }
     });
   }
@@ -180,6 +182,27 @@ export class AmbientAudioEngine {
       gain.connect(this.masterGain);
       osc.start(start);
       osc.stop(start + 0.22);
+    });
+  }
+
+  playPermissionAlert() {
+    if (!this.enabled || !this.ctx || !this.masterGain) return;
+    const notes = [587.33, 880.0]; // D5 -> A5 (atento, limpio)
+    notes.forEach((freq, idx) => {
+      const start = this.ctx.currentTime + idx * 0.1;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(freq, start);
+
+      gain.gain.setValueAtTime(0.001, start);
+      gain.gain.linearRampToValueAtTime(0.085, start + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.001, start + 0.24);
+
+      osc.connect(gain);
+      gain.connect(this.masterGain);
+      osc.start(start);
+      osc.stop(start + 0.26);
     });
   }
 
