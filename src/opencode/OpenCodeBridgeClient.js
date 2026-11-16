@@ -1414,6 +1414,18 @@ export class OpenCodeBridgeClient {
     };
   }
 
+  _unwrapResponseData(payload) {
+    if (
+      payload &&
+      typeof payload === "object" &&
+      !Array.isArray(payload) &&
+      "data" in payload
+    ) {
+      return payload.data;
+    }
+    return payload;
+  }
+
   async testConnection() {
     const baseUrl = this.getActiveBaseUrl();
     const start = performance.now();
@@ -1438,8 +1450,8 @@ export class OpenCodeBridgeClient {
         };
       }
 
-      const data = await probe.resp.json().catch(() => null);
-      if (data === null) {
+      const raw = await probe.resp.json().catch(() => null);
+      if (raw === null) {
         return {
           ok: false,
           status: probe.status,
@@ -1448,6 +1460,7 @@ export class OpenCodeBridgeClient {
         };
       }
 
+      const data = this._unwrapResponseData(raw);
       const list = Array.isArray(data) ? data : data?.sessions || [];
       return {
         ok: true,
@@ -1504,12 +1517,19 @@ export class OpenCodeBridgeClient {
     if (Array.isArray(schema.allOf)) {
       const mergedProps = {};
       const mergedReq = [];
+      let strict = false;
       for (const item of schema.allOf) {
         const resolved = this._resolveSchemaRef(spec, item, seen);
         if (resolved?.properties) Object.assign(mergedProps, resolved.properties);
         if (Array.isArray(resolved?.required)) mergedReq.push(...resolved.required);
+        if (resolved?.additionalProperties === false) strict = true;
       }
-      return { type: "object", properties: mergedProps, required: mergedReq };
+      return {
+        type: "object",
+        properties: mergedProps,
+        required: mergedReq,
+        ...(strict ? { additionalProperties: false } : {}),
+      };
     }
     if (Array.isArray(schema.anyOf) || Array.isArray(schema.oneOf)) {
       const variants = schema.anyOf || schema.oneOf;
@@ -1529,10 +1549,13 @@ export class OpenCodeBridgeClient {
       rawBody?.content?.["*/*"]?.schema ||
       null;
     const resolved = this._resolveSchemaRef(spec, rawSchema);
-    if (!resolved || typeof resolved !== "object") return { hasBody: true, props: [] };
+    if (!resolved || typeof resolved !== "object") {
+      return { hasBody: true, props: [], required: [], strict: false };
+    }
     const props = resolved.properties ? Object.keys(resolved.properties) : [];
     const required = Array.isArray(resolved.required) ? resolved.required : [];
-    return { hasBody: true, props, required };
+    const strict = resolved.additionalProperties === false;
+    return { hasBody: true, props, required, strict };
   }
 
   async _extractHttpError(resp, fallbackText) {
@@ -1585,7 +1608,10 @@ export class OpenCodeBridgeClient {
   async _discoverOpenApiCapabilities(baseUrl = this.getActiveBaseUrl(), signal) {
     const defaults = {
       discoveredFrom: "defaults",
-      createSessionProps: ["title"],
+      createSessionSchema: null,
+      activeSessionPath: `${this.apiPrefix}/session/active`,
+      sessionStatusPath: null,
+      sessionAgentEndpoints: [],
       promptPaths: [
         `${this.apiPrefix}/session/{sessionID}/prompt`,
         `${this.apiPrefix}/session/{sessionID}/prompt_async`,
@@ -1639,15 +1665,18 @@ export class OpenCodeBridgeClient {
       const permReplyFound = [];
       const permissionReplySchemas = {};
       const formListFound = [];
-      let createSessionProps = defaults.createSessionProps;
+      const sessionAgentEndpoints = [];
+      let createSessionSchema = null;
+      let activeSessionPath = null;
+      let sessionStatusPath = null;
 
       for (const [rawPath, methods] of Object.entries(paths)) {
         if (!methods || typeof methods !== "object") continue;
         const norm = this._normalizeDiscoveredPath(rawPath);
+
         if (methods.post) {
           if (/^(\/api)?\/session$/i.test(rawPath)) {
-            const info = this._extractBodySchemaInfo(spec, methods.post);
-            if (info?.props?.length) createSessionProps = info.props;
+            createSessionSchema = this._extractBodySchemaInfo(spec, methods.post);
           } else if (/\/session\/\{[^}]+\}\/(prompt|prompt_async|message)$/i.test(rawPath)) {
             promptFound.push(norm);
             const info = this._extractBodySchemaInfo(spec, methods.post);
@@ -1663,10 +1692,29 @@ export class OpenCodeBridgeClient {
             permReplyFound.push(norm);
             const info = this._extractBodySchemaInfo(spec, methods.post);
             if (info) permissionReplySchemas[norm] = info;
+          } else if (/\/session\/\{[^}]+\}\/agent$/i.test(rawPath)) {
+            sessionAgentEndpoints.push({
+              method: "POST",
+              path: norm,
+              schema: this._extractBodySchemaInfo(spec, methods.post),
+            });
           }
         }
+
+        if (methods.patch && /\/session\/\{[^}]+\}\/agent$/i.test(rawPath)) {
+          sessionAgentEndpoints.unshift({
+            method: "PATCH",
+            path: norm,
+            schema: this._extractBodySchemaInfo(spec, methods.patch),
+          });
+        }
+
         if (methods.get) {
-          if (/\/permission$/i.test(rawPath)) {
+          if (/^(\/api)?\/session\/active$/i.test(rawPath)) {
+            activeSessionPath = norm;
+          } else if (/^(\/api)?\/session\/status$/i.test(rawPath)) {
+            sessionStatusPath = norm;
+          } else if (/\/permission$/i.test(rawPath)) {
             permListFound.push(norm);
           } else if (/\/session\/\{[^}]+\}\/form$/i.test(rawPath)) {
             formListFound.push(norm);
@@ -1704,7 +1752,10 @@ export class OpenCodeBridgeClient {
 
       this.capabilities = {
         discoveredFrom: "openapi.json",
-        createSessionProps,
+        createSessionSchema,
+        activeSessionPath,
+        sessionStatusPath,
+        sessionAgentEndpoints,
         promptPaths: dedup(promptFound, defaults.promptPaths),
         promptBodySchemas,
         interruptPaths: dedup(interruptFound, defaults.interruptPaths),
@@ -1740,7 +1791,8 @@ export class OpenCodeBridgeClient {
         const ct = (resp.headers.get("content-type") || "").toLowerCase();
         if (!resp.ok || !ct.includes("application/json")) continue;
 
-        const data = await resp.json().catch(() => null);
+        const raw = await resp.json().catch(() => null);
+        const data = this._unwrapResponseData(raw);
         const list = Array.isArray(data)
           ? data
           : Array.isArray(data?.permissions)
@@ -1764,18 +1816,34 @@ export class OpenCodeBridgeClient {
     const baseUrl = this.getActiveBaseUrl();
     const caps =
       this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
-    const allowed = new Set(caps.createSessionProps || ["title"]);
+    const schema = caps.createSessionSchema;
 
-    const primaryBody = {};
-    if (title && String(title).trim() && (allowed.has("title") || allowed.size === 0)) {
-      primaryBody.title = String(title).trim().slice(0, 64);
-    }
-    if (agent && allowed.has("agent")) {
-      primaryBody.agent = agent;
-    }
+    const candidates = [];
+    const pushUnique = (obj) => {
+      const key = JSON.stringify(obj);
+      if (!candidates.some((c) => JSON.stringify(c) === key)) {
+        candidates.push(obj);
+      }
+    };
 
-    const candidates =
-      Object.keys(primaryBody).length > 0 ? [primaryBody, {}] : [{}];
+    if (schema?.props?.length) {
+      const body = {};
+      const allowed = new Set(schema.props);
+      if (agent && allowed.has("agent")) {
+        body.agent = agent;
+      }
+      if (title && String(title).trim() && allowed.has("title")) {
+        body.title = String(title).trim().slice(0, 64);
+      }
+      if (Object.keys(body).length > 0) pushUnique(body);
+      pushUnique({});
+    } else {
+      if (agent) pushUnique({ agent });
+      if (title && String(title).trim()) {
+        pushUnique({ title: String(title).trim().slice(0, 64) });
+      }
+      pushUnique({});
+    }
 
     let lastErr = "No se pudo crear la sesión";
     for (const payload of candidates) {
@@ -1810,27 +1878,61 @@ export class OpenCodeBridgeClient {
         throw new Error("OpenCode devolvió HTML en lugar de JSON al crear sesión");
       }
 
-      const session = await resp.json();
+      const rawJson = await resp.json();
+      const session = this._unwrapResponseData(rawJson);
       if (session?.id) {
         if (agent) this.sessionAgentMap.set(session.id, agent);
         this._upsertSessionRecord({ ...session, agent: session.agent || agent });
         this.activeSessionId = session.id;
         this._emitConnectionState();
+        return session;
       }
-      return session;
     }
 
     throw new Error(lastErr);
   }
 
+  async _switchSessionAgent(sessionId, agent, caps) {
+    if (!sessionId || !agent || !caps?.sessionAgentEndpoints?.length) return false;
+    const baseUrl = this.getActiveBaseUrl();
+    const headers = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...this._buildAuthHeaders(),
+    };
+
+    for (const ep of caps.sessionAgentEndpoints) {
+      const path = this._fillEndpointTemplate(ep.path, { sessionID: sessionId });
+      const props = ep.schema?.props || [];
+      const payload = props.includes("name")
+        ? { name: agent }
+        : props.includes("agentID")
+          ? { agentID: agent }
+          : { agent };
+      try {
+        const resp = await fetch(`${baseUrl}${path}`, {
+          method: ep.method,
+          headers,
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(2500),
+        });
+        if (resp.ok) return true;
+      } catch {
+        // Mejor esfuerzo; continuar con prompt
+      }
+    }
+    return false;
+  }
+
   _buildPromptPayloads(template, cleanText, agent, caps) {
     const schema = caps?.promptBodySchemas?.[template];
     const props = schema?.props || [];
+    const isStrict = Boolean(schema?.strict && props.length > 0);
     const hasText = props.includes("text");
     const hasParts = props.includes("parts");
     const hasMessage = props.includes("message");
     const hasContent = props.includes("content");
-    const allowsAgent = props.length === 0 || props.includes("agent");
+    const allowsAgent = props.length > 0 ? props.includes("agent") : false;
 
     const candidates = [];
     const pushUnique = (obj) => {
@@ -1843,29 +1945,45 @@ export class OpenCodeBridgeClient {
     const partsBody = { parts: [{ type: "text", text: cleanText }] };
     const textBody = { text: cleanText };
 
+    if (isStrict) {
+      if (hasText) {
+        if (agent && allowsAgent) pushUnique({ agent, ...textBody });
+        pushUnique(textBody);
+      }
+      if (hasParts) {
+        if (agent && allowsAgent) pushUnique({ agent, ...partsBody });
+        pushUnique(partsBody);
+      }
+      if (hasMessage) {
+        if (agent && allowsAgent) pushUnique({ agent, message: cleanText });
+        pushUnique({ message: cleanText });
+      }
+      if (hasContent) {
+        if (agent && allowsAgent) pushUnique({ agent, content: cleanText });
+        pushUnique({ content: cleanText });
+      }
+      if (candidates.length > 0) return candidates;
+    }
+
     if (hasText && !hasParts) {
       if (agent && allowsAgent) pushUnique({ agent, ...textBody });
       pushUnique(textBody);
-      if (agent) pushUnique({ agent, ...partsBody });
       pushUnique(partsBody);
     } else if (hasParts && !hasText) {
       if (agent && allowsAgent) pushUnique({ agent, ...partsBody });
       pushUnique(partsBody);
-      if (agent) pushUnique({ agent, ...textBody });
       pushUnique(textBody);
     } else {
-      if (agent && allowsAgent) pushUnique({ agent, ...partsBody });
-      if (agent && allowsAgent) pushUnique({ agent, ...textBody });
-      pushUnique(partsBody);
       pushUnique(textBody);
+      pushUnique(partsBody);
+      if (agent) pushUnique({ agent, ...textBody });
+      if (agent) pushUnique({ agent, ...partsBody });
     }
 
     if (hasMessage) {
-      if (agent && allowsAgent) pushUnique({ agent, message: cleanText });
       pushUnique({ message: cleanText });
     }
     if (hasContent) {
-      if (agent && allowsAgent) pushUnique({ agent, content: cleanText });
       pushUnique({ content: cleanText });
     }
 
@@ -1884,11 +2002,18 @@ export class OpenCodeBridgeClient {
 
     let targetSessionId = sessionId || this.activeSessionId;
     if (!targetSessionId) {
-      const created = await this.createSession({
-        title: cleanText.slice(0, 36),
-        agent,
-      });
-      targetSessionId = created?.id;
+      try {
+        const created = await this.createSession({
+          title: cleanText.slice(0, 36),
+          agent,
+        });
+        targetSessionId = created?.id;
+      } catch (createErr) {
+        return {
+          ok: false,
+          error: createErr?.message || "No se pudo crear una sesión activa.",
+        };
+      }
     }
 
     if (!targetSessionId) {
@@ -1903,6 +2028,7 @@ export class OpenCodeBridgeClient {
         agent,
         updatedAt: Date.now(),
       });
+      await this._switchSessionAgent(targetSessionId, agent, caps);
     }
 
     const controller = new AbortController();
@@ -2072,7 +2198,9 @@ export class OpenCodeBridgeClient {
         sessionID: sessionId,
       });
       const expectsBody = Boolean(caps.interruptBodyInfo?.[template]);
-      const attemptBodies = expectsBody ? [JSON.stringify({}), undefined] : [undefined, JSON.stringify({})];
+      const attemptBodies = expectsBody
+        ? [JSON.stringify({}), undefined]
+        : [undefined, JSON.stringify({})];
 
       for (const body of attemptBodies) {
         try {
@@ -2156,9 +2284,20 @@ export class OpenCodeBridgeClient {
       });
 
       const schemaProps = caps.permissionReplySchemas?.[template]?.props || [];
-      const bodyCandidates = schemaProps.includes("reply")
-        ? [{ reply: validResp }, { response: validResp }]
-        : [{ response: validResp }, { reply: validResp }];
+      let bodyCandidates;
+      if (schemaProps.includes("decision")) {
+        bodyCandidates = [{ decision: validResp }];
+      } else if (schemaProps.includes("reply")) {
+        bodyCandidates = [{ reply: validResp }, { decision: validResp }];
+      } else if (schemaProps.includes("response")) {
+        bodyCandidates = [{ response: validResp }, { decision: validResp }];
+      } else {
+        bodyCandidates = [
+          { decision: validResp },
+          { reply: validResp },
+          { response: validResp },
+        ];
+      }
 
       for (const payload of bodyCandidates) {
         try {
@@ -2238,42 +2377,62 @@ export class OpenCodeBridgeClient {
         throw new Error("Credenciales Basic Auth inválidas (401)");
       }
       if (probe.ok) {
-        const data = await probe.resp.json().catch(() => []);
+        const raw = await probe.resp.json().catch(() => []);
+        const data = this._unwrapResponseData(raw);
         const list = Array.isArray(data) ? data : data?.sessions || [];
         for (const s of list) this._upsertSessionRecord(s);
       }
 
-      await this._discoverOpenApiCapabilities(baseUrl, signal);
+      const caps = await this._discoverOpenApiCapabilities(baseUrl, signal);
 
-      const statusResp = await fetch(`${baseUrl}${this.apiPrefix}/session/status`, {
-        headers,
-        signal,
-      }).catch(() => null);
+      if (caps.activeSessionPath) {
+        const activeResp = await fetch(`${baseUrl}${caps.activeSessionPath}`, {
+          headers,
+          signal,
+        }).catch(() => null);
+        const activeCt = (activeResp?.headers?.get("content-type") || "").toLowerCase();
+        if (activeResp?.ok && activeCt.includes("application/json")) {
+          const activeRaw = await activeResp.json().catch(() => null);
+          const activeSession = this._unwrapResponseData(activeRaw);
+          if (activeSession?.id) {
+            this._upsertSessionRecord(activeSession);
+            this.activeSessionId = activeSession.id;
+          }
+        }
+      }
 
-      const statusCt = (statusResp?.headers?.get("content-type") || "").toLowerCase();
-      if (statusResp?.ok && statusCt.includes("application/json")) {
-        const statusMap = await statusResp.json().catch(() => ({}));
-        if (statusMap && typeof statusMap === "object") {
-          for (const [sessionId, st] of Object.entries(statusMap)) {
-            if (st?.type === "busy") {
-              this.activeSessionId = this.activeSessionId || sessionId;
-              const agentId = this._resolveEventAgentId("session.status", {
-                sessionID: sessionId,
-                status: st,
-              });
-              if (agentId) {
-                this.busySessions.set(sessionId, agentId);
-                this._emitLiveKanbanSync({
-                  sessionId,
-                  agentId,
-                  status: "in_progress",
-                  title: "Sesión OpenCode en curso",
+      if (caps.sessionStatusPath) {
+        const statusResp = await fetch(`${baseUrl}${caps.sessionStatusPath}`, {
+          headers,
+          signal,
+        }).catch(() => null);
+
+        const statusCt = (statusResp?.headers?.get("content-type") || "").toLowerCase();
+        if (statusResp?.ok && statusCt.includes("application/json")) {
+          const statusRaw = await statusResp.json().catch(() => ({}));
+          const statusMap = this._unwrapResponseData(statusRaw);
+          if (statusMap && typeof statusMap === "object") {
+            for (const [sessionId, st] of Object.entries(statusMap)) {
+              if (st?.type === "busy") {
+                this.activeSessionId = this.activeSessionId || sessionId;
+                const agentId = this._resolveEventAgentId("session.status", {
+                  sessionID: sessionId,
+                  status: st,
                 });
-                this._queueAgentTask(agentId, {
-                  status: "started",
-                  label: "Sesión OpenCode en curso",
-                  file: null,
-                });
+                if (agentId) {
+                  this.busySessions.set(sessionId, agentId);
+                  this._emitLiveKanbanSync({
+                    sessionId,
+                    agentId,
+                    status: "in_progress",
+                    title: "Sesión OpenCode en curso",
+                  });
+                  this._queueAgentTask(agentId, {
+                    status: "started",
+                    label: "Sesión OpenCode en curso",
+                    file: null,
+                  });
+                }
               }
             }
           }
@@ -2287,9 +2446,10 @@ export class OpenCodeBridgeClient {
           () => [],
         );
       }
+      this._emitConnectionState();
     } catch (err) {
       if (err?.message?.includes("401")) throw err;
-      // No bloquear apertura SSE si /api/session/status difiere según versión
+      // No bloquear apertura SSE si alguna ruta auxiliar difiere según versión
     }
   }
 
