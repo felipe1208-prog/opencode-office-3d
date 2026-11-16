@@ -83,18 +83,29 @@ export class SupervisorOffice {
     }
 
     // Monitores 10% más grandes con curvatura y materiales originales
-    this.place(
+    const monL = this.place(
       "monitor",
       { x: -8.67, y: 0.75, z: -5.26 },
       { height: 0.485 },
       -0.26,
     );
-    this.place(
+    const monR = this.place(
       "monitor",
       { x: -8.13, y: 0.75, z: -5.26 },
       { height: 0.485 },
       0.26,
     );
+    const monitorSys = this.experience?.monitorSystem || null;
+    if (monitorSys) {
+      monitorSys.attachWorkstationMonitor(monL, {
+        stationKey: "supervisor-desk",
+        screenIndex: 0,
+      });
+      monitorSys.attachWorkstationMonitor(monR, {
+        stationKey: "supervisor-desk",
+        screenIndex: 1,
+      });
+    }
 
     // Hardware adelantado dentro del tablero
     this.place("keyboard", { x: -8.4, y: 0.752, z: -5.58 }, { width: 0.38 }, 0);

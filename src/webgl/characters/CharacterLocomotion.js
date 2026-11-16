@@ -1,14 +1,21 @@
 import * as THREE from "three";
 
+const _dir = new THREE.Vector3();
+const _steerDir = new THREE.Vector3();
+const _toOther = new THREE.Vector3();
+const _myForward = new THREE.Vector3();
+const _lateral = new THREE.Vector3();
+const _upAxis = new THREE.Vector3(0, 1, 0);
+
 export class CharacterLocomotion {
   constructor(model, options = {}) {
     this.model = model;
-    this.speed = options.speed || 0.65;
+    this.speed = options.speed || 0.85;
     this.waypoints = options.waypoints || [];
     this.currentWaypointIndex = 0;
     this.onArrival = options.onArrival || null;
 
-    this.sensorRange = 1.1;
+    this.sensorRange = 1.05;
     this.avoidanceForce = new THREE.Vector3();
   }
 
@@ -23,24 +30,25 @@ export class CharacterLocomotion {
     if (this.waypoints.length === 0) return;
 
     const myPos = this.model.position;
-    const myForward = new THREE.Vector3(0, 0, 1).applyAxisAngle(
-      new THREE.Vector3(0, 1, 0),
-      this.model.rotation.y,
-    );
+    _myForward.set(0, 0, 1).applyAxisAngle(_upAxis, this.model.rotation.y);
 
     for (const other of allCharacters) {
-      if (other.config.id === currentAgentId) continue;
+      if (other.config.id === currentAgentId || !other.model) continue;
       const otherPos = other.model.position;
       const dist = myPos.distanceTo(otherPos);
 
-      if (dist < this.sensorRange) {
-        const toOther = new THREE.Vector3().subVectors(otherPos, myPos);
-        toOther.y = 0;
-        toOther.normalize();
+      if (dist < this.sensorRange && dist > 0.001) {
+        _toOther.subVectors(otherPos, myPos);
+        _toOther.y = 0;
+        _toOther.normalize();
 
-        const lateral = new THREE.Vector3(-myForward.z, 0, myForward.x);
-        const weight = (this.sensorRange - dist) / this.sensorRange;
-        this.avoidanceForce.addScaledVector(lateral, weight * 0.45);
+        // Solo esquivar si el otro agente está delante o muy cerca lateralmente
+        if (_myForward.dot(_toOther) > -0.25) {
+          _lateral.set(-_myForward.z, 0, _myForward.x);
+          const side = _lateral.dot(_toOther) >= 0 ? -1 : 1;
+          const weight = (this.sensorRange - dist) / this.sensorRange;
+          this.avoidanceForce.addScaledVector(_lateral, side * weight * 0.48);
+        }
       }
     }
   }
@@ -49,11 +57,11 @@ export class CharacterLocomotion {
     if (this.currentWaypointIndex >= this.waypoints.length) return;
 
     const target = this.waypoints[this.currentWaypointIndex];
-    const dir = new THREE.Vector3().subVectors(target, this.model.position);
-    dir.y = 0;
-    const distance = dir.length();
+    _dir.subVectors(target, this.model.position);
+    _dir.y = 0;
+    const distance = _dir.length();
 
-    if (distance < 0.22) {
+    if (distance < 0.2) {
       this.currentWaypointIndex++;
       if (this.currentWaypointIndex >= this.waypoints.length) {
         if (this.onArrival) {
@@ -65,15 +73,16 @@ export class CharacterLocomotion {
       return;
     }
 
-    dir.normalize();
-    const steerDir = dir.clone().add(this.avoidanceForce).normalize();
+    _dir.normalize();
+    _steerDir.copy(_dir).add(this.avoidanceForce).normalize();
 
-    const targetAngle = Math.atan2(steerDir.x, steerDir.z);
+    const targetAngle = Math.atan2(_steerDir.x, _steerDir.z);
     let diff = targetAngle - this.model.rotation.y;
     while (diff < -Math.PI) diff += Math.PI * 2;
     while (diff > Math.PI) diff -= Math.PI * 2;
-    this.model.rotation.y += diff * Math.min(delta * 7.5, 1);
+    this.model.rotation.y += diff * Math.min(delta * 8.0, 1);
 
-    this.model.position.addScaledVector(steerDir, this.speed * delta);
+    this.model.position.x += _steerDir.x * this.speed * delta;
+    this.model.position.z += _steerDir.z * this.speed * delta;
   }
 }

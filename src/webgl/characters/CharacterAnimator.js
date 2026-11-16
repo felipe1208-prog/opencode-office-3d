@@ -8,6 +8,9 @@ export class CharacterAnimator {
     this.mixer = new THREE.AnimationMixer(this.model);
     this.actions = new Map();
     this.currentAction = null;
+    this.currentAnimName = null;
+    this.onClipChanged = null;
+    this.oneShotCallbacks = new Map();
 
     this.initClips();
   }
@@ -47,6 +50,7 @@ export class CharacterAnimator {
       }
     });
 
+    retargeted.optimize();
     return retargeted;
   }
 
@@ -74,19 +78,34 @@ export class CharacterAnimator {
       }
     });
 
-    // Transiciones automáticas encadenadas (ej. sitToType -> typing)
     this.mixer.addEventListener("finished", (e) => {
-      Object.entries(ANIMATION_DEFS).forEach(([animName, def]) => {
-        if (def.next && e.action === this.actions.get(animName)) {
-          this.play(def.next, 0.2);
+      for (const [animName, action] of this.actions.entries()) {
+        if (e.action === action) {
+          const cb = this.oneShotCallbacks.get(animName);
+          if (cb) {
+            this.oneShotCallbacks.delete(animName);
+            cb();
+          }
+          const def = ANIMATION_DEFS[animName];
+          if (def?.next && this.actions.has(def.next)) {
+            this.play(def.next, 0.2);
+          }
+          break;
         }
-      });
+      }
     });
   }
 
-  play(name, duration = 0.22) {
+  play(name, duration = 0.22, onFinished = null) {
     const nextAction = this.actions.get(name);
-    if (!nextAction) return;
+    if (!nextAction) {
+      if (onFinished) onFinished();
+      return false;
+    }
+
+    if (onFinished) {
+      this.oneShotCallbacks.set(name, onFinished);
+    }
 
     if (this.currentAction && this.currentAction !== nextAction) {
       this.currentAction.fadeOut(duration);
@@ -94,6 +113,16 @@ export class CharacterAnimator {
 
     nextAction.reset().fadeIn(duration).play();
     this.currentAction = nextAction;
+    this.currentAnimName = name;
+
+    if (this.onClipChanged) {
+      this.onClipChanged(name);
+    }
+    return true;
+  }
+
+  clearPendingCallbacks() {
+    this.oneShotCallbacks.clear();
   }
 
   update(delta) {

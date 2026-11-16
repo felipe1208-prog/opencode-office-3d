@@ -171,10 +171,14 @@ export class DevArea {
 
     slotCentersX.forEach((sx, idx) => {
       const seatId = podId * 10 + idx * 2;
+      const sideTag = pairs === 1 ? "" : idx === 0 ? "w" : "e";
+      const northKey = `dev-pod${podId}-n${sideTag}`;
+      const southKey = `dev-pod${podId}-s${sideTag}`;
 
       // Puesto Norte (sentado al norte, mirando al sur)
       this.buildStationHardware({
         stationIndex: seatId,
+        stationKey: northKey,
         slotX: sx,
         centerZ: centerZ,
         isNorth: true,
@@ -184,6 +188,7 @@ export class DevArea {
       // Puesto Sur (sentado al sur, mirando al norte)
       this.buildStationHardware({
         stationIndex: seatId + 1,
+        stationKey: southKey,
         slotX: sx,
         centerZ: centerZ,
         isNorth: false,
@@ -231,25 +236,37 @@ export class DevArea {
   }
 
   // --- HARDWARE, PERIFÉRICOS Y PAPELERÍA TÉCNICA POR PUESTO ---
-  buildStationHardware({ stationIndex, slotX, centerZ, isNorth, chairTone }) {
+  buildStationHardware({
+    stationIndex,
+    stationKey,
+    slotX,
+    centerZ,
+    isNorth,
+    chairTone,
+  }) {
     const tableY = 0.752;
+    const monitorSys = this.experience?.monitorSystem || null;
 
     if (isNorth) {
       // === PUESTO NORTE (Usuario en Z < centerZ, mira al SUR +Z) ===
 
       // 1. Monitores duales cóncavos
-      this.place(
+      const monL = this.place(
         "monitor",
         { x: slotX - 0.28, y: 0.75, z: centerZ - 0.2 },
         { height: 0.44 },
         -0.26,
       );
-      this.place(
+      const monR = this.place(
         "monitor",
         { x: slotX + 0.28, y: 0.75, z: centerZ - 0.2 },
         { height: 0.44 },
         0.26,
       );
+      if (monitorSys && stationKey) {
+        monitorSys.attachWorkstationMonitor(monL, { stationKey, screenIndex: 0 });
+        monitorSys.attachWorkstationMonitor(monR, { stationKey, screenIndex: 1 });
+      }
 
       // 2. Teclado
       this.place(
@@ -341,18 +358,22 @@ export class DevArea {
       // === PUESTO SUR (Usuario en Z > centerZ, mira al NORTE -Z) ===
 
       // 1. Monitores duales cóncavos simétricos
-      this.place(
+      const monSL = this.place(
         "monitor",
         { x: slotX - 0.28, y: 0.75, z: centerZ + 0.2 },
         { height: 0.44 },
         Math.PI + 0.26,
       );
-      this.place(
+      const monSR = this.place(
         "monitor",
         { x: slotX + 0.28, y: 0.75, z: centerZ + 0.2 },
         { height: 0.44 },
         Math.PI - 0.26,
       );
+      if (monitorSys && stationKey) {
+        monitorSys.attachWorkstationMonitor(monSL, { stationKey, screenIndex: 0 });
+        monitorSys.attachWorkstationMonitor(monSR, { stationKey, screenIndex: 1 });
+      }
 
       // 2. Teclado
       this.place(

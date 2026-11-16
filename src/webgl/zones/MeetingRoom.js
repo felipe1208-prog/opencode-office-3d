@@ -275,6 +275,7 @@ export class MeetingRoom {
     const screenMesh = new THREE.Mesh(screenGeo, screenMat);
     screenMesh.position.set(tvX, tvY, wallZ + 0.019);
     this.group.add(screenMesh);
+    this.experience?.monitorSystem?.registerMeetingTV(screenMesh);
   }
 
   initWhiteboard() {

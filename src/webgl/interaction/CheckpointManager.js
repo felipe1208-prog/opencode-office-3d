@@ -16,6 +16,23 @@ export class CheckpointManager {
     return this.checkpoints[checkpointId] || null;
   }
 
+  isAvailable(checkpointId) {
+    const cp = this.checkpoints[checkpointId];
+    return Boolean(cp && !cp.isOccupied && !cp.reservedBy);
+  }
+
+  getAvailableByIds(ids = []) {
+    return ids
+      .map((id) => this.checkpoints[id])
+      .filter((cp) => cp && !cp.isOccupied && !cp.reservedBy);
+  }
+
+  getAvailableByType(type) {
+    return Object.values(this.checkpoints).filter(
+      (cp) => cp.type === type && !cp.isOccupied && !cp.reservedBy,
+    );
+  }
+
   reserve(checkpointId, agentId) {
     const cp = this.checkpoints[checkpointId];
     if (!cp) return false;
@@ -47,7 +64,6 @@ export class CheckpointManager {
         cp.reservedBy = nextAgentId;
         cp.isOccupied = true;
 
-        // Evento global seguro: notifica a todos los agentes quién tiene el turno
         this.emit("turn:granted", {
           checkpointId,
           agentId: nextAgentId,
@@ -64,6 +80,13 @@ export class CheckpointManager {
       if (idx !== -1) {
         queue.splice(idx, 1);
       }
+    }
+  }
+
+  removeAgentFromAllQueues(agentId) {
+    for (const queue of this.queues.values()) {
+      const idx = queue.indexOf(agentId);
+      if (idx !== -1) queue.splice(idx, 1);
     }
   }
 

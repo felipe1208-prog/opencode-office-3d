@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
 html,
 body,
 #app {
@@ -9,4 +14,5 @@ body,
   padding: 0;
   overflow: hidden;
   background-color: #0b0f19;
+  font-family: var(--font-sans);
 }

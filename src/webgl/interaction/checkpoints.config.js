@@ -95,6 +95,28 @@ export const CHECKPOINTS = {
     reservedBy: null,
   },
 
+  // Pod 3 (Isla Norte)
+  "dev-pod3-n": {
+    id: "dev-pod3-n",
+    zone: "dev-area",
+    type: CHECKPOINT_TYPES.WORKSTATION,
+    pos: { x: -7.8, y: 0.035, z: -0.02 },
+    rotY: 0,
+    actions: ["typing", "sittingIdle", "sitToType", "typeToSit"],
+    isOccupied: false,
+    reservedBy: null,
+  },
+  "dev-pod3-s": {
+    id: "dev-pod3-s",
+    zone: "dev-area",
+    type: CHECKPOINT_TYPES.WORKSTATION,
+    pos: { x: -7.8, y: 0.035, z: 2.02 },
+    rotY: Math.PI,
+    actions: ["typing", "sittingIdle", "sitToType", "typeToSit"],
+    isOccupied: false,
+    reservedBy: null,
+  },
+
   // ==========================================
   // 2. COCINA & COFFEE BAR (CoffeeArea)
   // ==========================================
@@ -495,6 +517,60 @@ export const CHECKPOINTS = {
     pos: { x: -5.5, y: -0.34, z: -7.3 },
     rotY: Math.PI,
     actions: ["browseBooks", "standingIdle"],
+    isOccupied: false,
+    reservedBy: null,
+  },
+
+  // ==========================================
+  // 7. PUNTOS DE REVISIÓN COLABORATIVA (Desk Review)
+  // ==========================================
+  "review-frontend": {
+    id: "review-frontend",
+    zone: "dev-area",
+    type: CHECKPOINT_TYPES.ACTION_STATION,
+    pos: { x: -7.25, y: -0.34, z: 3.62 },
+    rotY: Math.atan2(0.55, 1.38),
+    actions: ["deskReview", "talking"],
+    isOccupied: false,
+    reservedBy: null,
+  },
+  "review-qa": {
+    id: "review-qa",
+    zone: "dev-area",
+    type: CHECKPOINT_TYPES.ACTION_STATION,
+    pos: { x: -4.75, y: -0.34, z: 3.62 },
+    rotY: Math.atan2(-0.55, 1.38),
+    actions: ["deskReview", "talking"],
+    isOccupied: false,
+    reservedBy: null,
+  },
+  "review-systems": {
+    id: "review-systems",
+    zone: "dev-area",
+    type: CHECKPOINT_TYPES.ACTION_STATION,
+    pos: { x: -7.25, y: -0.34, z: 6.78 },
+    rotY: Math.atan2(0.55, -1.38),
+    actions: ["deskReview", "talking"],
+    isOccupied: false,
+    reservedBy: null,
+  },
+  "review-backend": {
+    id: "review-backend",
+    zone: "dev-area",
+    type: CHECKPOINT_TYPES.ACTION_STATION,
+    pos: { x: -4.75, y: -0.34, z: 6.78 },
+    rotY: Math.atan2(-0.55, -1.38),
+    actions: ["deskReview", "talking"],
+    isOccupied: false,
+    reservedBy: null,
+  },
+  "review-architect": {
+    id: "review-architect",
+    zone: "supervisor",
+    type: CHECKPOINT_TYPES.ACTION_STATION,
+    pos: { x: -7.55, y: -0.34, z: -6.35 },
+    rotY: Math.atan2(-0.85, 1.09),
+    actions: ["deskReview", "talking"],
     isOccupied: false,
     reservedBy: null,
   },

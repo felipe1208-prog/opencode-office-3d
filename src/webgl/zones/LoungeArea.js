@@ -214,6 +214,10 @@ export class LoungeArea {
         0,
       );
 
+    if (tvModel) {
+      this.experience?.monitorSystem?.registerLoungeTV(tvModel);
+    }
+
     if (!tvModel) {
       const tvFrameMat = new THREE.MeshStandardMaterial({
         color: "#090B0E",
@@ -570,12 +574,14 @@ export class LoungeArea {
       metalMat,
     );
     lampStem.position.y = 0.63;
+    const tableShadeMat = new THREE.MeshStandardMaterial({
+      map: this.textures.linenTex,
+      roughness: 0.5,
+    });
+    this.experience?.nightRig?.registerLampShadeMaterial(tableShadeMat);
     const lampShade = new THREE.Mesh(
       new THREE.CylinderGeometry(0.12, 0.14, 0.16, 16),
-      new THREE.MeshStandardMaterial({
-        map: this.textures.linenTex,
-        roughness: 0.5,
-      }),
+      tableShadeMat,
     );
     lampShade.position.y = 0.78;
     stSW.add(lampBase, lampStem, lampShade);
@@ -623,12 +629,14 @@ export class LoungeArea {
       metalMat,
     );
     aPole.position.y = 0.925;
+    const arcShadeMat = new THREE.MeshStandardMaterial({
+      map: this.textures.linenTex,
+      roughness: 0.4,
+    });
+    this.experience?.nightRig?.registerLampShadeMaterial(arcShadeMat);
     const aShade = new THREE.Mesh(
       new THREE.CylinderGeometry(0.16, 0.24, 0.22, 16),
-      new THREE.MeshStandardMaterial({
-        map: this.textures.linenTex,
-        roughness: 0.4,
-      }),
+      arcShadeMat,
     );
     aShade.position.y = 1.85;
     arcLamp.add(aBase, aPole, aShade);
