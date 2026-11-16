@@ -69,6 +69,7 @@ export class OpenCodeBridgeClient {
 
     // Estado de conexión
     this.status = "disconnected"; // disconnected | connecting | connected | error
+    this.apiPrefix = "/api"; // API v2 (/api/session, /api/event) con autodetección
     this.lastError = null;
     this.eventsReceived = 0;
     this.lastEventAt = null;
@@ -682,37 +683,125 @@ export class OpenCodeBridgeClient {
     this.pendingAgentBuffer.clear();
   }
 
+  async _probeSessionEndpoint(baseUrl, headers, signal) {
+    const probeAt = async (prefix) => {
+      const resp = await fetch(`${baseUrl}${prefix}/session`, { headers, signal });
+      const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+      return {
+        prefix,
+        resp,
+        isJson: contentType.includes("application/json"),
+        isHtml: contentType.includes("text/html"),
+      };
+    };
+
+    const primary = await probeAt("/api");
+    if (primary.resp.status === 401) {
+      this.apiPrefix = "/api";
+      return {
+        ok: false,
+        prefix: "/api",
+        status: 401,
+        isAuthError: true,
+        error: "Autenticación requerida (Basic Auth)",
+      };
+    }
+
+    if (primary.resp.status === 502 && primary.isJson) {
+      const errBody = await primary.resp.json().catch(() => null);
+      return {
+        ok: false,
+        prefix: "/api",
+        status: 502,
+        isAuthError: false,
+        error: errBody?.detail
+          ? `${errBody.error || "Puente 502"} (${errBody.detail})`
+          : errBody?.error || "Puente sin conexión con opencode serve",
+      };
+    }
+
+    if (primary.resp.ok && primary.isJson) {
+      this.apiPrefix = "/api";
+      return { ok: true, prefix: "/api", status: primary.resp.status, resp: primary.resp };
+    }
+
+    if (primary.resp.status === 404 || primary.isHtml) {
+      const legacy = await probeAt("");
+      if (legacy.resp.status === 401) {
+        this.apiPrefix = "";
+        return {
+          ok: false,
+          prefix: "",
+          status: 401,
+          isAuthError: true,
+          error: "Autenticación requerida (Basic Auth)",
+        };
+      }
+      if (legacy.resp.ok && legacy.isJson) {
+        this.apiPrefix = "";
+        return { ok: true, prefix: "", status: legacy.resp.status, resp: legacy.resp };
+      }
+      if (primary.isHtml || legacy.isHtml) {
+        return {
+          ok: false,
+          prefix: "/api",
+          status: primary.resp.status,
+          isAuthError: false,
+          error: "El servidor devolvió HTML (SPA fallback) en lugar de JSON en /api/session",
+        };
+      }
+    }
+
+    return {
+      ok: false,
+      prefix: "/api",
+      status: primary.resp.status,
+      isAuthError: false,
+      error: `HTTP ${primary.resp.status} en /api/session`,
+    };
+  }
+
   async testConnection() {
     const baseUrl = this.getActiveBaseUrl();
     const start = performance.now();
-    try {
-      const resp = await fetch(`${baseUrl}/session`, {
-        headers: {
-          Accept: "application/json",
-          ...this._buildAuthHeaders(),
-        },
-        signal: AbortSignal.timeout(4000),
-      });
+    const headers = {
+      Accept: "application/json",
+      ...this._buildAuthHeaders(),
+    };
 
-      if (!resp.ok) {
+    try {
+      const probe = await this._probeSessionEndpoint(
+        baseUrl,
+        headers,
+        AbortSignal.timeout(4000),
+      );
+
+      if (!probe.ok) {
         return {
           ok: false,
-          status: resp.status,
+          status: probe.status,
           latencyMs: Math.round(performance.now() - start),
-          error:
-            resp.status === 401
-              ? "Autenticación requerida (Basic Auth)"
-              : `HTTP ${resp.status}`,
+          error: probe.error,
         };
       }
 
-      const data = await resp.json().catch(() => []);
+      const data = await probe.resp.json().catch(() => null);
+      if (data === null) {
+        return {
+          ok: false,
+          status: probe.status,
+          latencyMs: Math.round(performance.now() - start),
+          error: "Respuesta no válida (JSON corrupto en /api/session)",
+        };
+      }
+
       const list = Array.isArray(data) ? data : data?.sessions || [];
       return {
         ok: true,
-        status: resp.status,
+        status: probe.status,
         latencyMs: Math.round(performance.now() - start),
         sessionsCount: list.length,
+        apiPrefix: probe.prefix,
       };
     } catch (err) {
       return {
@@ -735,20 +824,23 @@ export class OpenCodeBridgeClient {
     };
 
     try {
-      const resp = await fetch(`${baseUrl}/session`, { headers, signal });
-      if (resp.ok) {
-        const list = await resp.json().catch(() => []);
-        if (Array.isArray(list)) {
-          for (const s of list) this._upsertSessionRecord(s);
-        }
+      const probe = await this._probeSessionEndpoint(baseUrl, headers, signal);
+      if (probe.isAuthError) {
+        throw new Error("Credenciales Basic Auth inválidas (401)");
+      }
+      if (probe.ok) {
+        const data = await probe.resp.json().catch(() => []);
+        const list = Array.isArray(data) ? data : data?.sessions || [];
+        for (const s of list) this._upsertSessionRecord(s);
       }
 
-      const statusResp = await fetch(`${baseUrl}/session/status`, {
+      const statusResp = await fetch(`${baseUrl}${this.apiPrefix}/session/status`, {
         headers,
         signal,
       }).catch(() => null);
 
-      if (statusResp?.ok) {
+      const statusCt = (statusResp?.headers?.get("content-type") || "").toLowerCase();
+      if (statusResp?.ok && statusCt.includes("application/json")) {
         const statusMap = await statusResp.json().catch(() => ({}));
         if (statusMap && typeof statusMap === "object") {
           for (const [sessionId, st] of Object.entries(statusMap)) {
@@ -768,8 +860,9 @@ export class OpenCodeBridgeClient {
           }
         }
       }
-    } catch {
-      // No bloquear apertura SSE si /session/status difiere según versión
+    } catch (err) {
+      if (err?.message?.includes("401")) throw err;
+      // No bloquear apertura SSE si /api/session/status difiere según versión
     }
   }
 
@@ -824,7 +917,8 @@ export class OpenCodeBridgeClient {
     try {
       await this._syncInitialSessions(controller.signal);
 
-      const resp = await fetch(`${baseUrl}/event`, {
+      const eventPath = `${this.apiPrefix}/event`;
+      const resp = await fetch(`${baseUrl}${eventPath}`, {
         method: "GET",
         headers: {
           Accept: "text/event-stream",
@@ -837,7 +931,16 @@ export class OpenCodeBridgeClient {
         throw new Error(
           resp.status === 401
             ? "Credenciales Basic Auth inválidas (401)"
-            : `Error HTTP ${resp.status} al abrir /event`,
+            : `Error HTTP ${resp.status} al abrir ${eventPath}`,
+        );
+      }
+
+      const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+      if (contentType && !contentType.includes("text/event-stream")) {
+        throw new Error(
+          contentType.includes("text/html")
+            ? `SPA fallback HTML recibido en ${eventPath} en vez de stream SSE`
+            : `Content-Type inesperado en ${eventPath}: ${contentType}`,
         );
       }
 

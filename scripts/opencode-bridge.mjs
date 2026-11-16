@@ -23,10 +23,13 @@ const AUTH_PASS = process.env.OPENCODE_SERVER_PASSWORD || "";
 
 const sseClients = new Set();
 
+let detectedUpstreamPrefix = "/api";
+
 function applyCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, Cache-Control");
+  res.setHeader("Access-Control-Allow-Private-Network", "true");
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 
@@ -35,6 +38,8 @@ function buildUpstreamHeaders(reqHeaders) {
   delete headers.host;
   delete headers.connection;
   delete headers["content-length"];
+  delete headers.origin;
+  delete headers.referer;
 
   if (!headers.authorization && (AUTH_USER || AUTH_PASS)) {
     const token = Buffer.from(`${AUTH_USER}:${AUTH_PASS}`).toString("base64");
@@ -54,20 +59,78 @@ function broadcastCustomEvent(payload) {
   }
 }
 
-async function handleHealth(_req, res) {
-  let upstreamOk = false;
-  let upstreamStatus = null;
+async function probeSessionAt(pathPrefix) {
+  const target = `${OPENCODE_URL}${pathPrefix}/session`;
+  const resp = await fetch(target, {
+    headers: buildUpstreamHeaders({ accept: "application/json" }),
+    signal: AbortSignal.timeout(2500),
+  });
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  const isJson = contentType.includes("application/json");
+  const isHtml = contentType.includes("text/html");
+  return { resp, isJson, isHtml };
+}
 
+async function probeUpstream() {
   try {
-    const resp = await fetch(`${OPENCODE_URL}/session`, {
-      headers: buildUpstreamHeaders({ accept: "application/json" }),
-      signal: AbortSignal.timeout(2500),
-    });
-    upstreamStatus = resp.status;
-    upstreamOk = resp.ok;
-  } catch {
-    upstreamOk = false;
+    const v2 = await probeSessionAt("/api");
+    if (v2.resp.status === 401) {
+      detectedUpstreamPrefix = "/api";
+      return {
+        ok: false,
+        status: 401,
+        prefix: "/api",
+        error: "Autenticación requerida (Basic Auth)",
+      };
+    }
+    if (v2.resp.ok && v2.isJson) {
+      detectedUpstreamPrefix = "/api";
+      return { ok: true, status: v2.resp.status, prefix: "/api", error: null };
+    }
+
+    if (v2.resp.status === 404 || v2.isHtml) {
+      const legacy = await probeSessionAt("");
+      if (legacy.resp.status === 401) {
+        detectedUpstreamPrefix = "";
+        return {
+          ok: false,
+          status: 401,
+          prefix: "",
+          error: "Autenticación requerida (Basic Auth)",
+        };
+      }
+      if (legacy.resp.ok && legacy.isJson) {
+        detectedUpstreamPrefix = "";
+        return { ok: true, status: legacy.resp.status, prefix: "", error: null };
+      }
+      if (v2.isHtml || legacy.isHtml) {
+        return {
+          ok: false,
+          status: v2.resp.status,
+          prefix: detectedUpstreamPrefix,
+          error: "OpenCode devolvió HTML (SPA fallback) en lugar de JSON (/api/session)",
+        };
+      }
+    }
+
+    return {
+      ok: false,
+      status: v2.resp.status,
+      prefix: detectedUpstreamPrefix,
+      error: `HTTP ${v2.resp.status} en /api/session`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: null,
+      prefix: detectedUpstreamPrefix,
+      error: err?.message || "Upstream unavailable",
+    };
   }
+}
+
+async function handleHealth(_req, res) {
+  const probe = await probeUpstream();
 
   res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
   res.end(
@@ -75,8 +138,10 @@ async function handleHealth(_req, res) {
       bridge: "ok",
       bridgeUrl: `http://${BRIDGE_HOST}:${BRIDGE_PORT}`,
       upstreamUrl: OPENCODE_URL,
-      upstreamOk,
-      upstreamStatus,
+      upstreamPrefix: probe.prefix,
+      upstreamOk: probe.ok,
+      upstreamStatus: probe.status,
+      upstreamError: probe.error,
       clients: sseClients.size,
     }),
   );
@@ -84,7 +149,11 @@ async function handleHealth(_req, res) {
 
 async function proxyHttp(req, res, targetUrl) {
   const controller = new AbortController();
-  req.on("close", () => controller.abort());
+  res.on("close", () => {
+    if (!res.writableFinished) {
+      controller.abort();
+    }
+  });
 
   try {
     const chunks = [];
@@ -166,7 +235,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const reqPath = req.url || "/";
+  const rawUrl = req.url || "/";
+  const queryIdx = rawUrl.indexOf("?");
+  const reqPath = queryIdx >= 0 ? rawUrl.slice(0, queryIdx) : rawUrl;
+  const query = queryIdx >= 0 ? rawUrl.slice(queryIdx) : "";
 
   if (reqPath === "/bridge/health") {
     await handleHealth(req, res);
@@ -189,7 +261,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  await proxyHttp(req, res, `${OPENCODE_URL}${reqPath}`);
+  const hasApiPrefix =
+    reqPath === "/api" || reqPath.startsWith("/api/") || reqPath === "/openapi.json";
+  const normalizedPath = hasApiPrefix
+    ? detectedUpstreamPrefix === "" && reqPath.startsWith("/api/")
+      ? reqPath.slice(4) || "/"
+      : reqPath
+    : detectedUpstreamPrefix
+      ? `${detectedUpstreamPrefix}${reqPath.startsWith("/") ? reqPath : `/${reqPath}`}`
+      : reqPath;
+
+  await proxyHttp(req, res, `${OPENCODE_URL}${normalizedPath}${query}`);
 });
 
 server.listen(BRIDGE_PORT, BRIDGE_HOST, () => {

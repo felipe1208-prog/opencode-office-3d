@@ -26,6 +26,7 @@ import {
   Copy,
   Check,
   Plug,
+  Download,
 } from "@lucide/vue";
 import { Resources } from "./webgl/core/Resources";
 import { Experience } from "./webgl/Experience";
@@ -43,6 +44,7 @@ import { openCodeBridge } from "./opencode/OpenCodeBridgeClient";
 import {
   OPENCODE_JSON_SNIPPET,
   OPENCODE_CLI_COMMANDS,
+  buildOpenCodeSetupReport,
 } from "./opencode/openCodeTemplates";
 
 const canvasRef = ref(null);
@@ -383,13 +385,52 @@ function toggleBubbles() {
 
 function toggleTaskBoard() {
   isTaskBoardOpen.value = !isTaskBoardOpen.value;
-  if (isTaskBoardOpen.value) isOpenCodePanelOpen.value = false;
+  if (isTaskBoardOpen.value) {
+    isOpenCodePanelOpen.value = false;
+    isDockCollapsed.value = false;
+  }
   ambientAudio.playSoftTick();
 }
 
 function toggleOpenCodePanel() {
   isOpenCodePanelOpen.value = !isOpenCodePanelOpen.value;
-  if (isOpenCodePanelOpen.value) isTaskBoardOpen.value = false;
+  if (isOpenCodePanelOpen.value) {
+    isTaskBoardOpen.value = false;
+    isDockCollapsed.value = false;
+  }
+  ambientAudio.playSoftTick();
+}
+
+function downloadTextFile(filename, content, mimeType = "text/plain;charset=utf-8") {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function downloadOpenCodeJson() {
+  downloadTextFile("opencode.json", OPENCODE_JSON_SNIPPET, "application/json;charset=utf-8");
+  ambientAudio.playSoftTick();
+}
+
+function downloadOpenCodeReport() {
+  const cfg = openCodeBridge.getConfig();
+  const report = buildOpenCodeSetupReport({
+    profiles: profiles.value,
+    aliases: cfg.aliases,
+    mode: cfg.mode,
+    url: openCodeBridge.getActiveBaseUrl(),
+  });
+  downloadTextFile(
+    "GUIA_CONFIGURACION_OPENCODE.md",
+    report,
+    "text/markdown;charset=utf-8",
+  );
   ambientAudio.playSoftTick();
 }
 
@@ -577,6 +618,49 @@ onBeforeUnmount(() => {
               : "Simulación autónoma"
         }}
       </span>
+    </div>
+
+    <!-- Acceso directo superior derecho a OpenCode CLI (siempre visible) -->
+    <div
+      v-if="isReady"
+      class="absolute top-4 right-5 z-30 flex items-center gap-2 pointer-events-auto"
+    >
+      <button
+        type="button"
+        @click="toggleOpenCodePanel"
+        :class="[
+          'px-3 py-2 rounded-lg border text-xs font-medium flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap shadow-lg',
+          isOpenCodePanelOpen || openCodeState.status === 'connected'
+            ? 'bg-sky-600/25 border-sky-500/50 text-sky-100'
+            : openCodeState.status === 'error'
+              ? 'bg-rose-950/92 border-rose-500/50 text-rose-200'
+              : 'bg-slate-950/92 border-slate-700 text-slate-100 hover:bg-slate-900 hover:border-sky-500/50',
+        ]"
+      >
+        <Terminal class="w-3.5 h-3.5 text-sky-400" />
+        <span>OpenCode</span>
+        <span aria-hidden="true" class="text-slate-600">·</span>
+        <span
+          :class="[
+            'font-mono text-[11px] tabular-nums',
+            openCodeState.status === 'connected'
+              ? 'text-emerald-300'
+              : openCodeState.status === 'error'
+                ? 'text-rose-300'
+                : 'text-slate-400',
+          ]"
+        >
+          {{
+            openCodeState.status === "connected"
+              ? `${openCodeState.activeAgents.length}/5 vivo`
+              : openCodeState.status === "connecting"
+                ? "Conectando"
+                : openCodeState.status === "error"
+                  ? "Error"
+                  : "Configurar"
+          }}
+        </span>
+      </button>
     </div>
 
     <!-- Dock inferior colapsable unificado -->
@@ -980,19 +1064,37 @@ onBeforeUnmount(() => {
               </div>
 
               <div class="lg:col-span-6 flex flex-col gap-1.5">
-                <div class="flex items-center justify-between">
+                <div class="flex flex-wrap items-center justify-between gap-2">
                   <span class="text-xs font-medium text-slate-300">
                     Plantilla <code class="text-sky-300">opencode.json</code> (5 agentes)
                   </span>
-                  <button
-                    type="button"
-                    @click="copySnippet('json', OPENCODE_JSON_SNIPPET)"
-                    class="px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    <Check v-if="copiedKey === 'json'" class="w-3.5 h-3.5" />
-                    <Copy v-else class="w-3.5 h-3.5" />
-                    <span>{{ copiedKey === "json" ? "JSON copiado" : "Copiar JSON" }}</span>
-                  </button>
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      @click="downloadOpenCodeReport"
+                      class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <Download class="w-3.5 h-3.5" />
+                      <span>Descargar guía (.md)</span>
+                    </button>
+                    <button
+                      type="button"
+                      @click="downloadOpenCodeJson"
+                      class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <Download class="w-3.5 h-3.5" />
+                      <span>Descargar .json</span>
+                    </button>
+                    <button
+                      type="button"
+                      @click="copySnippet('json', OPENCODE_JSON_SNIPPET)"
+                      class="px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <Check v-if="copiedKey === 'json'" class="w-3.5 h-3.5" />
+                      <Copy v-else class="w-3.5 h-3.5" />
+                      <span>{{ copiedKey === "json" ? "JSON copiado" : "Copiar JSON" }}</span>
+                    </button>
+                  </div>
                 </div>
                 <pre
                   class="rounded-md bg-slate-950 border border-slate-800 p-2.5 text-[11px] font-mono text-slate-300 overflow-auto max-h-44 leading-relaxed select-text"
@@ -1461,8 +1563,49 @@ onBeforeUnmount(() => {
               </button>
             </div>
 
-            <!-- Controles de Mock Director + Ambiente + Cámara -->
-            <div class="flex flex-wrap items-center gap-2 shrink-0">
+            <!-- Controles de Mock Director + OpenCode + Tablero + Ambiente -->
+            <div class="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
+              <!-- OpenCode CLI (prioritario) -->
+              <button
+                type="button"
+                @click="toggleOpenCodePanel"
+                :class="[
+                  'px-2.5 py-1.5 rounded-md border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0',
+                  isOpenCodePanelOpen || openCodeState.status === 'connected'
+                    ? 'bg-sky-600/20 border-sky-500/40 text-sky-200'
+                    : openCodeState.status === 'error'
+                      ? 'bg-rose-600/20 border-rose-500/40 text-rose-200'
+                      : 'bg-slate-900 border-slate-700 text-slate-100 hover:bg-slate-800',
+                ]"
+              >
+                <Terminal class="w-3.5 h-3.5 text-sky-400" />
+                <span>OpenCode</span>
+                <span
+                  v-if="openCodeState.status === 'connected'"
+                  class="font-mono text-[11px] text-emerald-300 tabular-nums"
+                >
+                  {{ openCodeState.activeAgents.length }}/5
+                </span>
+              </button>
+
+              <!-- Tablero de Tareas -->
+              <button
+                type="button"
+                @click="toggleTaskBoard"
+                :class="[
+                  'px-2.5 py-1.5 rounded-md border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0',
+                  isTaskBoardOpen
+                    ? 'bg-sky-600/20 border-sky-500/40 text-sky-200'
+                    : 'bg-slate-900 border-slate-800 text-slate-200 hover:bg-slate-800',
+                ]"
+              >
+                <ListTodo class="w-3.5 h-3.5" />
+                <span>Tablero</span>
+                <span class="font-mono text-[11px] text-slate-400 tabular-nums">
+                  {{ tasks.length }}
+                </span>
+              </button>
+
               <!-- Mock Director -->
               <div
                 class="flex items-center gap-1 p-0.5 rounded-md bg-slate-900 border border-slate-800"
@@ -1520,47 +1663,6 @@ onBeforeUnmount(() => {
               >
                 <Users class="w-3.5 h-3.5" />
                 <span>Reunión</span>
-              </button>
-
-              <!-- OpenCode CLI -->
-              <button
-                type="button"
-                @click="toggleOpenCodePanel"
-                :class="[
-                  'px-2.5 py-1.5 rounded-md border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0',
-                  isOpenCodePanelOpen || openCodeState.status === 'connected'
-                    ? 'bg-sky-600/20 border-sky-500/40 text-sky-200'
-                    : openCodeState.status === 'error'
-                      ? 'bg-rose-600/20 border-rose-500/40 text-rose-200'
-                      : 'bg-slate-900 border-slate-800 text-slate-200 hover:bg-slate-800',
-                ]"
-              >
-                <Terminal class="w-3.5 h-3.5" />
-                <span>OpenCode</span>
-                <span
-                  v-if="openCodeState.status === 'connected'"
-                  class="font-mono text-[11px] text-emerald-300 tabular-nums"
-                >
-                  {{ openCodeState.activeAgents.length }}/5
-                </span>
-              </button>
-
-              <!-- Tablero de Tareas -->
-              <button
-                type="button"
-                @click="toggleTaskBoard"
-                :class="[
-                  'px-2.5 py-1.5 rounded-md border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0',
-                  isTaskBoardOpen
-                    ? 'bg-sky-600/20 border-sky-500/40 text-sky-200'
-                    : 'bg-slate-900 border-slate-800 text-slate-200 hover:bg-slate-800',
-                ]"
-              >
-                <ListTodo class="w-3.5 h-3.5" />
-                <span>Tablero</span>
-                <span class="font-mono text-[11px] text-slate-400 tabular-nums">
-                  {{ tasks.length }}
-                </span>
               </button>
 
               <!-- Visibilidad Burbujas 3D -->
