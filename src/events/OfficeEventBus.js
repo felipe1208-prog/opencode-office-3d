@@ -13,6 +13,7 @@ export const OFFICE_EVENTS = {
   OPENCODE_TASK_SYNC: "opencode:task_sync",
   OPENCODE_SESSION_LOG: "opencode:session_log",
   OPENCODE_DELEGATION: "opencode:delegation",
+  OPENCODE_QUESTION: "opencode:question",
 };
 
 const MAX_HISTORY = 30;

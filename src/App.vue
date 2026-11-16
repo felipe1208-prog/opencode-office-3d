@@ -114,7 +114,11 @@ const isInterrupting = ref(false);
 const commandFeedback = ref(null);
 const replyingPermissionId = ref(null);
 const permissionError = ref(null);
+const replyingQuestionId = ref(null);
+const questionError = ref(null);
+const questionDrafts = reactive({});
 const sessionLogEntries = ref([]);
+const childSessionLogs = reactive({});
 const logContainerRef = ref(null);
 
 const newTask = reactive({
@@ -161,10 +165,19 @@ const activePermission = computed(
   () => openCodeState.value.pendingPermissions?.[0] || null,
 );
 
+const activeQuestion = computed(
+  () => openCodeState.value.pendingQuestions?.[0] || null,
+);
+
 const blockedCliAlerts = computed(() => {
   const permSessions = new Set(
     (openCodeState.value.pendingPermissions || [])
       .map((p) => p.sessionID)
+      .filter(Boolean),
+  );
+  const questionSessions = new Set(
+    (openCodeState.value.pendingQuestions || [])
+      .map((q) => q.sessionID)
       .filter(Boolean),
   );
   return tasks.value
@@ -173,6 +186,7 @@ const blockedCliAlerts = computed(() => {
         t.source === "opencode" &&
         t.status === "blocked" &&
         !permSessions.has(t.sessionId) &&
+        !questionSessions.has(t.sessionId) &&
         !dismissedBlockedAlertKeys.value.has(`${t.id}:${t.updatedAt}`),
     )
     .slice(0, 2);
@@ -181,6 +195,38 @@ const blockedCliAlerts = computed(() => {
 const activeLogSessionId = computed(
   () => commandForm.sessionId || openCodeState.value.activeSessionId || "",
 );
+
+const activeHistoryState = computed(() => {
+  const sid = activeLogSessionId.value;
+  if (!sid) return { status: "idle", error: null, lastSyncedAt: null };
+  return (
+    openCodeState.value.sessionHistoryStates?.[sid] || {
+      status: "idle",
+      error: null,
+      lastSyncedAt: null,
+    }
+  );
+});
+
+const unlinkedChildSessions = computed(() => {
+  const sid = activeLogSessionId.value;
+  if (!sid) return [];
+  const childIds = openCodeState.value.childSessionsByParent?.[sid] || [];
+  if (childIds.length === 0) return [];
+  const linked = new Set(
+    sessionLogEntries.value.map((e) => e.childSessionId).filter(Boolean),
+  );
+  return childIds
+    .filter((cid) => !linked.has(cid))
+    .map((cid) => {
+      const sess = (openCodeState.value.sessions || []).find((s) => s.id === cid);
+      return {
+        id: cid,
+        title: sess?.title || `Sub-sesión ${cid.slice(0, 10)}`,
+        agentId: sess?.agent || null,
+      };
+    });
+});
 
 const taskCountByStatus = computed(() => {
   const counts = {};
@@ -349,13 +395,60 @@ function scrollLogToBottom(force = false) {
   }
 }
 
-function syncSessionLogView() {
-  const sid = activeLogSessionId.value;
-  sessionLogEntries.value = sid ? openCodeBridge.getSessionLog(sid) : [];
+function ensureQuestionDraft(item) {
+  if (!item?.id) return [];
+  const questions = Array.isArray(item.questions) ? item.questions : [];
+  const existing = questionDrafts[item.id];
+  if (!Array.isArray(existing) || existing.length !== questions.length) {
+    questionDrafts[item.id] = questions.map(() => ({
+      selected: [],
+      custom: "",
+    }));
+  }
+  return questionDrafts[item.id];
 }
 
-watch(activeLogSessionId, () => {
+watch(
+  activeQuestion,
+  (item) => {
+    if (item) {
+      ensureQuestionDraft(item);
+    } else {
+      questionError.value = null;
+    }
+  },
+  { immediate: true },
+);
+
+function syncChildLogsForEntries(entries = []) {
+  for (const entry of entries) {
+    if (entry?.childSessionId) {
+      childSessionLogs[entry.childSessionId] = openCodeBridge.getSessionLog(
+        entry.childSessionId,
+      );
+    }
+  }
+}
+
+function syncSessionLogView() {
+  const sid = activeLogSessionId.value;
+  const entries = sid ? openCodeBridge.getSessionLog(sid) : [];
+  sessionLogEntries.value = entries;
+  syncChildLogsForEntries(entries);
+  const childIds = sid
+    ? openCodeState.value.childSessionsByParent?.[sid] || []
+    : [];
+  for (const cid of childIds) {
+    childSessionLogs[cid] = openCodeBridge.getSessionLog(cid);
+  }
+}
+
+watch(activeLogSessionId, (sid) => {
   syncSessionLogView();
+  if (sid && openCodeState.value.status === "connected") {
+    openCodeBridge.hydrateSessionHistory(sid);
+    openCodeBridge.syncPendingQuestions(sid);
+  }
   nextTick(() => scrollLogToBottom(true));
 });
 
@@ -410,8 +503,9 @@ onMounted(() => {
 
     const availableIds = new Set((snap.sessions || []).map((s) => s.id));
     if (!commandForm.sessionId || !availableIds.has(commandForm.sessionId)) {
+      const rootSession = (snap.sessions || []).find((s) => !s.parentID);
       commandForm.sessionId =
-        snap.activeSessionId || snap.sessions?.[0]?.id || "";
+        snap.activeSessionId || rootSession?.id || snap.sessions?.[0]?.id || "";
     }
 
     if (
@@ -425,21 +519,38 @@ onMounted(() => {
     if ((snap.pendingPermissions || []).length === 0) {
       permissionError.value = null;
     }
+    if ((snap.pendingQuestions || []).length === 0) {
+      questionError.value = null;
+    }
   });
   unsubSessionLog = officeEventBus.on(
     OFFICE_EVENTS.OPENCODE_SESSION_LOG,
     (payload) => {
       if (payload?.cleared && !payload?.sessionId) {
         sessionLogEntries.value = [];
+        for (const key of Object.keys(childSessionLogs)) {
+          delete childSessionLogs[key];
+        }
         return;
+      }
+      const entries = Array.isArray(payload?.entries) ? payload.entries : [];
+      if (payload?.sessionId) {
+        const parentChildren =
+          openCodeState.value.childSessionsByParent?.[activeLogSessionId.value] || [];
+        const isTrackedChild =
+          Object.prototype.hasOwnProperty.call(childSessionLogs, payload.sessionId) ||
+          parentChildren.includes(payload.sessionId) ||
+          sessionLogEntries.value.some((e) => e.childSessionId === payload.sessionId);
+        if (isTrackedChild) {
+          childSessionLogs[payload.sessionId] = entries;
+        }
       }
       if (!payload?.sessionId || payload.sessionId === activeLogSessionId.value) {
         const el = logContainerRef.value;
         const shouldAutoScroll =
           !el || el.scrollHeight - el.scrollTop - el.clientHeight < 52;
-        sessionLogEntries.value = Array.isArray(payload?.entries)
-          ? payload.entries
-          : [];
+        sessionLogEntries.value = entries;
+        syncChildLogsForEntries(entries);
         if (shouldAutoScroll) {
           nextTick(() => scrollLogToBottom(true));
         }
@@ -558,6 +669,10 @@ function toggleOpenCodePanel() {
     isTaskBoardOpen.value = false;
     if (openCodeState.value.status === "connected") {
       openCodeTab.value = "command";
+      if (activeLogSessionId.value) {
+        openCodeBridge.hydrateSessionHistory(activeLogSessionId.value);
+        openCodeBridge.syncPendingQuestions(activeLogSessionId.value);
+      }
     }
   }
   ambientAudio.playSoftTick();
@@ -742,6 +857,116 @@ function handleClearSessionLog() {
   if (!activeLogSessionId.value) return;
   openCodeBridge.clearSessionLog(activeLogSessionId.value);
   ambientAudio.playSoftTick();
+}
+
+function handleRefreshSessionHistory() {
+  if (!activeLogSessionId.value) return;
+  openCodeBridge.hydrateSessionHistory(activeLogSessionId.value, { force: true });
+  openCodeBridge.syncPendingQuestions(activeLogSessionId.value);
+  ambientAudio.playSoftTick();
+}
+
+function handleToggleChildThread(childSessionId, event) {
+  if (!childSessionId || !event?.target?.open) return;
+  childSessionLogs[childSessionId] = openCodeBridge.getSessionLog(childSessionId);
+  openCodeBridge.hydrateSessionHistory(childSessionId);
+}
+
+function getChildEntries(childSessionId) {
+  if (!childSessionId) return [];
+  return childSessionLogs[childSessionId] || openCodeBridge.getSessionLog(childSessionId);
+}
+
+function getChildHistoryState(childSessionId) {
+  if (!childSessionId) return { status: "idle", error: null };
+  return (
+    openCodeState.value.sessionHistoryStates?.[childSessionId] || {
+      status: "idle",
+      error: null,
+    }
+  );
+}
+
+function isOptionSelected(item, qIdx, label) {
+  const draft = ensureQuestionDraft(item);
+  return Boolean(draft[qIdx]?.selected?.includes(label));
+}
+
+function toggleQuestionOption(item, qIdx, label) {
+  const draft = ensureQuestionDraft(item);
+  const slot = draft[qIdx];
+  if (!slot) return;
+  const isMulti = Boolean(item.questions?.[qIdx]?.multiple);
+  if (isMulti) {
+    const idx = slot.selected.indexOf(label);
+    if (idx === -1) {
+      slot.selected.push(label);
+    } else {
+      slot.selected.splice(idx, 1);
+    }
+  } else {
+    slot.selected = slot.selected[0] === label ? [] : [label];
+  }
+  ambientAudio.playSoftTick();
+}
+
+function canSubmitQuestion(item) {
+  if (!item?.id) return false;
+  const draft = ensureQuestionDraft(item);
+  return (item.questions || []).every((_, idx) => {
+    const slot = draft[idx];
+    return Boolean(slot?.selected?.length > 0 || slot?.custom?.trim());
+  });
+}
+
+async function handleSubmitQuestion(item) {
+  if (!item?.id || replyingQuestionId.value) return;
+  const draft = ensureQuestionDraft(item);
+  const answers = (item.questions || []).map((_, idx) => {
+    const slot = draft[idx] || { selected: [], custom: "" };
+    const vals = [...slot.selected];
+    if (slot.custom?.trim()) vals.push(slot.custom.trim());
+    return vals;
+  });
+
+  replyingQuestionId.value = item.id;
+  questionError.value = null;
+  const res = await openCodeBridge.replyQuestion(item.id, answers);
+  replyingQuestionId.value = null;
+  if (res.ok) {
+    delete questionDrafts[item.id];
+    ambientAudio.playSoftTick();
+  } else {
+    questionError.value = res.error || "No se pudo enviar la respuesta";
+  }
+}
+
+async function handleQuickQuestionOption(item, optLabel) {
+  if (!item?.id || replyingQuestionId.value) return;
+  replyingQuestionId.value = item.id;
+  questionError.value = null;
+  const res = await openCodeBridge.replyQuestion(item.id, [[optLabel]]);
+  replyingQuestionId.value = null;
+  if (res.ok) {
+    delete questionDrafts[item.id];
+    ambientAudio.playSoftTick();
+  } else {
+    questionError.value = res.error || "No se pudo enviar la respuesta";
+  }
+}
+
+async function handleRejectQuestion(item) {
+  if (!item?.id || replyingQuestionId.value) return;
+  replyingQuestionId.value = item.id;
+  questionError.value = null;
+  const res = await openCodeBridge.replyQuestion(item.id, [], { reject: true });
+  replyingQuestionId.value = null;
+  if (res.ok) {
+    delete questionDrafts[item.id];
+    ambientAudio.playSoftTick();
+  } else {
+    questionError.value = res.error || "No se pudo omitir la pregunta";
+  }
 }
 
 async function handleReplyPermission(requestId, response) {
@@ -1012,10 +1237,10 @@ onBeforeUnmount(() => {
             }}
           </span>
           <span
-            v-if="openCodeState.pendingPermissions.length > 0"
+            v-if="openCodeState.pendingPermissions.length + openCodeState.pendingQuestions.length > 0"
             class="px-1.5 py-0.5 rounded bg-[#D97706] text-[10px] font-semibold text-[#111318] tabular-nums"
           >
-            {{ openCodeState.pendingPermissions.length }}
+            {{ openCodeState.pendingPermissions.length + openCodeState.pendingQuestions.length }}
           </span>
         </button>
 
@@ -1038,11 +1263,64 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <!-- Pila discreta de Toasts (Permisos CLI y alertas bloqueadas question/form) -->
+      <!-- Pila discreta de Toasts (Permisos CLI, Preguntas interactivas y alertas) -->
       <div
-        v-if="activePermission || blockedCliAlerts.length > 0"
+        v-if="activePermission || (activeQuestion && !isOpenCodePanelOpen) || blockedCliAlerts.length > 0"
         class="w-[min(390px,92vw)] flex flex-col gap-2 pointer-events-auto"
       >
+        <!-- Toast compacto de Pregunta interactiva cuando el drawer está cerrado -->
+        <div
+          v-if="activeQuestion && !isOpenCodePanelOpen"
+          class="rounded-xl bg-[#111318]/96 border border-[#4F6EF7]/45 p-3.5 space-y-2.5"
+        >
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2 text-xs font-semibold text-[#93A8FA]">
+              <MessageSquare class="w-4 h-4 text-[#4F6EF7] shrink-0" />
+              <span>Pregunta del agente</span>
+            </div>
+            <div class="flex items-center gap-1.5 text-[11px] text-[#9CA3AF] tabular-nums">
+              <span>{{ profileMap[activeQuestion.agentId]?.name || activeQuestion.agentId }}</span>
+              <span aria-hidden="true" class="text-[#4B5563]">·</span>
+              <span>1 de {{ openCodeState.pendingQuestions.length }}</span>
+            </div>
+          </div>
+
+          <div class="text-xs text-[#F3F4F6] leading-relaxed">
+            {{ activeQuestion.questions[0]?.question }}
+          </div>
+
+          <div v-if="questionError" class="text-xs text-[#FB7185]">
+            {{ questionError }}
+          </div>
+
+          <div class="flex flex-wrap items-center gap-1.5">
+            <template
+              v-if="
+                activeQuestion.questions.length === 1 &&
+                !activeQuestion.questions[0]?.multiple &&
+                activeQuestion.questions[0]?.options?.length > 0
+              "
+            >
+              <button
+                v-for="opt in activeQuestion.questions[0].options.slice(0, 3)"
+                :key="opt.label"
+                type="button"
+                :disabled="replyingQuestionId === activeQuestion.id"
+                @click="handleQuickQuestionOption(activeQuestion, opt.label)"
+                class="px-2.5 py-1.5 rounded-lg bg-[#1E243B] hover:bg-[#27304F] border border-[#4F6EF7]/35 text-xs font-medium text-[#E0E7FF] transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+              >
+                {{ opt.label }}
+              </button>
+            </template>
+            <button
+              type="button"
+              @click="openCommandComposer"
+              class="px-2.5 py-1.5 rounded-lg bg-[#4F6EF7] hover:bg-[#5E7BF8] text-xs font-medium text-[#F8FAFC] transition-colors cursor-pointer whitespace-nowrap"
+            >
+              Responder en Comando
+            </button>
+          </div>
+        </div>
         <!-- Toast de Permiso CLI -->
         <div
           v-if="activePermission"
@@ -1683,6 +1961,104 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
+        <!-- Banner inline de pregunta interactiva (`question`) -->
+        <div
+          v-if="activeQuestion"
+          class="px-4 py-3 border-b border-[#4F6EF7]/35 bg-[#161B29] space-y-2.5 shrink-0 max-h-[44vh] overflow-y-auto"
+        >
+          <div class="flex items-center justify-between gap-2 text-xs">
+            <span class="font-semibold text-[#93A8FA] flex items-center gap-1.5">
+              <MessageSquare class="w-3.5 h-3.5 text-[#4F6EF7]" />
+              <span>Pregunta pendiente</span>
+            </span>
+            <span class="text-[11px] text-[#9CA3AF] tabular-nums">
+              {{ profileMap[activeQuestion.agentId]?.name || activeQuestion.agentId }} · 1 de
+              {{ openCodeState.pendingQuestions.length }}
+            </span>
+          </div>
+
+          <div
+            v-for="(q, qIdx) in activeQuestion.questions"
+            :key="`${activeQuestion.id}_${qIdx}`"
+            class="space-y-1.5"
+          >
+            <div class="text-[11px] font-medium text-[#9CA3AF]">
+              {{ q.header }}
+              <span v-if="q.multiple" class="text-[#6B7280]"> · Selección múltiple</span>
+            </div>
+            <div class="text-xs text-[#F3F4F6] leading-relaxed select-text">
+              {{ q.question }}
+            </div>
+
+            <div v-if="q.options.length > 0" class="flex flex-col gap-1 pt-0.5">
+              <button
+                v-for="opt in q.options"
+                :key="opt.label"
+                type="button"
+                :disabled="replyingQuestionId === activeQuestion.id"
+                @click="toggleQuestionOption(activeQuestion, qIdx, opt.label)"
+                :class="[
+                  'w-full text-left px-2.5 py-1.5 rounded-lg border text-xs transition-colors cursor-pointer flex items-start justify-between gap-2 disabled:opacity-50',
+                  isOptionSelected(activeQuestion, qIdx, opt.label)
+                    ? 'bg-[#1E243B] border-[#4F6EF7]/65 text-[#E0E7FF]'
+                    : 'bg-[#111318] border-white/[0.08] text-[#D1D5DB] hover:bg-[#1F232D]',
+                ]"
+              >
+                <span class="min-w-0">
+                  <span class="font-medium block">{{ opt.label }}</span>
+                  <span
+                    v-if="opt.description"
+                    class="text-[11px] text-[#9CA3AF] block leading-snug"
+                  >
+                    {{ opt.description }}
+                  </span>
+                </span>
+                <Check
+                  v-if="isOptionSelected(activeQuestion, qIdx, opt.label)"
+                  class="w-3.5 h-3.5 text-[#93A8FA] shrink-0 mt-0.5"
+                />
+              </button>
+            </div>
+
+            <input
+              v-if="q.custom !== false"
+              v-model="ensureQuestionDraft(activeQuestion)[qIdx].custom"
+              type="text"
+              @keydown.ctrl.enter.prevent="canSubmitQuestion(activeQuestion) && handleSubmitQuestion(activeQuestion)"
+              :placeholder="
+                q.options.length > 0
+                  ? 'O escribe otra respuesta...'
+                  : 'Escribe tu respuesta...'
+              "
+              class="w-full px-2.5 py-1.5 rounded-lg bg-[#111318] border border-white/[0.08] text-xs text-[#F3F4F6] placeholder:text-[#6B7280] focus:outline-none focus:border-[#4F6EF7]"
+            />
+          </div>
+
+          <div v-if="questionError" class="text-[11px] text-[#FB7185]">
+            {{ questionError }}
+          </div>
+
+          <div class="flex items-center justify-between gap-2 pt-0.5">
+            <button
+              type="button"
+              :disabled="replyingQuestionId === activeQuestion.id"
+              @click="handleRejectQuestion(activeQuestion)"
+              class="px-2.5 py-1.5 rounded-md bg-[#2B141C] hover:bg-[#3A1B26] border border-[#E11D48]/35 text-[11px] font-medium text-[#FECDD3] cursor-pointer whitespace-nowrap disabled:opacity-50"
+            >
+              Omitir
+            </button>
+            <button
+              type="button"
+              :disabled="replyingQuestionId === activeQuestion.id || !canSubmitQuestion(activeQuestion)"
+              @click="handleSubmitQuestion(activeQuestion)"
+              class="px-3 py-1.5 rounded-md bg-[#4F6EF7] hover:bg-[#5E7BF8] text-[11px] font-medium text-[#F8FAFC] flex items-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-45"
+            >
+              <Send class="w-3 h-3" />
+              <span>{{ replyingQuestionId === activeQuestion.id ? "Enviando..." : "Enviar respuesta" }}</span>
+            </button>
+          </div>
+        </div>
+
         <!-- Banner inline de permiso pendiente si el drawer está abierto -->
         <div
           v-if="activePermission"
@@ -1844,7 +2220,7 @@ onBeforeUnmount(() => {
             </form>
           </div>
 
-          <!-- Bitácora en vivo con máxima altura vertical -->
+          <!-- Bitácora en vivo con historial hidratado e hilos anidados -->
           <div class="flex-1 min-h-0 flex flex-col p-4 space-y-2">
             <div class="flex items-center justify-between gap-2 shrink-0">
               <div class="flex items-center gap-1.5 text-xs text-[#D1D5DB] min-w-0">
@@ -1855,29 +2231,72 @@ onBeforeUnmount(() => {
                 </span>
                 <template v-if="activeLogSessionId">
                   <span aria-hidden="true" class="text-[#4B5563]">·</span>
-                  <span class="text-[11px] text-[#6B7280] truncate max-w-[110px] tabular-nums">
-                    {{ activeLogSessionId.slice(0, 12) }}
+                  <span class="text-[11px] text-[#6B7280] truncate max-w-[96px] tabular-nums">
+                    {{ activeLogSessionId.slice(0, 10) }}
                   </span>
                 </template>
               </div>
 
-              <button
-                type="button"
-                :disabled="sessionLogEntries.length === 0"
-                @click="handleClearSessionLog"
-                class="px-2 py-1 rounded-md bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-[11px] font-medium text-[#9CA3AF] hover:text-[#F3F4F6] flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-40"
-              >
-                <Trash2 class="w-3 h-3" />
-                <span>Limpiar</span>
-              </button>
+              <div class="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  :disabled="!activeLogSessionId || activeHistoryState.status === 'loading'"
+                  @click="handleRefreshSessionHistory"
+                  class="px-2 py-1 rounded-md bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-[11px] font-medium text-[#9CA3AF] hover:text-[#F3F4F6] flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-40"
+                >
+                  <RefreshCw
+                    :class="[
+                      'w-3 h-3',
+                      activeHistoryState.status === 'loading' ? 'animate-spin text-[#93A8FA]' : '',
+                    ]"
+                  />
+                  <span>Actualizar</span>
+                </button>
+                <button
+                  type="button"
+                  :disabled="sessionLogEntries.length === 0"
+                  @click="handleClearSessionLog"
+                  class="px-2 py-1 rounded-md bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-[11px] font-medium text-[#9CA3AF] hover:text-[#F3F4F6] flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-40"
+                >
+                  <Trash2 class="w-3 h-3" />
+                  <span>Limpiar</span>
+                </button>
+              </div>
             </div>
 
             <div
               ref="logContainerRef"
               class="flex-1 min-h-0 overflow-y-auto rounded-lg bg-[#181B22] border border-white/[0.08] p-2.5 space-y-2"
             >
+              <!-- Banner de error recuperable si falló la carga del historial -->
               <div
-                v-if="sessionLogEntries.length === 0"
+                v-if="activeHistoryState.status === 'error'"
+                class="rounded-lg bg-[#2B141C] border border-[#E11D48]/35 px-3 py-2 flex items-center justify-between gap-2 text-xs text-[#FECDD3]"
+              >
+                <span class="truncate">
+                  {{ activeHistoryState.error || "No se pudo cargar el historial de esta sesión." }}
+                </span>
+                <button
+                  type="button"
+                  @click="handleRefreshSessionHistory"
+                  class="px-2 py-1 rounded-md bg-[#3A1B26] hover:bg-[#492230] text-[11px] font-medium text-[#FECDD3] cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  Reintentar historial
+                </button>
+              </div>
+
+              <!-- Esqueleto de carga al hidratar historial -->
+              <div
+                v-if="activeHistoryState.status === 'loading' && sessionLogEntries.length === 0"
+                class="space-y-2 py-1"
+              >
+                <div class="h-12 rounded-lg bg-[#1F232D]/80 border border-white/[0.06] animate-pulse"></div>
+                <div class="h-8 rounded-lg bg-[#1F232D]/60 border border-white/[0.05] animate-pulse"></div>
+                <div class="h-20 rounded-lg bg-[#1F232D]/80 border border-white/[0.06] animate-pulse"></div>
+              </div>
+
+              <div
+                v-else-if="sessionLogEntries.length === 0 && activeHistoryState.status !== 'error'"
                 class="py-8 px-3 text-center text-xs text-[#6B7280] leading-relaxed"
               >
                 Sin actividad en esta sesión todavía. Envía una instrucción para ver herramientas, razonamiento plegable y respuesta final en tiempo real.
@@ -1931,7 +2350,161 @@ onBeforeUnmount(() => {
                   </div>
                 </details>
 
-                <!-- Línea de herramienta -->
+                <!-- Hilo anidado desplegable de subagente (delegación subagent / task) -->
+                <details
+                  v-else-if="entry.kind === 'tool' && entry.isDelegation"
+                  @toggle="handleToggleChildThread(entry.childSessionId, $event)"
+                  class="rounded-lg bg-[#111318]/90 border border-white/[0.08]"
+                >
+                  <summary class="flex items-center justify-between gap-2 px-2.5 py-1.5 cursor-pointer text-[11px] select-none">
+                    <div class="flex items-center gap-1.5 min-w-0 truncate">
+                      <span
+                        :class="[
+                          'shrink-0 font-semibold',
+                          entry.status === 'done'
+                            ? 'text-[#10B981]'
+                            : entry.status === 'error'
+                              ? 'text-[#E11D48]'
+                              : 'text-[#4F6EF7]',
+                        ]"
+                      >
+                        {{
+                          entry.status === "done"
+                            ? "✓"
+                            : entry.status === "error"
+                              ? "✕"
+                              : "…"
+                        }}
+                      </span>
+                      <span class="font-medium text-[#E5E7EB] shrink-0">{{ entry.toolName }}</span>
+                      <span
+                        v-if="entry.target"
+                        class="text-[#9CA3AF] truncate tabular-nums"
+                      >
+                        · {{ entry.target }}
+                      </span>
+                    </div>
+                    <div class="flex items-center gap-1.5 text-[10px] text-[#6B7280] tabular-nums shrink-0">
+                      <span v-if="entry.childSessionId">
+                        {{ getChildEntries(entry.childSessionId).length }} pasos
+                      </span>
+                      <span v-else>
+                        {{ profileMap[entry.subagentId || entry.agentId]?.name || entry.subagentId || entry.agentId }}
+                      </span>
+                      <ChevronDown class="w-3 h-3 text-[#6B7280]" />
+                    </div>
+                  </summary>
+
+                  <div class="pl-3 pr-2.5 py-2 border-t border-white/[0.06] space-y-1.5">
+                    <div
+                      v-if="!entry.childSessionId"
+                      class="text-[11px] text-[#6B7280] leading-relaxed"
+                    >
+                      {{
+                        entry.status === "running"
+                          ? `Esperando vinculación de sub-sesión @${entry.subagentId || "subagent"}...`
+                          : "Subtarea ejecutada sin sub-sesión separada registrada."
+                      }}
+                    </div>
+
+                    <template v-else>
+                      <div
+                        v-if="getChildHistoryState(entry.childSessionId).status === 'loading' && getChildEntries(entry.childSessionId).length === 0"
+                        class="space-y-1.5 py-0.5"
+                      >
+                        <div class="h-6 rounded bg-[#1F232D]/70 animate-pulse"></div>
+                        <div class="h-10 rounded bg-[#1F232D]/70 animate-pulse"></div>
+                      </div>
+
+                      <div
+                        v-else-if="getChildHistoryState(entry.childSessionId).status === 'error'"
+                        class="flex items-center justify-between gap-2 text-[11px] text-[#FECDD3]"
+                      >
+                        <span class="truncate">No se pudo cargar el hilo del subagente.</span>
+                        <button
+                          type="button"
+                          @click="openCodeBridge.hydrateSessionHistory(entry.childSessionId, { force: true })"
+                          class="px-2 py-0.5 rounded bg-[#2B141C] hover:bg-[#3A1B26] border border-[#E11D48]/35 text-[10px] font-medium cursor-pointer whitespace-nowrap"
+                        >
+                          Reintentar
+                        </button>
+                      </div>
+
+                      <div
+                        v-else-if="getChildEntries(entry.childSessionId).length === 0"
+                        class="text-[11px] text-[#6B7280]"
+                      >
+                        {{
+                          entry.status === "running"
+                            ? "Subagente iniciando ejecución..."
+                            : "Sin pasos detallados registrados en esta sub-sesión."
+                        }}
+                      </div>
+
+                      <template v-for="subEntry in getChildEntries(entry.childSessionId)" :key="subEntry.id">
+                        <details
+                          v-if="subEntry.kind === 'reasoning'"
+                          class="rounded bg-[#181B22] border border-white/[0.05]"
+                        >
+                          <summary class="flex items-center justify-between gap-2 px-2 py-1 cursor-pointer text-[10px] text-[#93A8FA] select-none">
+                            <span>Razonamiento · {{ subEntry.status === "running" ? "Pensando..." : "Completado" }}</span>
+                            <span class="text-[#6B7280] tabular-nums">{{ subEntry.content.length }} chars</span>
+                          </summary>
+                          <div
+                            v-if="subEntry.content"
+                            v-html="renderSafeMarkdown(subEntry.content)"
+                            class="px-2 pb-2 pt-1.5 text-[11px] text-[#D1D5DB] space-y-1 border-t border-white/[0.05] max-h-40 overflow-y-auto select-text"
+                          ></div>
+                        </details>
+
+                        <div
+                          v-else-if="subEntry.kind === 'tool'"
+                          class="flex items-center justify-between gap-2 px-2 py-1 rounded bg-[#181B22] border border-white/[0.04] text-[10px]"
+                        >
+                          <div class="flex items-center gap-1.5 min-w-0 truncate">
+                            <span
+                              :class="[
+                                'shrink-0 font-semibold',
+                                subEntry.status === 'done'
+                                  ? 'text-[#10B981]'
+                                  : subEntry.status === 'error'
+                                    ? 'text-[#E11D48]'
+                                    : 'text-[#4F6EF7]',
+                              ]"
+                            >
+                              {{
+                                subEntry.status === "done"
+                                  ? "✓"
+                                  : subEntry.status === "error"
+                                    ? "✕"
+                                    : "…"
+                              }}
+                            </span>
+                            <span class="font-medium text-[#E5E7EB] shrink-0">{{ subEntry.toolName }}</span>
+                            <span v-if="subEntry.target" class="text-[#9CA3AF] truncate tabular-nums">
+                              · {{ subEntry.target }}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div
+                          v-else-if="subEntry.kind === 'text' && subEntry.content"
+                          v-html="renderSafeMarkdown(subEntry.content)"
+                          class="pt-1 text-[11px] text-[#E5E7EB] space-y-1 border-t border-white/[0.05] select-text"
+                        ></div>
+
+                        <div
+                          v-else-if="subEntry.kind === 'error'"
+                          class="px-2 py-1 rounded bg-[#2B141C] border border-[#E11D48]/35 text-[11px] text-[#FECDD3] select-text"
+                        >
+                          {{ subEntry.content }}
+                        </div>
+                      </template>
+                    </template>
+                  </div>
+                </details>
+
+                <!-- Línea de herramienta normal -->
                 <div
                   v-else-if="entry.kind === 'tool'"
                   class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-[#111318]/80 border border-white/[0.05] text-[11px]"
@@ -2007,6 +2580,51 @@ onBeforeUnmount(() => {
                 >
                   {{ entry.content }}
                 </div>
+              </template>
+
+              <!-- Sub-sesiones hijas vinculadas por parentID sin tarjeta de delegación directa -->
+              <template v-for="child in unlinkedChildSessions" :key="child.id">
+                <details
+                  @toggle="handleToggleChildThread(child.id, $event)"
+                  class="rounded-lg bg-[#111318]/90 border border-white/[0.08]"
+                >
+                  <summary class="flex items-center justify-between gap-2 px-2.5 py-1.5 cursor-pointer text-[11px] select-none">
+                    <span class="truncate text-[#D1D5DB]">
+                      <span class="font-medium text-[#E5E7EB]">Sub-sesión</span>
+                      <span aria-hidden="true" class="text-[#4B5563] mx-1">·</span>
+                      <span class="text-[#9CA3AF]">{{ child.title }}</span>
+                    </span>
+                    <span class="text-[10px] text-[#6B7280] tabular-nums shrink-0">
+                      {{ getChildEntries(child.id).length }} pasos
+                    </span>
+                  </summary>
+                  <div class="pl-3 pr-2.5 py-2 border-t border-white/[0.06] space-y-1.5">
+                    <div
+                      v-if="getChildHistoryState(child.id).status === 'loading' && getChildEntries(child.id).length === 0"
+                      class="h-10 rounded bg-[#1F232D]/70 animate-pulse"
+                    ></div>
+                    <div
+                      v-else-if="getChildEntries(child.id).length === 0"
+                      class="text-[11px] text-[#6B7280]"
+                    >
+                      Sin pasos registrados todavía.
+                    </div>
+                    <template v-for="subEntry in getChildEntries(child.id)" :key="subEntry.id">
+                      <div
+                        v-if="subEntry.kind === 'tool'"
+                        class="flex items-center gap-1.5 px-2 py-1 rounded bg-[#181B22] text-[10px] text-[#D1D5DB] truncate"
+                      >
+                        <span class="font-medium text-[#E5E7EB]">{{ subEntry.toolName }}</span>
+                        <span v-if="subEntry.target" class="text-[#9CA3AF] truncate">· {{ subEntry.target }}</span>
+                      </div>
+                      <div
+                        v-else-if="subEntry.kind === 'text' && subEntry.content"
+                        v-html="renderSafeMarkdown(subEntry.content)"
+                        class="pt-1 text-[11px] text-[#E5E7EB] space-y-1 select-text"
+                      ></div>
+                    </template>
+                  </div>
+                </details>
               </template>
             </div>
           </div>

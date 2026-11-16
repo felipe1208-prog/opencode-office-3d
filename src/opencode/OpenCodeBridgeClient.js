@@ -154,11 +154,17 @@ export class OpenCodeBridgeClient {
     this.taskCallsByPartId = new Map();
     this.activeAgents = new Set();
     this.pendingPermissions = new Map();
+    this.pendingQuestions = new Map();
+    this.questionCallIdMap = new Map();
     this.liveTaskMeta = new Map(); // externalKey -> { title, file }
     this.capabilities = null;
 
-    // Bitácora por sesión y buffers de razonamiento/delegación en vivo
+    // Bitácora por sesión, historial hidratado y enlace padre -> hijas
     this.sessionLogsById = new Map();
+    this.sessionHistoryState = new Map();
+    this.historyFetchPromises = new Map();
+    this.childSessionsByParent = new Map();
+    this.messageMetaById = new Map();
     this.reasoningBuffers = new Map();
     this.activeStreamEntryIds = new Map();
     this.emittedDelegations = new Set();
@@ -297,6 +303,32 @@ export class OpenCodeBridgeClient {
     );
   }
 
+  getPendingQuestions() {
+    return Array.from(this.pendingQuestions.values()).sort(
+      (a, b) => (a.createdAt || 0) - (b.createdAt || 0),
+    );
+  }
+
+  getSessionHistoryState(sessionId = this.activeSessionId) {
+    const sid = sessionId || this.activeSessionId;
+    if (!sid) {
+      return { status: "idle", error: null, lastSyncedAt: null };
+    }
+    return (
+      this.sessionHistoryState.get(sid) || {
+        status: "idle",
+        error: null,
+        lastSyncedAt: null,
+      }
+    );
+  }
+
+  getChildSessionIds(parentSessionId = this.activeSessionId) {
+    if (!parentSessionId) return [];
+    const set = this.childSessionsByParent.get(parentSessionId);
+    return set ? Array.from(set) : [];
+  }
+
   getSessionLog(sessionId = this.activeSessionId) {
     const sid = sessionId || this.activeSessionId;
     if (!sid) return [];
@@ -308,6 +340,11 @@ export class OpenCodeBridgeClient {
     const sid = sessionId || this.activeSessionId;
     if (!sid) return;
     this.sessionLogsById.delete(sid);
+    this.sessionHistoryState.set(sid, {
+      status: "loaded",
+      error: null,
+      lastSyncedAt: Date.now(),
+    });
     for (const key of Array.from(this.activeStreamEntryIds.keys())) {
       if (key.startsWith(`${sid}:`)) {
         this.activeStreamEntryIds.delete(key);
@@ -323,6 +360,7 @@ export class OpenCodeBridgeClient {
       { sessionId: sid, entries: [], cleared: true },
       "opencode-sse",
     );
+    this._emitConnectionState();
   }
 
   _emitSessionLog(sessionId) {
@@ -349,11 +387,16 @@ export class OpenCodeBridgeClient {
       `${entry.kind || "log"}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const record = {
       id,
+      sourceKey: entry.sourceKey || null,
+      callKey: entry.callKey || null,
       sessionId: sid,
       kind: entry.kind || "text",
       agentId: entry.agentId || "architect",
       toolName: entry.toolName || null,
       target: entry.target || null,
+      isDelegation: Boolean(entry.isDelegation),
+      subagentId: entry.subagentId || null,
+      childSessionId: entry.childSessionId || null,
       content: String(entry.content || ""),
       status: entry.status || "done",
       timestamp: entry.timestamp || Date.now(),
@@ -370,6 +413,7 @@ export class OpenCodeBridgeClient {
     sessionId,
     {
       streamKey,
+      sourceKey = null,
       kind = "text",
       agentId = "architect",
       deltaText = "",
@@ -382,16 +426,24 @@ export class OpenCodeBridgeClient {
     const activeKey = `${sid}:${kind}:${streamKey || "default"}`;
     let entryId = this.activeStreamEntryIds.get(activeKey);
     let existing = entryId ? list.find((item) => item.id === entryId) : null;
+    if (!existing && sourceKey) {
+      existing = list.find((item) => item.kind === kind && item.sourceKey === sourceKey);
+    }
 
     if (!existing || (existing.status === "done" && status === "running")) {
       entryId = `${kind}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       existing = {
         id: entryId,
+        sourceKey: sourceKey || (streamKey && streamKey !== "active" ? `${kind}:${streamKey}` : null),
+        callKey: null,
         sessionId: sid,
         kind,
         agentId: agentId || "architect",
         toolName: null,
         target: null,
+        isDelegation: false,
+        subagentId: null,
+        childSessionId: null,
         content: "",
         status,
         timestamp: Date.now(),
@@ -404,6 +456,7 @@ export class OpenCodeBridgeClient {
     }
 
     if (agentId) existing.agentId = agentId;
+    if (sourceKey && !existing.sourceKey) existing.sourceKey = sourceKey;
     if (replaceContent && typeof fullText === "string") {
       existing.content = fullText;
     } else if (typeof deltaText === "string" && deltaText.length > 0) {
@@ -426,11 +479,15 @@ export class OpenCodeBridgeClient {
     sessionId,
     {
       callKey = null,
+      sourceKey = null,
       agentId = "architect",
       toolName = "tool",
       target = null,
       status = "running",
       errorMessage = null,
+      isDelegation = false,
+      subagentId = null,
+      childSessionId = null,
     } = {},
   ) {
     const { sid, list } = this._ensureSessionLogList(sessionId);
@@ -438,6 +495,10 @@ export class OpenCodeBridgeClient {
     if (callKey) {
       existing = list.find(
         (item) => item.kind === "tool" && item.callKey === callKey,
+      );
+    } else if (sourceKey) {
+      existing = list.find(
+        (item) => item.kind === "tool" && item.sourceKey === sourceKey,
       );
     } else {
       for (let i = list.length - 1; i >= 0; i -= 1) {
@@ -453,15 +514,24 @@ export class OpenCodeBridgeClient {
       }
     }
 
+    const resolvedChild =
+      childSessionId ||
+      existing?.childSessionId ||
+      (isDelegation ? this._findUnassignedChildForDelegation(sid, subagentId) : null);
+
     if (!existing) {
       existing = {
         id: `tool_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        sourceKey: sourceKey || (callKey ? `call:${callKey}` : null),
         callKey,
         sessionId: sid,
         kind: "tool",
         agentId: agentId || "architect",
         toolName,
         target: target || null,
+        isDelegation: Boolean(isDelegation),
+        subagentId: subagentId || null,
+        childSessionId: resolvedChild || null,
         content: errorMessage ? String(errorMessage) : "",
         status,
         timestamp: Date.now(),
@@ -473,6 +543,10 @@ export class OpenCodeBridgeClient {
     } else {
       if (agentId) existing.agentId = agentId;
       if (target) existing.target = target;
+      if (sourceKey && !existing.sourceKey) existing.sourceKey = sourceKey;
+      if (isDelegation) existing.isDelegation = true;
+      if (subagentId) existing.subagentId = subagentId;
+      if (resolvedChild) existing.childSessionId = resolvedChild;
       if (errorMessage) existing.content = String(errorMessage);
       existing.status = status;
       existing.timestamp = Date.now();
@@ -480,6 +554,93 @@ export class OpenCodeBridgeClient {
 
     this._emitSessionLog(sid);
     return existing;
+  }
+
+  _findUnassignedChildForDelegation(parentSessionId, subagentId = null) {
+    if (!parentSessionId) return null;
+    const childIds = this.getChildSessionIds(parentSessionId);
+    if (childIds.length === 0) return null;
+    const logList = this.sessionLogsById.get(parentSessionId) || [];
+    const alreadyLinked = new Set(
+      logList.map((e) => e.childSessionId).filter(Boolean),
+    );
+    const candidates = childIds.filter((cid) => !alreadyLinked.has(cid));
+    if (candidates.length === 0) return null;
+
+    if (subagentId) {
+      for (const cid of candidates) {
+        const sess = this.sessionsById.get(cid);
+        const childAgent =
+          this.taskCallsByChildSession.get(cid) ||
+          this.resolveAgentId(sess?.agent) ||
+          this._inferSubagentFromText(sess?.title || "");
+        if (childAgent === subagentId) return cid;
+      }
+    }
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  _registerChildSession(parentSessionId, childSessionId, { agent = null, title = "" } = {}) {
+    if (!parentSessionId || !childSessionId || parentSessionId === childSessionId) {
+      return;
+    }
+    if (!this.childSessionsByParent.has(parentSessionId)) {
+      this.childSessionsByParent.set(parentSessionId, new Set());
+    }
+    this.childSessionsByParent.get(parentSessionId).add(childSessionId);
+
+    if (!this.sessionsById.has(childSessionId)) {
+      this.sessionsById.set(childSessionId, {
+        id: childSessionId,
+        parentID: parentSessionId,
+        agent: agent || null,
+        title: title || "",
+        updatedAt: Date.now(),
+      });
+    } else {
+      const existing = this.sessionsById.get(childSessionId);
+      if (!existing.parentID) existing.parentID = parentSessionId;
+      if (agent && !existing.agent) existing.agent = agent;
+      if (title && !existing.title) existing.title = title;
+    }
+
+    const resolvedChildAgent =
+      this.taskCallsByChildSession.get(childSessionId) ||
+      this.resolveAgentId(agent) ||
+      this._inferSubagentFromText(title);
+    if (resolvedChildAgent) {
+      this.taskCallsByChildSession.set(childSessionId, resolvedChildAgent);
+      this.sessionAgentMap.set(childSessionId, resolvedChildAgent);
+    }
+
+    const parentLogs = this.sessionLogsById.get(parentSessionId);
+    if (Array.isArray(parentLogs) && parentLogs.length > 0) {
+      const alreadyLinked = parentLogs.some((e) => e.childSessionId === childSessionId);
+      if (!alreadyLinked) {
+        let targetEntry = null;
+        if (resolvedChildAgent) {
+          targetEntry = parentLogs.find(
+            (e) =>
+              e.kind === "tool" &&
+              e.isDelegation &&
+              !e.childSessionId &&
+              e.subagentId === resolvedChildAgent,
+          );
+        }
+        if (!targetEntry) {
+          const runningDelegations = parentLogs.filter(
+            (e) => e.kind === "tool" && e.isDelegation && !e.childSessionId,
+          );
+          if (runningDelegations.length === 1) {
+            targetEntry = runningDelegations[0];
+          }
+        }
+        if (targetEntry) {
+          targetEntry.childSessionId = childSessionId;
+          this._emitSessionLog(parentSessionId);
+        }
+      }
+    }
   }
 
   _emitDelegationEvent({
@@ -522,6 +683,14 @@ export class OpenCodeBridgeClient {
       activeSessionId: this.activeSessionId,
       sessions: this.getSessions(),
       pendingPermissions: this.getPendingPermissions(),
+      pendingQuestions: this.getPendingQuestions(),
+      sessionHistoryStates: Object.fromEntries(this.sessionHistoryState.entries()),
+      childSessionsByParent: Object.fromEntries(
+        Array.from(this.childSessionsByParent.entries()).map(([k, set]) => [
+          k,
+          Array.from(set),
+        ]),
+      ),
       capabilities: this.capabilities,
     };
   }
@@ -774,6 +943,146 @@ export class OpenCodeBridgeClient {
     return true;
   }
 
+  _emitQuestionsState(added = false, item = null) {
+    officeEventBus.emit(
+      OFFICE_EVENTS.OPENCODE_QUESTION,
+      {
+        queue: this.getPendingQuestions(),
+        added,
+        item,
+      },
+      "opencode-sse",
+    );
+    this._emitConnectionState();
+  }
+
+  _normalizeQuestionList(raw = {}) {
+    const sourceList = Array.isArray(raw.questions) && raw.questions.length > 0
+      ? raw.questions
+      : Array.isArray(raw.fields) && raw.fields.length > 0
+        ? raw.fields
+        : [raw];
+
+    return sourceList.map((q, idx) => {
+      const rawOpts = Array.isArray(q?.options)
+        ? q.options
+        : Array.isArray(q?.choices)
+          ? q.choices
+          : [];
+      const options = rawOpts
+        .map((opt) => {
+          if (typeof opt === "string") {
+            return { label: opt, description: "" };
+          }
+          if (opt && typeof opt === "object") {
+            const label = String(opt.label || opt.title || opt.value || opt.name || "").trim();
+            if (!label) return null;
+            return {
+              label,
+              description: String(opt.description || opt.hint || "").trim(),
+            };
+          }
+          return null;
+        })
+        .filter(Boolean);
+
+      return {
+        header: String(q?.header || q?.title || q?.name || `Pregunta ${idx + 1}`).trim(),
+        question: String(
+          q?.question || q?.prompt || q?.label || q?.text || "El agente necesita tu respuesta para continuar.",
+        ).trim(),
+        options,
+        multiple: Boolean(q?.multiple || q?.multiSelect),
+        custom: q?.custom !== false,
+      };
+    });
+  }
+
+  _addPendingQuestion(rawQuestion, sessionIdHint = null) {
+    if (!rawQuestion || typeof rawQuestion !== "object") return null;
+    const callID = rawQuestion.tool?.callID || rawQuestion.callID || null;
+    const id =
+      rawQuestion.id ||
+      rawQuestion.requestID ||
+      rawQuestion.questionID ||
+      rawQuestion.formID ||
+      callID ||
+      null;
+    if (!id) return null;
+
+    // Si existía un placeholder sintético creado desde tool="question" por callID, reemplazarlo por el ID real
+    if (callID && id !== callID) {
+      const synthId = this.questionCallIdMap.get(callID) || callID;
+      if (synthId !== id && this.pendingQuestions.has(synthId)) {
+        this.pendingQuestions.delete(synthId);
+      }
+    }
+    if (callID) {
+      this.questionCallIdMap.set(callID, id);
+    }
+
+    const sessionID =
+      rawQuestion.sessionID ||
+      rawQuestion.sessionId ||
+      sessionIdHint ||
+      this.activeSessionId ||
+      null;
+
+    const questions = this._normalizeQuestionList(rawQuestion);
+    const firstHeader = questions[0]?.header || "Pregunta";
+    const agentId =
+      this._resolveEventAgentId("question.asked", {
+        ...rawQuestion,
+        sessionID,
+      }) || "architect";
+
+    const isNew = !this.pendingQuestions.has(id);
+    const item = {
+      id,
+      callID,
+      sessionID,
+      agentId,
+      header: firstHeader,
+      questions,
+      createdAt: rawQuestion.createdAt || Date.now(),
+    };
+
+    this.pendingQuestions.set(id, item);
+    if (sessionID) {
+      this._cancelSessionIdleTimer(sessionID);
+      this.busySessions.set(sessionID, agentId);
+    }
+
+    this._emitLiveKanbanSync({
+      sessionId: sessionID,
+      agentId,
+      status: "blocked",
+      title: `Pregunta: ${firstHeader}`,
+      file: questions[0]?.question?.slice(0, 40) || "question",
+    });
+    this._emitQuestionsState(isNew, item);
+    return item;
+  }
+
+  _removePendingQuestion(requestIdOrCallId) {
+    if (!requestIdOrCallId) return null;
+    const mappedId = this.questionCallIdMap.get(requestIdOrCallId) || requestIdOrCallId;
+    const targetId = this.pendingQuestions.has(requestIdOrCallId)
+      ? requestIdOrCallId
+      : this.pendingQuestions.has(mappedId)
+        ? mappedId
+        : null;
+    if (!targetId) return null;
+
+    const removed = this.pendingQuestions.get(targetId);
+    this.pendingQuestions.delete(targetId);
+    if (removed?.callID) {
+      this.questionCallIdMap.delete(removed.callID);
+    }
+    this._emitQuestionsState(false, removed);
+    return removed;
+  }
+
   _releaseSessionNow(
     sessionId,
     agentId,
@@ -966,14 +1275,11 @@ export class OpenCodeBridgeClient {
       this.sessionAgentMap.set(sessionObj.id, agentHint);
     }
 
-    // Si es sesión hija, cachear si el título o agent ya identifica un subagente
     if (parentID) {
-      const resolvedChild =
-        this.resolveAgentId(agentHint) ||
-        this._inferSubagentFromText(title);
-      if (resolvedChild) {
-        this.taskCallsByChildSession.set(sessionObj.id, resolvedChild);
-      }
+      this._registerChildSession(parentID, sessionObj.id, {
+        agent: agentHint,
+        title,
+      });
     }
   }
 
@@ -1109,42 +1415,75 @@ export class OpenCodeBridgeClient {
           ? `@${agentId}${file ? ` · ${file}` : ""}`
           : file || (typeof input.description === "string" ? input.description.slice(0, 40) : null);
 
-      this._upsertToolLogEntry(sessionId || this.activeSessionId, {
+      const metaObj = props.metadata || props.state?.metadata || {};
+      const childSessionId =
+        metaObj.sessionId || metaObj.sessionID || metaObj.childSessionId || props.childSessionId || null;
+      const targetSid = sessionId || this.activeSessionId;
+
+      if (isDelegation && childSessionId && targetSid) {
+        this._registerChildSession(targetSid, childSessionId, {
+          agent: agentId,
+          title: file || input.description || "",
+        });
+      }
+
+      this._upsertToolLogEntry(targetSid, {
         callKey,
         agentId:
           isDelegation && parentAgentForTask ? parentAgentForTask : agentId,
         toolName,
         target: logTarget,
         status: isError ? "error" : isFinished ? "done" : "running",
+        isDelegation,
+        subagentId: isDelegation ? agentId : null,
+        childSessionId,
         errorMessage: isError
           ? props.error?.data?.message || props.error?.message || props.message || null
           : null,
       });
 
-      // Preguntas / formularios interactivos (`question`) requieren respuesta en CLI
+      // Preguntas / formularios interactivos (`question`) pueden responderse desde la web
       if (toolName === "question") {
-        if (!isFinished) {
-          this._emitLiveKanbanSync({
-            sessionId,
-            agentId,
-            status: "blocked",
-            title: "Esperando respuesta en CLI",
-            file: file || "question",
-          });
+        if (!isFinished && !isError) {
+          if (Array.isArray(input.questions) || typeof input.question === "string") {
+            this._addPendingQuestion(
+              {
+                id: callKey || `q_${Date.now()}`,
+                callID: callKey,
+                sessionID: targetSid,
+                ...input,
+              },
+              targetSid,
+            );
+          } else {
+            this._emitLiveKanbanSync({
+              sessionId,
+              agentId,
+              status: "blocked",
+              title: "Esperando respuesta",
+              file: file || "question",
+            });
+          }
           this._queueAgentTask(
             agentId,
             {
               status: "failed",
-              label: "Esperando respuesta en CLI",
+              label: "Esperando respuesta",
               file: file || "question",
             },
             { immediate: true },
           );
           return agentId;
         }
+        if (isFinished) {
+          this._removePendingQuestion(callKey);
+        }
       }
 
       if (isError) {
+        if (toolName === "question") {
+          this._removePendingQuestion(callKey);
+        }
         const errLabel = `Fallo en ${toolName}`;
         this._emitLiveKanbanSync({
           sessionId,
@@ -1207,33 +1546,61 @@ export class OpenCodeBridgeClient {
       return agentId;
     }
 
-    if (eventType.startsWith("session.form.") || eventType === "question.asked") {
+    if (
+      eventType.startsWith("session.form.") ||
+      eventType.startsWith("question.") ||
+      eventType.startsWith("session.question.")
+    ) {
       if (sessionId) this._cancelSessionIdleTimer(sessionId);
-      const agentId = this._resolveEventAgentId(eventType, props);
-      if (!agentId) return null;
 
       const resolvedForm =
         eventType.endsWith("replied") ||
+        eventType.endsWith("rejected") ||
         eventType.endsWith("submitted") ||
         eventType.endsWith("completed") ||
-        eventType.endsWith("ended");
+        eventType.endsWith("ended") ||
+        eventType.endsWith("resolved");
 
-      this._emitLiveKanbanSync({
-        sessionId,
-        agentId,
-        status: resolvedForm ? "in_progress" : "blocked",
-        title: resolvedForm ? "Formulario respondido" : "Esperando respuesta en CLI",
-        file: formatToolTarget(props.input || props) || "form",
-      });
+      if (resolvedForm) {
+        const reqId =
+          props.requestID ||
+          props.questionID ||
+          props.formID ||
+          props.id ||
+          props.callID ||
+          props.tool?.callID;
+        const removed = this._removePendingQuestion(reqId);
+        const agentId =
+          removed?.agentId || this._resolveEventAgentId(eventType, props) || "architect";
+        const rejected = eventType.endsWith("rejected");
+
+        this._emitLiveKanbanSync({
+          sessionId: removed?.sessionID || sessionId,
+          agentId,
+          status: rejected ? "blocked" : "in_progress",
+          title: rejected ? "Pregunta omitida" : "Respuesta enviada",
+          file: removed?.header || "question",
+        });
+        this._queueAgentTask(agentId, {
+          status: rejected ? "failed" : "started",
+          phase: "working",
+          label: rejected ? "Pregunta omitida" : "Continuando tarea",
+          file: null,
+        });
+        return agentId;
+      }
+
+      const added = this._addPendingQuestion(props, sessionId);
+      const agentId =
+        added?.agentId || this._resolveEventAgentId(eventType, props) || "architect";
       this._queueAgentTask(
         agentId,
         {
-          status: resolvedForm ? "started" : "failed",
-          phase: "working",
-          label: resolvedForm ? "Continuando tarea" : "Esperando respuesta en CLI",
-          file: null,
+          status: "failed",
+          label: "Esperando respuesta",
+          file: added?.header || formatToolTarget(props.input || props) || "question",
         },
-        { immediate: !resolvedForm },
+        { immediate: true },
       );
       return agentId;
     }
@@ -1541,6 +1908,13 @@ export class OpenCodeBridgeClient {
 
     if (eventType === "message.updated") {
       const info = props.info || props;
+      if (info?.id) {
+        this.messageMetaById.set(info.id, {
+          role: info.role || "assistant",
+          agent: info.agent || null,
+          sessionID: info.sessionID || sessionId || null,
+        });
+      }
       if (info?.sessionID && info?.agent) {
         this._upsertSessionRecord({ id: info.sessionID, agent: info.agent });
       }
@@ -1550,13 +1924,44 @@ export class OpenCodeBridgeClient {
     if (eventType === "message.part.updated") {
       if (sessionId) this._cancelSessionIdleTimer(sessionId);
       const part = props.part || props;
+      const msgMeta = part.messageID ? this.messageMetaById.get(part.messageID) : null;
       const agentId = this._resolveEventAgentId(eventType, props);
       if (!agentId) return null;
+
+      // Evitar duplicar prompts del usuario cuando message.part.updated emite la parte user text
+      if (msgMeta?.role === "user" && part.type === "text") {
+        const sid = part.sessionID || sessionId || this.activeSessionId || "global";
+        const textVal = String(part.text || "").trim();
+        const sourceKey = part.messageID ? `msg:${part.messageID}:part:${part.id || 0}` : null;
+        if (textVal) {
+          const { list } = this._ensureSessionLogList(sid);
+          const already = list.find(
+            (e) =>
+              e.kind === "prompt" &&
+              ((sourceKey && e.sourceKey === sourceKey) ||
+                (!e.sourceKey && e.content.trim() === textVal)),
+          );
+          if (already) {
+            if (sourceKey && !already.sourceKey) already.sourceKey = sourceKey;
+          } else {
+            this._appendSessionLogEntry(sid, {
+              sourceKey,
+              kind: "prompt",
+              agentId: this.resolveAgentId(msgMeta.agent) || agentId,
+              content: textVal,
+              status: "done",
+              timestamp: part.time?.start || Date.now(),
+            });
+          }
+        }
+        return agentId;
+      }
 
       if (part.type === "tool") {
         const toolName = String(part.tool || part.name || "tool").toLowerCase();
         const stateStatus = part.state?.status || "running";
         const input = part.state?.input || part.input || {};
+        const metaObj = part.state?.metadata || part.metadata || {};
         const file = formatToolTarget(input);
         const callKey = part.callID || part.id || props.id || null;
         const isDone = stateStatus === "completed";
@@ -1607,32 +2012,63 @@ export class OpenCodeBridgeClient {
             ? `@${agentId}${file ? ` · ${file}` : ""}`
             : file || (typeof input.description === "string" ? input.description.slice(0, 40) : null);
 
-        this._upsertToolLogEntry(part.sessionID || sessionId || this.activeSessionId, {
+        const targetSid = part.sessionID || sessionId || this.activeSessionId;
+        const childSessionId =
+          metaObj.sessionId || metaObj.sessionID || metaObj.childSessionId || null;
+        if (isDelegation && childSessionId && targetSid) {
+          this._registerChildSession(targetSid, childSessionId, {
+            agent: agentId,
+            title: file || input.description || "",
+          });
+        }
+
+        this._upsertToolLogEntry(targetSid, {
           callKey,
+          sourceKey: part.messageID ? `msg:${part.messageID}:part:${part.id || callKey || "tool"}` : null,
           agentId: isDelegation && parentAgent ? parentAgent : agentId,
           toolName,
           target: logTarget,
+          isDelegation,
+          subagentId: isDelegation ? agentId : null,
+          childSessionId,
           status: isErr ? "error" : isDone ? "done" : "running",
+          errorMessage: isErr ? part.state?.error || part.error || null : null,
         });
 
-        if (toolName === "question" && stateStatus !== "completed") {
-          this._emitLiveKanbanSync({
-            sessionId,
-            agentId,
-            status: "blocked",
-            title: "Esperando respuesta en CLI",
-            file: file || "question",
-          });
+        if (toolName === "question" && stateStatus !== "completed" && stateStatus !== "error") {
+          if (Array.isArray(input.questions) || typeof input.question === "string") {
+            this._addPendingQuestion(
+              {
+                id: callKey || `q_${Date.now()}`,
+                callID: callKey,
+                sessionID: targetSid,
+                ...input,
+              },
+              targetSid,
+            );
+          } else {
+            this._emitLiveKanbanSync({
+              sessionId,
+              agentId,
+              status: "blocked",
+              title: "Esperando respuesta",
+              file: file || "question",
+            });
+          }
           this._queueAgentTask(
             agentId,
             {
               status: "failed",
-              label: "Esperando respuesta en CLI",
+              label: "Esperando respuesta",
               file: file || "question",
             },
             { immediate: true },
           );
           return agentId;
+        }
+
+        if (toolName === "question" && (isDone || isErr)) {
+          this._removePendingQuestion(callKey);
         }
 
         if (stateStatus === "error") {
@@ -1698,6 +2134,9 @@ export class OpenCodeBridgeClient {
         const isReasoning = part.type === "reasoning";
         const isDone = Boolean(part.time?.end);
         const streamId = part.id || part.messageID || "active";
+        const sourceKey = part.messageID
+          ? `msg:${part.messageID}:part:${part.id || (isReasoning ? "reasoning" : "text")}`
+          : null;
 
         if (isReasoning) {
           const bufKey = `${sid}:${agentId}`;
@@ -1705,6 +2144,7 @@ export class OpenCodeBridgeClient {
           this.reasoningBuffers.set(bufKey, sourceText.slice(-500));
           this._upsertStreamingLogEntry(sid, {
             streamKey: streamId,
+            sourceKey,
             kind: "reasoning",
             agentId,
             deltaText: delta,
@@ -1730,6 +2170,7 @@ export class OpenCodeBridgeClient {
         } else {
           this._upsertStreamingLogEntry(sid, {
             streamKey: streamId,
+            sourceKey,
             kind: "text",
             agentId,
             deltaText: delta,
@@ -2169,6 +2610,25 @@ export class OpenCodeBridgeClient {
         `${this.apiPrefix}/session/{sessionID}/permissions/{requestID}`,
       ],
       permissionReplySchemas: {},
+      messageListPaths: [
+        `${this.apiPrefix}/session/{sessionID}/message`,
+        `${this.apiPrefix}/session/{sessionID}/messages`,
+      ],
+      questionListPaths: [
+        `${this.apiPrefix}/question`,
+        `${this.apiPrefix}/session/{sessionID}/question`,
+        `${this.apiPrefix}/session/{sessionID}/form`,
+      ],
+      questionReplyPaths: [
+        `${this.apiPrefix}/question/{requestID}/reply`,
+        `${this.apiPrefix}/session/{sessionID}/question/{requestID}/reply`,
+        `${this.apiPrefix}/session/{sessionID}/form/{requestID}/submit`,
+      ],
+      questionReplySchemas: {},
+      questionRejectPaths: [
+        `${this.apiPrefix}/question/{requestID}/reject`,
+        `${this.apiPrefix}/session/{sessionID}/question/{requestID}/reject`,
+      ],
       formListPaths: [`${this.apiPrefix}/session/{sessionID}/form`],
     };
 
@@ -2200,6 +2660,11 @@ export class OpenCodeBridgeClient {
       const permListFound = [];
       const permReplyFound = [];
       const permissionReplySchemas = {};
+      const messageListFound = [];
+      const questionListFound = [];
+      const questionReplyFound = [];
+      const questionReplySchemas = {};
+      const questionRejectFound = [];
       const formListFound = [];
       const sessionAgentEndpoints = [];
       let createSessionSchema = null;
@@ -2228,6 +2693,15 @@ export class OpenCodeBridgeClient {
             permReplyFound.push(norm);
             const info = this._extractBodySchemaInfo(spec, methods.post);
             if (info) permissionReplySchemas[norm] = info;
+          } else if (
+            /\/question\/\{[^}]+\}\/(reply|answer)$/i.test(rawPath) ||
+            /\/session\/\{[^}]+\}\/(question|form)\/\{[^}]+\}\/(reply|submit|answer)$/i.test(rawPath)
+          ) {
+            questionReplyFound.push(norm);
+            const info = this._extractBodySchemaInfo(spec, methods.post);
+            if (info) questionReplySchemas[norm] = info;
+          } else if (/\/question\/\{[^}]+\}\/reject$/i.test(rawPath)) {
+            questionRejectFound.push(norm);
           } else if (/\/session\/\{[^}]+\}\/agent$/i.test(rawPath)) {
             sessionAgentEndpoints.push({
               method: "POST",
@@ -2250,10 +2724,15 @@ export class OpenCodeBridgeClient {
             activeSessionPath = norm;
           } else if (/^(\/api)?\/session\/status$/i.test(rawPath)) {
             sessionStatusPath = norm;
+          } else if (/\/session\/\{[^}]+\}\/messages?$/i.test(rawPath)) {
+            messageListFound.push(norm);
           } else if (/\/permission$/i.test(rawPath)) {
             permListFound.push(norm);
-          } else if (/\/session\/\{[^}]+\}\/form$/i.test(rawPath)) {
-            formListFound.push(norm);
+          } else if (/\/(question|form)s?$/i.test(rawPath)) {
+            questionListFound.push(norm);
+            if (/\/session\/\{[^}]+\}\/form$/i.test(rawPath)) {
+              formListFound.push(norm);
+            }
           }
         }
       }
@@ -2285,6 +2764,13 @@ export class OpenCodeBridgeClient {
             ? -1
             : 1,
       );
+      messageListFound.sort((a, b) =>
+        a.endsWith("/message") === b.endsWith("/message")
+          ? 0
+          : a.endsWith("/message")
+            ? -1
+            : 1,
+      );
 
       this.capabilities = {
         discoveredFrom: "openapi.json",
@@ -2299,6 +2785,11 @@ export class OpenCodeBridgeClient {
         permissionListPaths: dedup(permListFound, defaults.permissionListPaths),
         permissionReplyPaths: dedup(permReplyFound, defaults.permissionReplyPaths),
         permissionReplySchemas,
+        messageListPaths: dedup(messageListFound, defaults.messageListPaths),
+        questionListPaths: dedup(questionListFound, defaults.questionListPaths),
+        questionReplyPaths: dedup(questionReplyFound, defaults.questionReplyPaths),
+        questionReplySchemas,
+        questionRejectPaths: dedup(questionRejectFound, defaults.questionRejectPaths),
         formListPaths: dedup(formListFound, defaults.formListPaths),
       };
       return this.capabilities;
@@ -2346,6 +2837,421 @@ export class OpenCodeBridgeClient {
       }
     }
     return this.getPendingPermissions();
+  }
+
+  async syncPendingQuestions(sessionId = this.activeSessionId, signal) {
+    const baseUrl = this.getActiveBaseUrl();
+    const caps = this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl, signal));
+    const headers = {
+      Accept: "application/json",
+      ...this._buildAuthHeaders(),
+    };
+
+    for (const template of caps.questionListPaths || []) {
+      if (template.includes("{sessionID}") && !sessionId) continue;
+      const path = this._fillEndpointTemplate(template, { sessionID: sessionId || "" });
+      try {
+        const resp = await fetch(`${baseUrl}${path}`, {
+          headers,
+          signal: signal || AbortSignal.timeout(3000),
+        });
+        const ct = (resp.headers.get("content-type") || "").toLowerCase();
+        if (!resp.ok || !ct.includes("application/json")) continue;
+
+        const raw = await resp.json().catch(() => null);
+        const data = this._unwrapResponseData(raw);
+        const list = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.questions)
+            ? data.questions
+            : Array.isArray(data?.items)
+              ? data.items
+              : data && typeof data === "object" && (data.id || data.requestID)
+                ? [data]
+                : [];
+
+        for (const q of list) {
+          this._addPendingQuestion(q, sessionId);
+        }
+        return this.getPendingQuestions();
+      } catch {
+        // Probar siguiente ruta candidata
+      }
+    }
+    return this.getPendingQuestions();
+  }
+
+  _normalizeHistoryMessages(rawList, sessionId) {
+    const entries = [];
+    const sessionRecord = this.sessionsById.get(sessionId);
+    const defaultAgent =
+      this.resolveAgentId(this.sessionAgentMap.get(sessionId)) ||
+      this.resolveAgentId(sessionRecord?.agent) ||
+      "architect";
+
+    const list = Array.isArray(rawList) ? rawList : [];
+    for (let mIdx = 0; mIdx < list.length; mIdx += 1) {
+      const msg = list[mIdx];
+      if (!msg || typeof msg !== "object") continue;
+
+      const info = msg.info && typeof msg.info === "object" ? msg.info : msg;
+      const msgId = info.id || msg.id || `hist_${mIdx}`;
+      const role = String(info.role || msg.role || "assistant").toLowerCase();
+      const msgTime = info.time?.created || info.createdAt || msg.timestamp || Date.now() + mIdx;
+      const msgAgent =
+        this.resolveAgentId(info.agent || msg.agent) || defaultAgent;
+
+      const parts = Array.isArray(msg.parts)
+        ? msg.parts
+        : Array.isArray(info.parts)
+          ? info.parts
+          : null;
+
+      if (role === "user") {
+        let userText = "";
+        if (parts && parts.length > 0) {
+          userText = parts
+            .filter((p) => p && (p.type === "text" || typeof p.text === "string"))
+            .map((p) => String(p.text || ""))
+            .join("\n")
+            .trim();
+        } else if (typeof info.content === "string") {
+          userText = info.content.trim();
+        } else if (typeof msg.text === "string") {
+          userText = msg.text.trim();
+        }
+        if (userText) {
+          entries.push({
+            id: `hist_prompt_${msgId}`,
+            sourceKey: `msg:${msgId}:user`,
+            callKey: null,
+            sessionId,
+            kind: "prompt",
+            agentId: msgAgent,
+            toolName: null,
+            target: null,
+            isDelegation: false,
+            subagentId: null,
+            childSessionId: null,
+            content: userText,
+            status: "done",
+            timestamp: msgTime,
+          });
+        }
+        continue;
+      }
+
+      if (parts && parts.length > 0) {
+        for (let pIdx = 0; pIdx < parts.length; pIdx += 1) {
+          const part = parts[pIdx];
+          if (!part || typeof part !== "object") continue;
+          const partId = part.id || `p${pIdx}`;
+          const partTime = part.time?.start || part.time?.end || msgTime + pIdx;
+          const sourceKey = `msg:${msgId}:part:${partId}`;
+
+          if (part.type === "reasoning") {
+            const text = String(part.text || "").trim();
+            if (!text) continue;
+            entries.push({
+              id: `hist_reasoning_${msgId}_${partId}`,
+              sourceKey,
+              callKey: null,
+              sessionId,
+              kind: "reasoning",
+              agentId: this.resolveAgentId(part.agent) || msgAgent,
+              toolName: null,
+              target: null,
+              isDelegation: false,
+              subagentId: null,
+              childSessionId: null,
+              content: text,
+              status: part.time?.end === false ? "running" : "done",
+              timestamp: partTime,
+            });
+          } else if (part.type === "tool") {
+            const toolName = String(part.tool || part.name || "tool").toLowerCase();
+            const input = part.state?.input || part.input || {};
+            const metaObj = part.state?.metadata || part.metadata || {};
+            const stateStatus = String(part.state?.status || "completed").toLowerCase();
+            const callKey = part.callID || part.id || null;
+            const isDelegation = isDelegationToolName(toolName);
+            const file = formatToolTarget(input);
+
+            let subagentId = null;
+            if (isDelegation) {
+              subagentId = this._resolveEventAgentId("message.part.updated", {
+                part,
+                sessionID: sessionId,
+              });
+            }
+            const childSessionId =
+              metaObj.sessionId || metaObj.sessionID || metaObj.childSessionId || null;
+            if (isDelegation && childSessionId) {
+              this._registerChildSession(sessionId, childSessionId, {
+                agent: subagentId,
+                title: file || input.description || "",
+              });
+            }
+
+            const logTarget =
+              isDelegation && subagentId && subagentId !== msgAgent
+                ? `@${subagentId}${file ? ` · ${file}` : ""}`
+                : file ||
+                  (typeof input.description === "string"
+                    ? input.description.slice(0, 40)
+                    : null);
+
+            entries.push({
+              id: `hist_tool_${msgId}_${partId}`,
+              sourceKey,
+              callKey,
+              sessionId,
+              kind: "tool",
+              agentId: msgAgent,
+              toolName,
+              target: logTarget,
+              isDelegation,
+              subagentId,
+              childSessionId,
+              content:
+                stateStatus === "error"
+                  ? String(part.state?.error || part.error || "")
+                  : "",
+              status:
+                stateStatus === "error"
+                  ? "error"
+                  : stateStatus === "running" || stateStatus === "pending"
+                    ? "running"
+                    : "done",
+              timestamp: partTime,
+            });
+          } else if (part.type === "text") {
+            const text = String(part.text || "").trim();
+            if (!text) continue;
+            entries.push({
+              id: `hist_text_${msgId}_${partId}`,
+              sourceKey,
+              callKey: null,
+              sessionId,
+              kind: "text",
+              agentId: this.resolveAgentId(part.agent) || msgAgent,
+              toolName: null,
+              target: null,
+              isDelegation: false,
+              subagentId: null,
+              childSessionId: null,
+              content: text,
+              status: part.time?.end === false ? "running" : "done",
+              timestamp: partTime,
+            });
+          }
+        }
+      } else if (typeof info.content === "string" && info.content.trim()) {
+        entries.push({
+          id: `hist_text_${msgId}`,
+          sourceKey: `msg:${msgId}:text`,
+          callKey: null,
+          sessionId,
+          kind: "text",
+          agentId: msgAgent,
+          toolName: null,
+          target: null,
+          isDelegation: false,
+          subagentId: null,
+          childSessionId: null,
+          content: info.content.trim(),
+          status: "done",
+          timestamp: msgTime,
+        });
+      }
+
+      if (info.error) {
+        const errMsg =
+          info.error?.data?.message || info.error?.message || info.error?.name || String(info.error);
+        if (errMsg) {
+          entries.push({
+            id: `hist_err_${msgId}`,
+            sourceKey: `msg:${msgId}:err`,
+            callKey: null,
+            sessionId,
+            kind: "error",
+            agentId: msgAgent,
+            toolName: null,
+            target: null,
+            isDelegation: false,
+            subagentId: null,
+            childSessionId: null,
+            content: errMsg,
+            status: "error",
+            timestamp: msgTime + 99,
+          });
+        }
+      }
+    }
+
+    return entries;
+  }
+
+  _mergeHydratedLogEntries(sessionId, hydratedEntries) {
+    const { sid, list } = this._ensureSessionLogList(sessionId);
+    const merged = [...hydratedEntries];
+
+    // Vincular sesiones hijas huérfanas con entradas de delegación si aún no tenían childSessionId
+    const childIds = this.getChildSessionIds(sid);
+    if (childIds.length > 0) {
+      const usedChildren = new Set(merged.map((e) => e.childSessionId).filter(Boolean));
+      const remainingChildren = childIds.filter((cid) => !usedChildren.has(cid));
+      for (const cid of remainingChildren) {
+        const sess = this.sessionsById.get(cid);
+        const childAgent =
+          this.taskCallsByChildSession.get(cid) ||
+          this.resolveAgentId(sess?.agent) ||
+          this._inferSubagentFromText(sess?.title || "");
+        const match =
+          (childAgent &&
+            merged.find(
+              (e) =>
+                e.kind === "tool" &&
+                e.isDelegation &&
+                !e.childSessionId &&
+                e.subagentId === childAgent,
+            )) ||
+          merged.find((e) => e.kind === "tool" && e.isDelegation && !e.childSessionId);
+        if (match) {
+          match.childSessionId = cid;
+        }
+      }
+    }
+
+    // Conservar entradas SSE en vivo que aún no aparezcan en el snapshot REST
+    for (const live of list) {
+      const idx = merged.findIndex((h) => {
+        if (live.sourceKey && h.sourceKey && live.sourceKey === h.sourceKey) return true;
+        if (live.callKey && h.callKey && live.callKey === h.callKey) return true;
+        if (
+          live.kind === "prompt" &&
+          h.kind === "prompt" &&
+          live.content.trim() === h.content.trim()
+        ) {
+          return true;
+        }
+        return false;
+      });
+      if (idx === -1) {
+        merged.push(live);
+      } else {
+        // Si la entrada en vivo tenía más detalle (p. ej. streaming reciente o childSessionId), conservarlo
+        if (live.childSessionId && !merged[idx].childSessionId) {
+          merged[idx].childSessionId = live.childSessionId;
+        }
+        if (live.content && live.content.length > merged[idx].content.length) {
+          merged[idx].content = live.content;
+        }
+        if (live.status === "running" && merged[idx].status !== "done") {
+          merged[idx].status = "running";
+        }
+      }
+    }
+
+    if (merged.length > MAX_SESSION_LOG_ENTRIES) {
+      merged.splice(0, merged.length - MAX_SESSION_LOG_ENTRIES);
+    }
+    this.sessionLogsById.set(sid, merged);
+    this._emitSessionLog(sid);
+    return merged;
+  }
+
+  async hydrateSessionHistory(sessionId, { force = false } = {}) {
+    const sid = sessionId || this.activeSessionId;
+    if (!sid) return [];
+
+    const currentState = this.sessionHistoryState.get(sid);
+    if (!force && currentState?.status === "loaded") {
+      return this.getSessionLog(sid);
+    }
+    if (this.historyFetchPromises.has(sid)) {
+      return this.historyFetchPromises.get(sid);
+    }
+
+    const promise = (async () => {
+      this.sessionHistoryState.set(sid, {
+        status: "loading",
+        error: null,
+        lastSyncedAt: currentState?.lastSyncedAt || null,
+      });
+      this._emitConnectionState();
+
+      const baseUrl = this.getActiveBaseUrl();
+      const caps =
+        this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
+      const headers = {
+        Accept: "application/json",
+        ...this._buildAuthHeaders(),
+      };
+
+      let lastErr = null;
+      let loaded = false;
+
+      for (const template of caps.messageListPaths || []) {
+        const path = this._fillEndpointTemplate(template, { sessionID: sid });
+        try {
+          const resp = await fetch(`${baseUrl}${path}`, {
+            headers,
+            signal: AbortSignal.timeout(6000),
+          });
+          if (resp.status === 404 || resp.status === 405) {
+            continue;
+          }
+          const ct = (resp.headers.get("content-type") || "").toLowerCase();
+          if (ct.includes("text/html")) {
+            continue;
+          }
+          if (!resp.ok) {
+            lastErr = await this._extractHttpError(
+              resp,
+              `Error HTTP ${resp.status} cargando historial`,
+            );
+            continue;
+          }
+
+          const raw = await resp.json().catch(() => []);
+          const data = this._unwrapResponseData(raw);
+          const rawMessages = Array.isArray(data)
+            ? data
+            : Array.isArray(data?.messages)
+              ? data.messages
+              : [];
+
+          const normalized = this._normalizeHistoryMessages(rawMessages, sid);
+          this._mergeHydratedLogEntries(sid, normalized);
+          this.sessionHistoryState.set(sid, {
+            status: "loaded",
+            error: null,
+            lastSyncedAt: Date.now(),
+          });
+          loaded = true;
+          break;
+        } catch (err) {
+          lastErr = err?.message || "No se pudo cargar el historial";
+        }
+      }
+
+      if (!loaded) {
+        this.sessionHistoryState.set(sid, {
+          status: lastErr ? "error" : "loaded",
+          error: lastErr || null,
+          lastSyncedAt: Date.now(),
+        });
+      }
+
+      this._emitConnectionState();
+      return this.getSessionLog(sid);
+    })().finally(() => {
+      this.historyFetchPromises.delete(sid);
+    });
+
+    this.historyFetchPromises.set(sid, promise);
+    return promise;
   }
 
   async createSession({ title = "", agent = "architect" } = {}) {
@@ -2913,6 +3819,171 @@ export class OpenCodeBridgeClient {
     };
   }
 
+  async replyQuestion(requestId, answers = [], { reject = false } = {}) {
+    const item = this.pendingQuestions.get(requestId);
+    if (!item) {
+      return { ok: false, error: "La pregunta ya fue respondida o expiró." };
+    }
+
+    const normalizedAnswers = (Array.isArray(answers) ? answers : [answers]).map(
+      (group) =>
+        (Array.isArray(group) ? group : [group])
+          .map((v) => String(v || "").trim())
+          .filter(Boolean),
+    );
+    const flatAnswers = normalizedAnswers.flat();
+    if (!reject && flatAnswers.length === 0) {
+      return { ok: false, error: "Selecciona una opción o escribe una respuesta." };
+    }
+
+    const baseUrl = this.getActiveBaseUrl();
+    const caps =
+      this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
+    const headers = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...this._buildAuthHeaders(),
+    };
+
+    let lastHttpError = null;
+    const flatText = flatAnswers.join(", ");
+
+    if (reject) {
+      for (const template of caps.questionRejectPaths || []) {
+        if (template.includes("{sessionID}") && !item.sessionID) continue;
+        const path = this._fillEndpointTemplate(template, {
+          sessionID: item.sessionID || "",
+          requestID: requestId,
+        });
+        try {
+          const resp = await fetch(`${baseUrl}${path}`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({}),
+            signal: AbortSignal.timeout(5000),
+          });
+          if (resp.status === 404 || resp.status === 405) continue;
+          if (!resp.ok) {
+            lastHttpError = await this._extractHttpError(
+              resp,
+              `HTTP ${resp.status} al omitir pregunta`,
+            );
+            continue;
+          }
+          this._removePendingQuestion(requestId);
+          this._emitLiveKanbanSync({
+            sessionId: item.sessionID,
+            agentId: item.agentId,
+            status: "blocked",
+            title: "Pregunta omitida",
+            file: item.header,
+          });
+          this._queueAgentTask(item.agentId, {
+            status: "failed",
+            label: "Pregunta omitida",
+            file: item.header,
+          });
+          return { ok: true, rejected: true, endpoint: path };
+        } catch (err) {
+          lastHttpError = err?.message || "No se pudo omitir la pregunta";
+        }
+      }
+    }
+
+    for (const template of caps.questionReplyPaths || []) {
+      if (template.includes("{sessionID}") && !item.sessionID) continue;
+      const path = this._fillEndpointTemplate(template, {
+        sessionID: item.sessionID || "",
+        requestID: requestId,
+      });
+
+      const schemaProps = caps.questionReplySchemas?.[template]?.props || [];
+      const bodyCandidates = reject
+        ? [{ reject: true }, { decision: "reject" }, { answers: [] }]
+        : schemaProps.includes("answers")
+          ? [{ answers: normalizedAnswers }]
+          : schemaProps.includes("answer")
+            ? [{ answer: flatText }, { answers: normalizedAnswers }]
+            : schemaProps.includes("values")
+              ? [{ values: flatAnswers }, { answers: normalizedAnswers }]
+              : [
+                  { answers: normalizedAnswers },
+                  { answer: flatText },
+                  { reply: flatText },
+                  { text: flatText },
+                ];
+
+      for (const payload of bodyCandidates) {
+        try {
+          const resp = await fetch(`${baseUrl}${path}`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(5000),
+          });
+          const ct = (resp.headers.get("content-type") || "").toLowerCase();
+          if (resp.status === 404 || resp.status === 405 || ct.includes("text/html")) {
+            break;
+          }
+          if (resp.status === 400 || resp.status === 422) {
+            lastHttpError = await this._extractHttpError(
+              resp,
+              `HTTP ${resp.status} al responder pregunta`,
+            );
+            continue;
+          }
+          if (!resp.ok) {
+            return {
+              ok: false,
+              error: await this._extractHttpError(
+                resp,
+                `Error HTTP ${resp.status} al responder pregunta`,
+              ),
+            };
+          }
+
+          this._removePendingQuestion(requestId);
+          if (item.sessionID) {
+            this._appendSessionLogEntry(item.sessionID, {
+              kind: "prompt",
+              agentId: item.agentId,
+              content: reject
+                ? `Pregunta omitida (${item.header})`
+                : `Respuesta (${item.header}): ${flatText}`,
+              status: "done",
+            });
+          }
+          this._emitLiveKanbanSync({
+            sessionId: item.sessionID,
+            agentId: item.agentId,
+            status: reject ? "blocked" : "in_progress",
+            title: reject ? "Pregunta omitida" : "Respuesta enviada",
+            file: item.header,
+          });
+          this._queueAgentTask(item.agentId, {
+            status: reject ? "failed" : "started",
+            phase: "working",
+            label: reject ? "Pregunta omitida" : "Continuando tarea",
+            file: item.header,
+          });
+          return { ok: true, endpoint: path };
+        } catch (err) {
+          return {
+            ok: false,
+            error: err?.message || "No se pudo responder la pregunta",
+          };
+        }
+      }
+    }
+
+    return {
+      ok: false,
+      error:
+        lastHttpError ||
+        "No se encontró endpoint compatible para responder preguntas (/question/.../reply)",
+    };
+  }
+
   async _syncInitialSessions(signal) {
     const baseUrl = this.getActiveBaseUrl();
     const headers = {
@@ -2991,9 +4062,13 @@ export class OpenCodeBridgeClient {
       const targetSessionForPerms =
         this.activeSessionId || this.getSessions()[0]?.id || null;
       if (targetSessionForPerms) {
-        await this.syncSessionPermissions(targetSessionForPerms, signal).catch(
-          () => [],
-        );
+        await Promise.all([
+          this.syncSessionPermissions(targetSessionForPerms, signal).catch(() => []),
+          this.syncPendingQuestions(targetSessionForPerms, signal).catch(() => []),
+          this.hydrateSessionHistory(targetSessionForPerms).catch(() => []),
+        ]);
+      } else {
+        await this.syncPendingQuestions(null, signal).catch(() => []);
       }
       this._emitConnectionState();
     } catch (err) {
@@ -3186,10 +4261,16 @@ export class OpenCodeBridgeClient {
     this.sessionAgentMap.clear();
     this.busySessions.clear();
     this.pendingPermissions.clear();
+    this.pendingQuestions.clear();
+    this.questionCallIdMap.clear();
     this.liveTaskMeta.clear();
     this.taskCallsByChildSession.clear();
     this.taskCallsByPartId.clear();
     this.sessionLogsById.clear();
+    this.sessionHistoryState.clear();
+    this.historyFetchPromises.clear();
+    this.childSessionsByParent.clear();
+    this.messageMetaById.clear();
     this.reasoningBuffers.clear();
     this.activeStreamEntryIds.clear();
     this.emittedDelegations.clear();
@@ -3200,6 +4281,7 @@ export class OpenCodeBridgeClient {
       { sessionId: null, entries: [], cleared: true },
       "opencode-sse",
     );
+    this._emitQuestionsState(false, null);
     this._emitPermissionsState(false, null);
   }
 
