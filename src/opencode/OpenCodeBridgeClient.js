@@ -158,6 +158,8 @@ export class OpenCodeBridgeClient {
     this.questionCallIdMap = new Map();
     this.liveTaskMeta = new Map(); // externalKey -> { title, file }
     this.capabilities = null;
+    this.capabilitiesCache = new Map();
+    this.deadGetPaths = new Set();
 
     // Bitácora por sesión, historial hidratado y enlace padre -> hijas
     this.sessionLogsById = new Map();
@@ -260,9 +262,26 @@ export class OpenCodeBridgeClient {
       }
     }
 
+    if (
+      patch.mode ||
+      patch.directUrl ||
+      patch.bridgeUrl ||
+      typeof patch.username === "string" ||
+      typeof patch.password === "string"
+    ) {
+      this.capabilities = null;
+      this.capabilitiesCache.clear();
+      this.deadGetPaths.clear();
+    }
+
     this._saveConfig();
     this._emitConnectionState();
     return this.getConfig();
+  }
+
+  setActiveSession(sessionId = null) {
+    this.activeSessionId = sessionId || null;
+    this._emitConnectionState();
   }
 
   resetAliases() {
@@ -430,7 +449,15 @@ export class OpenCodeBridgeClient {
       existing = list.find((item) => item.kind === kind && item.sourceKey === sourceKey);
     }
 
-    if (!existing || (existing.status === "done" && status === "running")) {
+    const hasIncomingText =
+      (typeof deltaText === "string" && deltaText.length > 0) ||
+      (typeof fullText === "string" && fullText.length > 0);
+
+    if (!existing && !hasIncomingText) {
+      return null;
+    }
+
+    if (!existing || (existing.status === "done" && status === "running" && hasIncomingText)) {
       entryId = `${kind}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       existing = {
         id: entryId,
@@ -957,11 +984,17 @@ export class OpenCodeBridgeClient {
   }
 
   _normalizeQuestionList(raw = {}) {
-    const sourceList = Array.isArray(raw.questions) && raw.questions.length > 0
-      ? raw.questions
-      : Array.isArray(raw.fields) && raw.fields.length > 0
-        ? raw.fields
-        : [raw];
+    const unwrapped =
+      raw?.input && typeof raw.input === "object" && Array.isArray(raw.input.questions)
+        ? raw.input
+        : raw?.info && typeof raw.info === "object" && Array.isArray(raw.info.questions)
+          ? raw.info
+          : raw;
+    const sourceList = Array.isArray(unwrapped.questions) && unwrapped.questions.length > 0
+      ? unwrapped.questions
+      : Array.isArray(unwrapped.fields) && unwrapped.fields.length > 0
+        ? unwrapped.fields
+        : [unwrapped];
 
     return sourceList.map((q, idx) => {
       const rawOpts = Array.isArray(q?.options)
@@ -992,7 +1025,9 @@ export class OpenCodeBridgeClient {
           q?.question || q?.prompt || q?.label || q?.text || "El agente necesita tu respuesta para continuar.",
         ).trim(),
         options,
-        multiple: Boolean(q?.multiple || q?.multiSelect),
+        multiple: Boolean(
+          q?.multiple || q?.multiSelect || q?.allowMultiple || q?.type === "multiselect",
+        ),
         custom: q?.custom !== false,
       };
     });
@@ -1010,16 +1045,9 @@ export class OpenCodeBridgeClient {
       null;
     if (!id) return null;
 
-    // Si existía un placeholder sintético creado desde tool="question" por callID, reemplazarlo por el ID real
-    if (callID && id !== callID) {
-      const synthId = this.questionCallIdMap.get(callID) || callID;
-      if (synthId !== id && this.pendingQuestions.has(synthId)) {
-        this.pendingQuestions.delete(synthId);
-      }
-    }
-    if (callID) {
-      this.questionCallIdMap.set(callID, id);
-    }
+    const isSynthetic = Boolean(
+      rawQuestion.isSynthetic || (!rawQuestion.requestID && !rawQuestion.questionID && callID && id === callID),
+    );
 
     const sessionID =
       rawQuestion.sessionID ||
@@ -1029,6 +1057,53 @@ export class OpenCodeBridgeClient {
       null;
 
     const questions = this._normalizeQuestionList(rawQuestion);
+    const firstPrompt = questions[0]?.question || "";
+
+    // No degradar una pregunta real (que_...) ya registrada si vuelve a llegar message.part.updated sintético
+    if (isSynthetic) {
+      if (callID && this.questionCallIdMap.has(callID)) {
+        const mappedId = this.questionCallIdMap.get(callID);
+        if (mappedId && mappedId !== id && this.pendingQuestions.has(mappedId)) {
+          return this.pendingQuestions.get(mappedId);
+        }
+      }
+      for (const existing of this.pendingQuestions.values()) {
+        if (
+          !existing.isSynthetic &&
+          existing.sessionID === sessionID &&
+          ((callID && existing.callID === callID) ||
+            (firstPrompt && existing.questions?.[0]?.question === firstPrompt))
+        ) {
+          if (callID) this.questionCallIdMap.set(callID, existing.id);
+          return existing;
+        }
+      }
+    } else {
+      // Si existía un placeholder sintético creado desde tool="question", reemplazarlo por el ID real
+      if (callID) {
+        const synthId = this.questionCallIdMap.get(callID) || callID;
+        if (synthId !== id && this.pendingQuestions.has(synthId)) {
+          this.pendingQuestions.delete(synthId);
+        }
+      }
+      for (const [existingId, existing] of this.pendingQuestions.entries()) {
+        if (
+          existing.isSynthetic &&
+          existingId !== id &&
+          ((callID && existing.callID === callID) ||
+            (existing.sessionID === sessionID &&
+              firstPrompt &&
+              existing.questions?.[0]?.question === firstPrompt))
+        ) {
+          this.pendingQuestions.delete(existingId);
+        }
+      }
+    }
+
+    if (callID) {
+      this.questionCallIdMap.set(callID, id);
+    }
+
     const firstHeader = questions[0]?.header || "Pregunta";
     const agentId =
       this._resolveEventAgentId("question.asked", {
@@ -1040,6 +1115,7 @@ export class OpenCodeBridgeClient {
     const item = {
       id,
       callID,
+      isSynthetic,
       sessionID,
       agentId,
       header: firstHeader,
@@ -1267,10 +1343,6 @@ export class OpenCodeBridgeClient {
       updatedAt,
     });
 
-    if (!this.activeSessionId && !parentID) {
-      this.activeSessionId = sessionObj.id;
-    }
-
     if (agentHint) {
       this.sessionAgentMap.set(sessionObj.id, agentHint);
     }
@@ -1450,6 +1522,7 @@ export class OpenCodeBridgeClient {
               {
                 id: callKey || `q_${Date.now()}`,
                 callID: callKey,
+                isSynthetic: true,
                 sessionID: targetSid,
                 ...input,
               },
@@ -1464,6 +1537,7 @@ export class OpenCodeBridgeClient {
               file: file || "question",
             });
           }
+          this.syncPendingQuestions(targetSid).catch(() => []);
           this._queueAgentTask(
             agentId,
             {
@@ -1619,13 +1693,17 @@ export class OpenCodeBridgeClient {
       const chunk = String(
         props.delta ?? props.text ?? props.part?.text ?? "",
       );
-      const streamId = props.id || props.partID || props.messageID || "active";
+      const streamId = props.partID || props.part?.id || props.id || props.messageID || "active";
+      const sourceKey = props.messageID
+        ? `msg:${props.messageID}:part:${streamId}`
+        : null;
       const bufferKey = `${sid}:${agentId}`;
 
       if (eventType === "session.reasoning.started") {
         this.reasoningBuffers.set(bufferKey, chunk);
         this._upsertStreamingLogEntry(sid, {
           streamKey: streamId,
+          sourceKey,
           kind: "reasoning",
           agentId,
           fullText: chunk,
@@ -1637,6 +1715,7 @@ export class OpenCodeBridgeClient {
         this.reasoningBuffers.set(bufferKey, nextBuf);
         this._upsertStreamingLogEntry(sid, {
           streamKey: streamId,
+          sourceKey,
           kind: "reasoning",
           agentId,
           deltaText: chunk,
@@ -1645,6 +1724,7 @@ export class OpenCodeBridgeClient {
       } else {
         this._upsertStreamingLogEntry(sid, {
           streamKey: streamId,
+          sourceKey,
           kind: "reasoning",
           agentId,
           fullText: chunk || undefined,
@@ -1687,11 +1767,15 @@ export class OpenCodeBridgeClient {
       const chunk = String(
         props.delta ?? props.text ?? props.part?.text ?? "",
       );
-      const streamId = props.id || props.partID || props.messageID || "active";
+      const streamId = props.partID || props.part?.id || props.id || props.messageID || "active";
+      const sourceKey = props.messageID
+        ? `msg:${props.messageID}:part:${streamId}`
+        : null;
 
       if (eventType === "session.text.started") {
         this._upsertStreamingLogEntry(sid, {
           streamKey: streamId,
+          sourceKey,
           kind: "text",
           agentId,
           fullText: chunk,
@@ -1701,6 +1785,7 @@ export class OpenCodeBridgeClient {
       } else if (eventType === "session.text.delta") {
         this._upsertStreamingLogEntry(sid, {
           streamKey: streamId,
+          sourceKey,
           kind: "text",
           agentId,
           deltaText: chunk,
@@ -1709,6 +1794,7 @@ export class OpenCodeBridgeClient {
       } else {
         this._upsertStreamingLogEntry(sid, {
           streamKey: streamId,
+          sourceKey,
           kind: "text",
           agentId,
           fullText: chunk || undefined,
@@ -1764,7 +1850,12 @@ export class OpenCodeBridgeClient {
     if (eventType === "session.created" || eventType === "session.updated") {
       const info = props.info || props.session || props;
       this._upsertSessionRecord(info);
-      if (info?.id && !info.parentID) {
+      if (
+        info?.id &&
+        !info.parentID &&
+        !this.activeSessionId &&
+        (eventType === "session.created" || info?.status?.type === "busy")
+      ) {
         this.activeSessionId = info.id;
       }
       const resolved = this._resolveEventAgentId(eventType, {
@@ -1924,12 +2015,15 @@ export class OpenCodeBridgeClient {
     if (eventType === "message.part.updated") {
       if (sessionId) this._cancelSessionIdleTimer(sessionId);
       const part = props.part || props;
+      if (part.synthetic || part.ignored) return null;
       const msgMeta = part.messageID ? this.messageMetaById.get(part.messageID) : null;
       const agentId = this._resolveEventAgentId(eventType, props);
       if (!agentId) return null;
 
+      const partRole = String(msgMeta?.role || part.role || props.info?.role || "").toLowerCase();
+
       // Evitar duplicar prompts del usuario cuando message.part.updated emite la parte user text
-      if (msgMeta?.role === "user" && part.type === "text") {
+      if (partRole === "user" && part.type === "text") {
         const sid = part.sessionID || sessionId || this.activeSessionId || "global";
         const textVal = String(part.text || "").trim();
         const sourceKey = part.messageID ? `msg:${part.messageID}:part:${part.id || 0}` : null;
@@ -1947,7 +2041,7 @@ export class OpenCodeBridgeClient {
             this._appendSessionLogEntry(sid, {
               sourceKey,
               kind: "prompt",
-              agentId: this.resolveAgentId(msgMeta.agent) || agentId,
+              agentId: this.resolveAgentId(msgMeta?.agent) || agentId,
               content: textVal,
               status: "done",
               timestamp: part.time?.start || Date.now(),
@@ -2041,6 +2135,7 @@ export class OpenCodeBridgeClient {
               {
                 id: callKey || `q_${Date.now()}`,
                 callID: callKey,
+                isSynthetic: true,
                 sessionID: targetSid,
                 ...input,
               },
@@ -2055,6 +2150,7 @@ export class OpenCodeBridgeClient {
               file: file || "question",
             });
           }
+          this.syncPendingQuestions(targetSid).catch(() => []);
           this._queueAgentTask(
             agentId,
             {
@@ -2583,11 +2679,18 @@ export class OpenCodeBridgeClient {
   }
 
   async _discoverOpenApiCapabilities(baseUrl = this.getActiveBaseUrl(), signal) {
+    const cacheKey = `${baseUrl}|${this.apiPrefix}`;
+    if (this.capabilitiesCache.has(cacheKey)) {
+      const cached = this.capabilitiesCache.get(cacheKey);
+      this.capabilities = cached;
+      return cached;
+    }
+
     const defaults = {
       discoveredFrom: "defaults",
       createSessionSchema: null,
-      activeSessionPath: `${this.apiPrefix}/session/active`,
-      sessionStatusPath: null,
+      activeSessionPath: null,
+      sessionStatusPath: `${this.apiPrefix}/session/status`,
       sessionAgentEndpoints: [],
       promptPaths: [
         `${this.apiPrefix}/session/{sessionID}/prompt`,
@@ -2601,12 +2704,12 @@ export class OpenCodeBridgeClient {
       ],
       interruptBodyInfo: {},
       permissionListPaths: [
-        `${this.apiPrefix}/session/{sessionID}/permission`,
         `${this.apiPrefix}/permission`,
+        `${this.apiPrefix}/session/{sessionID}/permission`,
       ],
       permissionReplyPaths: [
-        `${this.apiPrefix}/session/{sessionID}/permission/{requestID}/reply`,
         `${this.apiPrefix}/permission/{requestID}/reply`,
+        `${this.apiPrefix}/session/{sessionID}/permission/{requestID}/reply`,
         `${this.apiPrefix}/session/{sessionID}/permissions/{requestID}`,
       ],
       permissionReplySchemas: {},
@@ -2617,39 +2720,48 @@ export class OpenCodeBridgeClient {
       questionListPaths: [
         `${this.apiPrefix}/question`,
         `${this.apiPrefix}/session/{sessionID}/question`,
-        `${this.apiPrefix}/session/{sessionID}/form`,
       ],
       questionReplyPaths: [
         `${this.apiPrefix}/question/{requestID}/reply`,
         `${this.apiPrefix}/session/{sessionID}/question/{requestID}/reply`,
-        `${this.apiPrefix}/session/{sessionID}/form/{requestID}/submit`,
       ],
       questionReplySchemas: {},
       questionRejectPaths: [
         `${this.apiPrefix}/question/{requestID}/reject`,
         `${this.apiPrefix}/session/{sessionID}/question/{requestID}/reject`,
       ],
-      formListPaths: [`${this.apiPrefix}/session/{sessionID}/form`],
+      formListPaths: [],
     };
 
     try {
-      const resp = await fetch(`${baseUrl}/openapi.json`, {
-        headers: {
-          Accept: "application/json",
-          ...this._buildAuthHeaders(),
-        },
-        signal: signal || AbortSignal.timeout(3000),
-      });
-      const ct = (resp.headers.get("content-type") || "").toLowerCase();
-      if (!resp.ok || !ct.includes("application/json")) {
-        this.capabilities = defaults;
-        return defaults;
+      const specCandidates =
+        this.apiPrefix === "" ? ["/doc", "/openapi.json"] : ["/openapi.json", "/doc"];
+      let spec = null;
+      let specSource = "openapi.json";
+
+      for (const specPath of specCandidates) {
+        const resp = await fetch(`${baseUrl}${specPath}`, {
+          headers: {
+            Accept: "application/json",
+            ...this._buildAuthHeaders(),
+          },
+          signal: signal || AbortSignal.timeout(3000),
+        }).catch(() => null);
+        if (!resp) continue;
+        const ct = (resp.headers.get("content-type") || "").toLowerCase();
+        if (!resp.ok || !ct.includes("application/json")) continue;
+        const parsed = await resp.json().catch(() => null);
+        if (parsed?.paths && typeof parsed.paths === "object") {
+          spec = parsed;
+          specSource = specPath === "/doc" ? "doc" : "openapi.json";
+          break;
+        }
       }
 
-      const spec = await resp.json().catch(() => null);
       const paths = spec?.paths;
       if (!paths || typeof paths !== "object") {
         this.capabilities = defaults;
+        this.capabilitiesCache.set(cacheKey, defaults);
         return defaults;
       }
 
@@ -2737,7 +2849,7 @@ export class OpenCodeBridgeClient {
         }
       }
 
-      const dedup = (arr, fallback) => [...new Set([...arr, ...fallback])];
+      const unique = (arr) => [...new Set(arr)];
       promptFound.sort((a, b) => {
         const rank = (p) =>
           p.endsWith("/prompt") ? 0 : p.endsWith("/prompt_async") ? 1 : 2;
@@ -2761,8 +2873,8 @@ export class OpenCodeBridgeClient {
         a.includes("/session/") === b.includes("/session/")
           ? 0
           : a.includes("/session/")
-            ? -1
-            : 1,
+            ? 1
+            : -1,
       );
       messageListFound.sort((a, b) =>
         a.endsWith("/message") === b.endsWith("/message")
@@ -2772,29 +2884,35 @@ export class OpenCodeBridgeClient {
             : 1,
       );
 
+      // Estricto según el OpenAPI descubierto: no mezclar URLs fallback que producirían HTTP 404
       this.capabilities = {
-        discoveredFrom: "openapi.json",
+        discoveredFrom: specSource,
         createSessionSchema,
         activeSessionPath,
         sessionStatusPath,
         sessionAgentEndpoints,
-        promptPaths: dedup(promptFound, defaults.promptPaths),
+        promptPaths: promptFound.length > 0 ? unique(promptFound) : defaults.promptPaths,
         promptBodySchemas,
-        interruptPaths: dedup(interruptFound, defaults.interruptPaths),
+        interruptPaths: interruptFound.length > 0 ? unique(interruptFound) : defaults.interruptPaths,
         interruptBodyInfo,
-        permissionListPaths: dedup(permListFound, defaults.permissionListPaths),
-        permissionReplyPaths: dedup(permReplyFound, defaults.permissionReplyPaths),
+        permissionListPaths: unique(permListFound),
+        permissionReplyPaths:
+          permReplyFound.length > 0 ? unique(permReplyFound) : defaults.permissionReplyPaths,
         permissionReplySchemas,
-        messageListPaths: dedup(messageListFound, defaults.messageListPaths),
-        questionListPaths: dedup(questionListFound, defaults.questionListPaths),
-        questionReplyPaths: dedup(questionReplyFound, defaults.questionReplyPaths),
+        messageListPaths:
+          messageListFound.length > 0 ? unique(messageListFound) : defaults.messageListPaths,
+        questionListPaths: unique(questionListFound),
+        questionReplyPaths:
+          questionReplyFound.length > 0 ? unique(questionReplyFound) : defaults.questionReplyPaths,
         questionReplySchemas,
-        questionRejectPaths: dedup(questionRejectFound, defaults.questionRejectPaths),
-        formListPaths: dedup(formListFound, defaults.formListPaths),
+        questionRejectPaths: unique(questionRejectFound),
+        formListPaths: unique(formListFound),
       };
+      this.capabilitiesCache.set(cacheKey, this.capabilities);
       return this.capabilities;
     } catch {
       this.capabilities = defaults;
+      this.capabilitiesCache.set(cacheKey, defaults);
       return defaults;
     }
   }
@@ -2808,13 +2926,18 @@ export class OpenCodeBridgeClient {
       ...this._buildAuthHeaders(),
     };
 
-    for (const template of caps.permissionListPaths) {
+    for (const template of caps.permissionListPaths || []) {
+      if (this.deadGetPaths.has(template)) continue;
       const path = this._fillEndpointTemplate(template, { sessionID: sessionId });
       try {
         const resp = await fetch(`${baseUrl}${path}`, {
           headers,
           signal: signal || AbortSignal.timeout(3000),
         });
+        if (resp.status === 404 || resp.status === 405) {
+          this.deadGetPaths.add(template);
+          continue;
+        }
         const ct = (resp.headers.get("content-type") || "").toLowerCase();
         if (!resp.ok || !ct.includes("application/json")) continue;
 
@@ -2848,6 +2971,7 @@ export class OpenCodeBridgeClient {
     };
 
     for (const template of caps.questionListPaths || []) {
+      if (this.deadGetPaths.has(template)) continue;
       if (template.includes("{sessionID}") && !sessionId) continue;
       const path = this._fillEndpointTemplate(template, { sessionID: sessionId || "" });
       try {
@@ -2855,6 +2979,10 @@ export class OpenCodeBridgeClient {
           headers,
           signal: signal || AbortSignal.timeout(3000),
         });
+        if (resp.status === 404 || resp.status === 405) {
+          this.deadGetPaths.add(template);
+          continue;
+        }
         const ct = (resp.headers.get("content-type") || "").toLowerCase();
         if (!resp.ok || !ct.includes("application/json")) continue;
 
@@ -2911,7 +3039,13 @@ export class OpenCodeBridgeClient {
         let userText = "";
         if (parts && parts.length > 0) {
           userText = parts
-            .filter((p) => p && (p.type === "text" || typeof p.text === "string"))
+            .filter(
+              (p) =>
+                p &&
+                !p.synthetic &&
+                !p.ignored &&
+                (p.type === "text" || typeof p.text === "string"),
+            )
             .map((p) => String(p.text || ""))
             .join("\n")
             .trim();
@@ -2944,7 +3078,7 @@ export class OpenCodeBridgeClient {
       if (parts && parts.length > 0) {
         for (let pIdx = 0; pIdx < parts.length; pIdx += 1) {
           const part = parts[pIdx];
-          if (!part || typeof part !== "object") continue;
+          if (!part || typeof part !== "object" || part.synthetic || part.ignored) continue;
           const partId = part.id || `p${pIdx}`;
           const partTime = part.time?.start || part.time?.end || msgTime + pIdx;
           const sourceKey = `msg:${msgId}:part:${partId}`;
@@ -3519,12 +3653,18 @@ export class OpenCodeBridgeClient {
           if (!raceOutcome.settled) {
             const targetAgentId = this.resolveAgentId(agent) || "architect";
             this.busySessions.set(targetSessionId, targetAgentId);
-            this._appendSessionLogEntry(targetSessionId, {
-              kind: "prompt",
-              agentId: targetAgentId,
-              content: cleanText,
-              status: "done",
-            });
+            const { list } = this._ensureSessionLogList(targetSessionId);
+            const alreadyLogged = list.some(
+              (e) => e.kind === "prompt" && e.content.trim() === cleanText,
+            );
+            if (!alreadyLogged) {
+              this._appendSessionLogEntry(targetSessionId, {
+                kind: "prompt",
+                agentId: targetAgentId,
+                content: cleanText,
+                status: "done",
+              });
+            }
             this._emitLiveKanbanSync({
               sessionId: targetSessionId,
               agentId: targetAgentId,
@@ -3590,12 +3730,18 @@ export class OpenCodeBridgeClient {
 
           const targetAgentId = this.resolveAgentId(agent) || "architect";
           this.busySessions.set(targetSessionId, targetAgentId);
-          this._appendSessionLogEntry(targetSessionId, {
-            kind: "prompt",
-            agentId: targetAgentId,
-            content: cleanText,
-            status: "done",
-          });
+          const { list } = this._ensureSessionLogList(targetSessionId);
+          const alreadyLogged = list.some(
+            (e) => e.kind === "prompt" && e.content.trim() === cleanText,
+          );
+          if (!alreadyLogged) {
+            this._appendSessionLogEntry(targetSessionId, {
+              kind: "prompt",
+              agentId: targetAgentId,
+              content: cleanText,
+              status: "done",
+            });
+          }
           this._emitLiveKanbanSync({
             sessionId: targetSessionId,
             agentId: targetAgentId,
@@ -3819,8 +3965,17 @@ export class OpenCodeBridgeClient {
     };
   }
 
+  _resolveQuestionTarget(requestId) {
+    const mappedId = this.questionCallIdMap.get(requestId) || requestId;
+    const item =
+      this.pendingQuestions.get(mappedId) ||
+      this.pendingQuestions.get(requestId) ||
+      null;
+    return { targetId: item?.id || mappedId, item };
+  }
+
   async replyQuestion(requestId, answers = [], { reject = false } = {}) {
-    const item = this.pendingQuestions.get(requestId);
+    let { targetId, item } = this._resolveQuestionTarget(requestId);
     if (!item) {
       return { ok: false, error: "La pregunta ya fue respondida o expiró." };
     }
@@ -3836,6 +3991,29 @@ export class OpenCodeBridgeClient {
       return { ok: false, error: "Selecciona una opción o escribe una respuesta." };
     }
 
+    // Si aún teníamos un placeholder sintético (callID) en lugar del requestID real (que_...),
+    // sincronizar primero GET /question para evitar HTTP 404 y no dejar pensando al agente.
+    if (item.isSynthetic) {
+      await this.syncPendingQuestions(item.sessionID).catch(() => []);
+      const refreshed = this._resolveQuestionTarget(requestId);
+      if (refreshed.item) {
+        targetId = refreshed.targetId;
+        item = refreshed.item;
+      }
+      if (item.isSynthetic) {
+        const realFallback = Array.from(this.pendingQuestions.values()).find(
+          (q) =>
+            !q.isSynthetic &&
+            q.sessionID === item.sessionID &&
+            q.questions?.[0]?.question === item.questions?.[0]?.question,
+        );
+        if (realFallback) {
+          targetId = realFallback.id;
+          item = realFallback;
+        }
+      }
+    }
+
     const baseUrl = this.getActiveBaseUrl();
     const caps =
       this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
@@ -3848,132 +4026,159 @@ export class OpenCodeBridgeClient {
     let lastHttpError = null;
     const flatText = flatAnswers.join(", ");
 
-    if (reject) {
-      for (const template of caps.questionRejectPaths || []) {
+    const sendWithId = async (effectiveId) => {
+      if (reject) {
+        for (const template of caps.questionRejectPaths || []) {
+          if (template.includes("{sessionID}") && !item.sessionID) continue;
+          const path = this._fillEndpointTemplate(template, {
+            sessionID: item.sessionID || "",
+            requestID: effectiveId,
+          });
+          try {
+            const resp = await fetch(`${baseUrl}${path}`, {
+              method: "POST",
+              headers,
+              body: JSON.stringify({}),
+              signal: AbortSignal.timeout(5000),
+            });
+            if (resp.status === 404 || resp.status === 405) continue;
+            if (!resp.ok) {
+              lastHttpError = await this._extractHttpError(
+                resp,
+                `HTTP ${resp.status} al omitir pregunta`,
+              );
+              continue;
+            }
+            this._removePendingQuestion(effectiveId);
+            this._removePendingQuestion(requestId);
+            this._emitLiveKanbanSync({
+              sessionId: item.sessionID,
+              agentId: item.agentId,
+              status: "blocked",
+              title: "Pregunta omitida",
+              file: item.header,
+            });
+            this._queueAgentTask(item.agentId, {
+              status: "failed",
+              label: "Pregunta omitida",
+              file: item.header,
+            });
+            return { ok: true, rejected: true, endpoint: path };
+          } catch (err) {
+            lastHttpError = err?.message || "No se pudo omitir la pregunta";
+          }
+        }
+      }
+
+      for (const template of caps.questionReplyPaths || []) {
         if (template.includes("{sessionID}") && !item.sessionID) continue;
         const path = this._fillEndpointTemplate(template, {
           sessionID: item.sessionID || "",
-          requestID: requestId,
+          requestID: effectiveId,
         });
-        try {
-          const resp = await fetch(`${baseUrl}${path}`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({}),
-            signal: AbortSignal.timeout(5000),
-          });
-          if (resp.status === 404 || resp.status === 405) continue;
-          if (!resp.ok) {
-            lastHttpError = await this._extractHttpError(
-              resp,
-              `HTTP ${resp.status} al omitir pregunta`,
-            );
-            continue;
-          }
-          this._removePendingQuestion(requestId);
-          this._emitLiveKanbanSync({
-            sessionId: item.sessionID,
-            agentId: item.agentId,
-            status: "blocked",
-            title: "Pregunta omitida",
-            file: item.header,
-          });
-          this._queueAgentTask(item.agentId, {
-            status: "failed",
-            label: "Pregunta omitida",
-            file: item.header,
-          });
-          return { ok: true, rejected: true, endpoint: path };
-        } catch (err) {
-          lastHttpError = err?.message || "No se pudo omitir la pregunta";
-        }
-      }
-    }
 
-    for (const template of caps.questionReplyPaths || []) {
-      if (template.includes("{sessionID}") && !item.sessionID) continue;
-      const path = this._fillEndpointTemplate(template, {
-        sessionID: item.sessionID || "",
-        requestID: requestId,
-      });
+        const schemaProps = caps.questionReplySchemas?.[template]?.props || [];
+        const bodyCandidates = reject
+          ? [{ reject: true }, { decision: "reject" }, { answers: [] }]
+          : schemaProps.includes("answers")
+            ? [{ answers: normalizedAnswers }]
+            : schemaProps.includes("answer")
+              ? [{ answer: flatText }, { answers: normalizedAnswers }]
+              : schemaProps.includes("values")
+                ? [{ values: flatAnswers }, { answers: normalizedAnswers }]
+                : [
+                    { answers: normalizedAnswers },
+                    { answer: flatText },
+                    { reply: flatText },
+                    { text: flatText },
+                  ];
 
-      const schemaProps = caps.questionReplySchemas?.[template]?.props || [];
-      const bodyCandidates = reject
-        ? [{ reject: true }, { decision: "reject" }, { answers: [] }]
-        : schemaProps.includes("answers")
-          ? [{ answers: normalizedAnswers }]
-          : schemaProps.includes("answer")
-            ? [{ answer: flatText }, { answers: normalizedAnswers }]
-            : schemaProps.includes("values")
-              ? [{ values: flatAnswers }, { answers: normalizedAnswers }]
-              : [
-                  { answers: normalizedAnswers },
-                  { answer: flatText },
-                  { reply: flatText },
-                  { text: flatText },
-                ];
+        for (const payload of bodyCandidates) {
+          try {
+            const resp = await fetch(`${baseUrl}${path}`, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(payload),
+              signal: AbortSignal.timeout(5000),
+            });
+            const ct = (resp.headers.get("content-type") || "").toLowerCase();
+            if (resp.status === 404 || resp.status === 405 || ct.includes("text/html")) {
+              break;
+            }
+            if (resp.status === 400 || resp.status === 422) {
+              lastHttpError = await this._extractHttpError(
+                resp,
+                `HTTP ${resp.status} al responder pregunta`,
+              );
+              continue;
+            }
+            if (!resp.ok) {
+              return {
+                ok: false,
+                error: await this._extractHttpError(
+                  resp,
+                  `Error HTTP ${resp.status} al responder pregunta`,
+                ),
+              };
+            }
 
-      for (const payload of bodyCandidates) {
-        try {
-          const resp = await fetch(`${baseUrl}${path}`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(payload),
-            signal: AbortSignal.timeout(5000),
-          });
-          const ct = (resp.headers.get("content-type") || "").toLowerCase();
-          if (resp.status === 404 || resp.status === 405 || ct.includes("text/html")) {
-            break;
-          }
-          if (resp.status === 400 || resp.status === 422) {
-            lastHttpError = await this._extractHttpError(
-              resp,
-              `HTTP ${resp.status} al responder pregunta`,
-            );
-            continue;
-          }
-          if (!resp.ok) {
+            this._removePendingQuestion(effectiveId);
+            this._removePendingQuestion(requestId);
+            if (item.sessionID) {
+              this._appendSessionLogEntry(item.sessionID, {
+                kind: "prompt",
+                agentId: item.agentId,
+                content: reject
+                  ? `Pregunta omitida (${item.header})`
+                  : `Respuesta (${item.header}): ${flatText}`,
+                status: "done",
+              });
+            }
+            this._emitLiveKanbanSync({
+              sessionId: item.sessionID,
+              agentId: item.agentId,
+              status: reject ? "blocked" : "in_progress",
+              title: reject ? "Pregunta omitida" : "Respuesta enviada",
+              file: item.header,
+            });
+            this._queueAgentTask(item.agentId, {
+              status: reject ? "failed" : "started",
+              phase: "working",
+              label: reject ? "Pregunta omitida" : "Continuando tarea",
+              file: item.header,
+            });
+            return { ok: true, endpoint: path };
+          } catch (err) {
             return {
               ok: false,
-              error: await this._extractHttpError(
-                resp,
-                `Error HTTP ${resp.status} al responder pregunta`,
-              ),
+              error: err?.message || "No se pudo responder la pregunta",
             };
           }
-
-          this._removePendingQuestion(requestId);
-          if (item.sessionID) {
-            this._appendSessionLogEntry(item.sessionID, {
-              kind: "prompt",
-              agentId: item.agentId,
-              content: reject
-                ? `Pregunta omitida (${item.header})`
-                : `Respuesta (${item.header}): ${flatText}`,
-              status: "done",
-            });
-          }
-          this._emitLiveKanbanSync({
-            sessionId: item.sessionID,
-            agentId: item.agentId,
-            status: reject ? "blocked" : "in_progress",
-            title: reject ? "Pregunta omitida" : "Respuesta enviada",
-            file: item.header,
-          });
-          this._queueAgentTask(item.agentId, {
-            status: reject ? "failed" : "started",
-            phase: "working",
-            label: reject ? "Pregunta omitida" : "Continuando tarea",
-            file: item.header,
-          });
-          return { ok: true, endpoint: path };
-        } catch (err) {
-          return {
-            ok: false,
-            error: err?.message || "No se pudo responder la pregunta",
-          };
         }
       }
+      return null;
+    };
+
+    const firstAttempt = await sendWithId(targetId);
+    if (firstAttempt) return firstAttempt;
+
+    // Si devolvió 404 por desfase de IDs, intentar sincronizar una vez más y reintentar
+    await this.syncPendingQuestions(item.sessionID).catch(() => []);
+    const retriedTarget = this._resolveQuestionTarget(requestId);
+    const retryMatch =
+      (retriedTarget.item && retriedTarget.targetId !== targetId && retriedTarget.item) ||
+      Array.from(this.pendingQuestions.values()).find(
+        (q) =>
+          !q.isSynthetic &&
+          q.id !== targetId &&
+          q.sessionID === item.sessionID &&
+          q.questions?.[0]?.question === item.questions?.[0]?.question,
+      );
+    if (retryMatch) {
+      targetId = retryMatch.id;
+      item = retryMatch;
+      const secondAttempt = await sendWithId(targetId);
+      if (secondAttempt) return secondAttempt;
     }
 
     return {
@@ -4016,7 +4221,9 @@ export class OpenCodeBridgeClient {
           const activeSession = this._unwrapResponseData(activeRaw);
           if (activeSession?.id) {
             this._upsertSessionRecord(activeSession);
-            this.activeSessionId = activeSession.id;
+            if (activeSession.status?.type === "busy") {
+              this.activeSessionId = activeSession.id;
+            }
           }
         }
       }
@@ -4059,17 +4266,13 @@ export class OpenCodeBridgeClient {
         }
       }
 
-      const targetSessionForPerms =
-        this.activeSessionId || this.getSessions()[0]?.id || null;
-      if (targetSessionForPerms) {
-        await Promise.all([
-          this.syncSessionPermissions(targetSessionForPerms, signal).catch(() => []),
-          this.syncPendingQuestions(targetSessionForPerms, signal).catch(() => []),
-          this.hydrateSessionHistory(targetSessionForPerms).catch(() => []),
-        ]);
-      } else {
-        await this.syncPendingQuestions(null, signal).catch(() => []);
-      }
+      // Sincronizar solo permisos/preguntas activos sin hidratar automáticamente el historial de chats viejos
+      await Promise.all([
+        this.activeSessionId
+          ? this.syncSessionPermissions(this.activeSessionId, signal).catch(() => [])
+          : Promise.resolve([]),
+        this.syncPendingQuestions(this.activeSessionId || null, signal).catch(() => []),
+      ]);
       this._emitConnectionState();
     } catch (err) {
       if (err?.message?.includes("401")) throw err;
@@ -4274,6 +4477,9 @@ export class OpenCodeBridgeClient {
     this.reasoningBuffers.clear();
     this.activeStreamEntryIds.clear();
     this.emittedDelegations.clear();
+    this.capabilities = null;
+    this.capabilitiesCache.clear();
+    this.deadGetPaths.clear();
     this.status = "disconnected";
     this.lastError = null;
     officeEventBus.emit(

@@ -262,7 +262,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   const hasApiPrefix =
-    reqPath === "/api" || reqPath.startsWith("/api/") || reqPath === "/openapi.json";
+    reqPath === "/api" ||
+    reqPath.startsWith("/api/") ||
+    reqPath === "/openapi.json" ||
+    reqPath === "/doc";
   const normalizedPath = hasApiPrefix
     ? detectedUpstreamPrefix === "" && reqPath.startsWith("/api/")
       ? reqPath.slice(4) || "/"

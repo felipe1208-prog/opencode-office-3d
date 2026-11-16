@@ -395,24 +395,33 @@ function scrollLogToBottom(force = false) {
   }
 }
 
-function ensureQuestionDraft(item) {
-  if (!item?.id) return [];
+function initQuestionDraft(item, prevId = null) {
+  if (!item?.id) return null;
   const questions = Array.isArray(item.questions) ? item.questions : [];
   const existing = questionDrafts[item.id];
   if (!Array.isArray(existing) || existing.length !== questions.length) {
-    questionDrafts[item.id] = questions.map(() => ({
-      selected: [],
-      custom: "",
-    }));
+    const prevDraft = prevId ? questionDrafts[prevId] : null;
+    if (Array.isArray(prevDraft) && prevDraft.length === questions.length) {
+      questionDrafts[item.id] = prevDraft.map((slot) => ({
+        selected: Array.isArray(slot?.selected) ? [...slot.selected] : [],
+        custom: String(slot?.custom || ""),
+      }));
+    } else {
+      questionDrafts[item.id] = questions.map(() => ({
+        selected: [],
+        custom: "",
+      }));
+    }
   }
   return questionDrafts[item.id];
 }
 
 watch(
-  activeQuestion,
-  (item) => {
-    if (item) {
-      ensureQuestionDraft(item);
+  () => [activeQuestion.value?.id, activeQuestion.value?.questions?.length || 0],
+  ([newId], [oldId] = []) => {
+    const item = activeQuestion.value;
+    if (item && newId) {
+      initQuestionDraft(item, oldId && oldId !== newId ? oldId : null);
     } else {
       questionError.value = null;
     }
@@ -443,12 +452,8 @@ function syncSessionLogView() {
   }
 }
 
-watch(activeLogSessionId, (sid) => {
+watch(activeLogSessionId, () => {
   syncSessionLogView();
-  if (sid && openCodeState.value.status === "connected") {
-    openCodeBridge.hydrateSessionHistory(sid);
-    openCodeBridge.syncPendingQuestions(sid);
-  }
   nextTick(() => scrollLogToBottom(true));
 });
 
@@ -502,10 +507,8 @@ onMounted(() => {
     openCodeState.value = snap;
 
     const availableIds = new Set((snap.sessions || []).map((s) => s.id));
-    if (!commandForm.sessionId || !availableIds.has(commandForm.sessionId)) {
-      const rootSession = (snap.sessions || []).find((s) => !s.parentID);
-      commandForm.sessionId =
-        snap.activeSessionId || rootSession?.id || snap.sessions?.[0]?.id || "";
+    if (commandForm.sessionId && !availableIds.has(commandForm.sessionId)) {
+      commandForm.sessionId = "";
     }
 
     if (
@@ -669,13 +672,23 @@ function toggleOpenCodePanel() {
     isTaskBoardOpen.value = false;
     if (openCodeState.value.status === "connected") {
       openCodeTab.value = "command";
-      if (activeLogSessionId.value) {
-        openCodeBridge.hydrateSessionHistory(activeLogSessionId.value);
-        openCodeBridge.syncPendingQuestions(activeLogSessionId.value);
-      }
     }
   }
   ambientAudio.playSoftTick();
+}
+
+function handleSessionSelectChange() {
+  const sid = commandForm.sessionId || "";
+  if (!sid) {
+    openCodeBridge.setActiveSession(null);
+    sessionLogEntries.value = [];
+    return;
+  }
+  openCodeBridge.setActiveSession(sid);
+  if (openCodeState.value.status === "connected") {
+    openCodeBridge.hydrateSessionHistory(sid);
+    openCodeBridge.syncPendingQuestions(sid);
+  }
 }
 
 function dismissBlockedAlert(task) {
@@ -887,14 +900,27 @@ function getChildHistoryState(childSessionId) {
   );
 }
 
+function getQuestionCustomText(item, qIdx) {
+  if (!item?.id) return "";
+  return questionDrafts[item.id]?.[qIdx]?.custom ?? "";
+}
+
+function setQuestionCustomText(item, qIdx, value) {
+  if (!item?.id) return;
+  const draft = initQuestionDraft(item);
+  if (draft?.[qIdx]) {
+    draft[qIdx].custom = String(value ?? "");
+  }
+}
+
 function isOptionSelected(item, qIdx, label) {
-  const draft = ensureQuestionDraft(item);
-  return Boolean(draft[qIdx]?.selected?.includes(label));
+  if (!item?.id) return false;
+  return Boolean(questionDrafts[item.id]?.[qIdx]?.selected?.includes(label));
 }
 
 function toggleQuestionOption(item, qIdx, label) {
-  const draft = ensureQuestionDraft(item);
-  const slot = draft[qIdx];
+  const draft = initQuestionDraft(item);
+  const slot = draft?.[qIdx];
   if (!slot) return;
   const isMulti = Boolean(item.questions?.[qIdx]?.multiple);
   if (isMulti) {
@@ -912,7 +938,8 @@ function toggleQuestionOption(item, qIdx, label) {
 
 function canSubmitQuestion(item) {
   if (!item?.id) return false;
-  const draft = ensureQuestionDraft(item);
+  const draft = questionDrafts[item.id];
+  if (!Array.isArray(draft)) return false;
   return (item.questions || []).every((_, idx) => {
     const slot = draft[idx];
     return Boolean(slot?.selected?.length > 0 || slot?.custom?.trim());
@@ -921,7 +948,7 @@ function canSubmitQuestion(item) {
 
 async function handleSubmitQuestion(item) {
   if (!item?.id || replyingQuestionId.value) return;
-  const draft = ensureQuestionDraft(item);
+  const draft = initQuestionDraft(item) || [];
   const answers = (item.questions || []).map((_, idx) => {
     const slot = draft[idx] || { selected: [], custom: "" };
     const vals = [...slot.selected];
@@ -1302,8 +1329,8 @@ onBeforeUnmount(() => {
               "
             >
               <button
-                v-for="opt in activeQuestion.questions[0].options.slice(0, 3)"
-                :key="opt.label"
+                v-for="(opt, optIdx) in activeQuestion.questions[0].options.slice(0, 3)"
+                :key="`${opt.label}_${optIdx}`"
                 type="button"
                 :disabled="replyingQuestionId === activeQuestion.id"
                 @click="handleQuickQuestionOption(activeQuestion, opt.label)"
@@ -1992,8 +2019,8 @@ onBeforeUnmount(() => {
 
             <div v-if="q.options.length > 0" class="flex flex-col gap-1 pt-0.5">
               <button
-                v-for="opt in q.options"
-                :key="opt.label"
+                v-for="(opt, optIdx) in q.options"
+                :key="`${opt.label}_${optIdx}`"
                 type="button"
                 :disabled="replyingQuestionId === activeQuestion.id"
                 @click="toggleQuestionOption(activeQuestion, qIdx, opt.label)"
@@ -2022,7 +2049,8 @@ onBeforeUnmount(() => {
 
             <input
               v-if="q.custom !== false"
-              v-model="ensureQuestionDraft(activeQuestion)[qIdx].custom"
+              :value="getQuestionCustomText(activeQuestion, qIdx)"
+              @input="setQuestionCustomText(activeQuestion, qIdx, $event.target.value)"
               type="text"
               @keydown.ctrl.enter.prevent="canSubmitQuestion(activeQuestion) && handleSubmitQuestion(activeQuestion)"
               :placeholder="
@@ -2130,6 +2158,7 @@ onBeforeUnmount(() => {
                 <div class="flex items-center gap-1.5">
                   <select
                     v-model="commandForm.sessionId"
+                    @change="handleSessionSelectChange"
                     aria-label="Sesión OpenCode"
                     class="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#F3F4F6] focus:outline-none focus:border-[#4F6EF7] tabular-nums"
                   >
