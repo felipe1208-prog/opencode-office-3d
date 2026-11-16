@@ -386,6 +386,8 @@ export class MonitorScreenSystem {
       else if (snap.socialMode === "DESK_REVIEW") mode = "REVIEWING";
       else if (snap.checkpointId !== AGENT_STATIONS[snap.id]?.checkpointId) {
         mode = "AWAY";
+      } else if (snap.state === "THINKING") {
+        mode = "THINKING";
       }
 
       this.setAgentScreenState(snap.id, {
@@ -528,6 +530,37 @@ export class MonitorScreenSystem {
       ctx.fillStyle = "#FDBA74";
       ctx.font = "15px sans-serif";
       ctx.fillText(entry.taskLabel || "Analizando incidente...", 64, 220);
+    } else if (mode === "THINKING") {
+      ctx.fillStyle = "rgba(14, 165, 233, 0.14)";
+      ctx.fillRect(20, 52, 472, 40);
+      ctx.strokeStyle = "rgba(56, 189, 248, 0.45)";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(20, 52, 472, 40);
+
+      ctx.fillStyle = "#7DD3FC";
+      ctx.font = "bold 17px monospace";
+      ctx.fillText("RAZONAMIENTO COGNITIVO EN CURSO", 34, 78);
+
+      // Ondas de inferencia animadas en el monitor izquierdo
+      for (let i = 0; i < 16; i++) {
+        const waveH = 18 + Math.round(Math.abs(Math.sin(i * 0.55 + this.tickCounter * 0.85)) * 56);
+        ctx.fillStyle = i % 2 === 0 ? "rgba(56, 189, 248, 0.72)" : "rgba(125, 211, 252, 0.45)";
+        ctx.fillRect(28 + i * 28, 198 - waveH, 18, waveH);
+      }
+
+      ctx.fillStyle = "#0F172A";
+      ctx.fillRect(20, 218, 472, 74);
+      ctx.strokeStyle = "#1E293B";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(20, 218, 472, 74);
+
+      const thoughtText = String(entry.taskLabel || "Pensando...").slice(0, 42);
+      ctx.fillStyle = "#E0F2FE";
+      ctx.font = "bold 16px sans-serif";
+      ctx.fillText(thoughtText, 34, 252);
+      ctx.fillStyle = "#94A3B8";
+      ctx.font = "13px monospace";
+      ctx.fillText("Analizando contexto antes de ejecutar herramienta", 34, 278);
     } else {
       // WORKING
       snippet.lines.forEach((line, idx) => {
@@ -575,7 +608,9 @@ export class MonitorScreenSystem {
           ? "#EF4444"
           : mode === "SUCCESS"
             ? "#10B981"
-            : accent;
+            : mode === "THINKING"
+              ? "#38BDF8"
+              : accent;
       for (let i = 0; i < 12; i++) {
         const val = 28 + ((i * 23 + this.tickCounter * 17) % 86);
         rightCtx.fillStyle = "rgba(30, 41, 59, 0.9)";
@@ -591,7 +626,7 @@ export class MonitorScreenSystem {
 
       rightCtx.fillStyle = "#E2E8F0";
       rightCtx.font = "bold 16px monospace";
-      rightCtx.fillText(`> ${entry.taskLabel || "En progreso"}`, 34, 224);
+      rightCtx.fillText(`> ${String(entry.taskLabel || "En progreso").slice(0, 36)}`, 34, 224);
 
       rightCtx.fillStyle = "#94A3B8";
       rightCtx.font = "14px monospace";
@@ -645,8 +680,12 @@ export class MonitorScreenSystem {
       ctx.fillText(`PRESENTADOR: ${presenterName.toUpperCase()}`, 64, 148);
 
       ctx.fillStyle = "#F8FAFC";
-      ctx.font = "bold 30px sans-serif";
-      ctx.fillText(topic, 64, 200);
+      ctx.font = "bold 28px sans-serif";
+      const safeTopic =
+        String(topic || "Sincronización").length > 34
+          ? `${String(topic).slice(0, 33)}…`
+          : String(topic || "Sincronización");
+      ctx.fillText(safeTopic, 64, 200);
 
       const bullets = [
         "1. Contrato de OfficeEventBus desacoplado",

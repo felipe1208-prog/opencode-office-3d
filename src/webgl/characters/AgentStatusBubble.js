@@ -52,7 +52,8 @@ export class AgentStatusBubble {
   }
 
   setStatus(text, accentColor = this.agentConfig.color, badgeTag = null) {
-    const cleanText = String(text || "Activo").slice(0, 28);
+    const raw = String(text || "Activo").replace(/\s+/g, " ").trim();
+    const cleanText = raw.length > 44 ? `${raw.slice(0, 43)}…` : raw;
     const badgeColor = accentColor || this.agentConfig.color;
     this.lastStatusLabel = cleanText;
     this.lastBadgeColor = badgeColor;
@@ -109,11 +110,30 @@ export class AgentStatusBubble {
     ctx.fillStyle = "#F8FAFC";
     ctx.font = "600 22px 'Plus Jakarta Sans', system-ui, sans-serif";
     ctx.textBaseline = "middle";
-    ctx.fillText(this.agentConfig.name, 60, y + 25);
+    ctx.fillText(this.agentConfig.name, 60, y + 24);
 
-    ctx.fillStyle = "#CBD5E1";
-    ctx.font = "500 20px 'Plus Jakarta Sans', system-ui, sans-serif";
-    ctx.fillText(cleanText, 60, y + 54);
+    // Subtítulo adaptativo para acomodar "Pensando · <extracto>" sin recorte abrupto
+    const maxTextWidth = w - 82;
+    let fontSize = 20;
+    ctx.font = `500 ${fontSize}px 'Plus Jakarta Sans', system-ui, sans-serif`;
+    while (fontSize > 16 && ctx.measureText(cleanText).width > maxTextWidth) {
+      fontSize -= 1;
+      ctx.font = `500 ${fontSize}px 'Plus Jakarta Sans', system-ui, sans-serif`;
+    }
+
+    let renderedText = cleanText;
+    if (ctx.measureText(renderedText).width > maxTextWidth) {
+      while (
+        renderedText.length > 4 &&
+        ctx.measureText(`${renderedText}…`).width > maxTextWidth
+      ) {
+        renderedText = renderedText.slice(0, -1);
+      }
+      renderedText = `${renderedText.trimEnd()}…`;
+    }
+
+    ctx.fillStyle = cleanText.startsWith("Pensando") ? "#7DD3FC" : "#CBD5E1";
+    ctx.fillText(renderedText, 60, y + 54);
 
     this.texture.needsUpdate = true;
   }

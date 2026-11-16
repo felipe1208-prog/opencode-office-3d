@@ -79,6 +79,7 @@ export class SimulationDirector {
     this.speedMultiplier = 1; // 1 | 2
     this.agentTimers = new Map();
     this.liveOwnership = new Map(); // agentId -> { active: boolean, idleCooldown: number }
+    this.activeDelegation = null; // { hostAgentId, participants: Set, holdThinkingUntil, timeoutId }
     this.unsubscribers = [];
 
     this.initTimers();
@@ -100,7 +101,123 @@ export class SimulationDirector {
     return Boolean(live && (live.active || live.idleCooldown > 0));
   }
 
-  claimAgentForLiveTask(agentId, { status = "started", label = null, file = null } = {}) {
+  _clearDelegationHuddle({ returnRemainingHome = false } = {}) {
+    if (!this.activeDelegation) return;
+    if (this.activeDelegation.timeoutId) {
+      clearTimeout(this.activeDelegation.timeoutId);
+    }
+    const remaining = Array.from(this.activeDelegation.participants || []);
+    this.activeDelegation = null;
+    this.monitorSystem?.setMeetingState({ active: false });
+
+    if (returnRemainingHome) {
+      for (const agentId of remaining) {
+        const agent = this.characterManager.getAgent(agentId);
+        if (!agent) continue;
+        const cp = agent.targetCheckpointId || agent.currentCheckpointId || "";
+        if (String(cp).startsWith("meeting-")) {
+          agent.returnHome({
+            pendingLiveTask: {
+              status: "started",
+              phase: "working",
+              label: agent.taskTitle || "Ejecutando subtarea",
+              onSeated: () => {
+                this.monitorSystem?.setAgentScreenState(agentId, {
+                  mode: "WORKING",
+                  taskLabel: agent.taskTitle || "Ejecutando subtarea",
+                });
+              },
+            },
+          });
+        }
+      }
+    }
+  }
+
+  _executeDelegationHuddle({
+    hostAgentId = "architect",
+    subagentId = null,
+    topic = "Delegando subtarea",
+    active = true,
+  } = {}) {
+    if (!active) {
+      this._clearDelegationHuddle({ returnRemainingHome: true });
+      return false;
+    }
+
+    const host = this.characterManager.getAgent(hostAgentId);
+    const subagent = subagentId ? this.characterManager.getAgent(subagentId) : null;
+    if (!host || !subagent || host.config.id === subagent.config.id) {
+      return false;
+    }
+
+    const seats = [
+      "meeting-chair-n1",
+      "meeting-chair-s1",
+      "meeting-chair-n2",
+      "meeting-chair-s2",
+      "meeting-chair-n3",
+      "meeting-chair-s3",
+    ];
+
+    const now = Date.now();
+    if (!this.activeDelegation) {
+      this.activeDelegation = {
+        hostAgentId: host.config.id,
+        participants: new Set([host.config.id]),
+        holdThinkingUntil: now + 2200,
+        timeoutId: null,
+      };
+      const hostCp = host.targetCheckpointId || host.currentCheckpointId;
+      if (hostCp !== "meeting-presenter") {
+        this.sendAgentTo(host.config.id, "meeting-presenter", "presenting");
+      }
+    } else {
+      this.activeDelegation.participants.add(host.config.id);
+      this.activeDelegation.holdThinkingUntil = Math.max(
+        this.activeDelegation.holdThinkingUntil,
+        now + 1800,
+      );
+      if (this.activeDelegation.timeoutId) {
+        clearTimeout(this.activeDelegation.timeoutId);
+      }
+    }
+
+    this.liveOwnership.set(host.config.id, { active: true, idleCooldown: 0 });
+    this.liveOwnership.set(subagent.config.id, { active: true, idleCooldown: 0 });
+
+    const subCp = subagent.targetCheckpointId || subagent.currentCheckpointId || "";
+    if (!String(subCp).startsWith("meeting-chair-")) {
+      const freeSeat =
+        seats.find((s) => checkpointManager.isAvailable(s)) || seats[0];
+      this.sendAgentTo(subagent.config.id, freeSeat, "listening");
+    }
+    this.activeDelegation.participants.add(subagent.config.id);
+
+    const safeTopic = String(topic || `Delegando @${subagent.config.id}`).slice(0, 38);
+    this.monitorSystem?.setMeetingState({
+      active: true,
+      topic: `Delegación · ${safeTopic}`,
+      presenterName: host.config.name,
+    });
+
+    this.activeDelegation.timeoutId = setTimeout(() => {
+      this._clearDelegationHuddle({ returnRemainingHome: true });
+    }, 4500);
+
+    return true;
+  }
+
+  claimAgentForLiveTask(
+    agentId,
+    {
+      status = "started",
+      phase = "working",
+      label = null,
+      file = null,
+      delegationEvent = false,
+    } = {},
+  ) {
     const agent = this.characterManager.getAgent(agentId);
     if (!agent) return false;
 
@@ -116,14 +233,38 @@ export class SimulationDirector {
       timer.waitCooldown = 0;
     }
 
-    this.monitorSystem?.setMeetingState({ active: false });
+    // Mantener coreografía breve en Sala de Reuniones durante delegación o pausa cognitiva inicial,
+    // pero devolver al escritorio al instante en cuanto llegue una herramienta real (phase === "working").
+    if (this.activeDelegation?.participants?.has(agentId)) {
+      const holdActive =
+        delegationEvent ||
+        (phase === "thinking" && Date.now() < this.activeDelegation.holdThinkingUntil);
+
+      if (holdActive) {
+        if (label) agent.taskTitle = label;
+        agent.syncBubble();
+        return true;
+      }
+
+      this.activeDelegation.participants.delete(agentId);
+      if (this.activeDelegation.participants.size === 0) {
+        this._clearDelegationHuddle({ returnRemainingHome: false });
+      }
+    }
+
+    if (!this.activeDelegation) {
+      this.monitorSystem?.setMeetingState({ active: false });
+    }
+
+    const screenMode = phase === "thinking" ? "THINKING" : "WORKING";
 
     agent.applyTaskFeedback({
       status,
+      phase,
       label,
       onSeated: () => {
         this.monitorSystem?.setAgentScreenState(agentId, {
-          mode: "WORKING",
+          mode: screenMode,
           taskLabel: label || agent.currentActionLabel,
           taskFile: file,
         });
@@ -145,6 +286,13 @@ export class SimulationDirector {
       idleCooldown: cooldown,
     });
 
+    if (this.activeDelegation?.participants?.has(agentId)) {
+      this.activeDelegation.participants.delete(agentId);
+      if (this.activeDelegation.participants.size === 0) {
+        this._clearDelegationHuddle({ returnRemainingHome: false });
+      }
+    }
+
     const screenMode = status === "failed" ? "ERROR" : "SUCCESS";
 
     agent.applyTaskFeedback({
@@ -163,6 +311,7 @@ export class SimulationDirector {
 
   clearAllLiveClaims() {
     this.liveOwnership.clear();
+    this._clearDelegationHuddle({ returnRemainingHome: false });
   }
 
   bindEventBus() {
@@ -171,6 +320,10 @@ export class SimulationDirector {
         if (payload?.status === "disconnected") {
           this.clearAllLiveClaims();
         }
+      }),
+
+      officeEventBus.on(OFFICE_EVENTS.OPENCODE_DELEGATION, (payload) => {
+        this._executeDelegationHuddle(payload);
       }),
 
       officeEventBus.on(OFFICE_EVENTS.AGENT_TASK, (payload) => {
@@ -260,7 +413,9 @@ export class SimulationDirector {
       timer.waitCooldown = 12 + Math.random() * 5;
     }
 
-    this.monitorSystem?.setMeetingState({ active: false });
+    if (!String(checkpointId).startsWith("meeting-")) {
+      this.monitorSystem?.setMeetingState({ active: false });
+    }
     return agent.requestAction(checkpointId, { overrideAction });
   }
 
@@ -502,6 +657,7 @@ export class SimulationDirector {
   }
 
   returnAllHome() {
+    this._clearDelegationHuddle({ returnRemainingHome: false });
     this.monitorSystem?.setMeetingState({ active: false });
     for (const agent of this.characterManager.characters) {
       const timer = this.agentTimers.get(agent.config.id);
@@ -605,6 +761,7 @@ export class SimulationDirector {
   }
 
   destroy() {
+    this._clearDelegationHuddle({ returnRemainingHome: false });
     for (const unsub of this.unsubscribers) {
       unsub();
     }

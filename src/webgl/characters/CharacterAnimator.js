@@ -103,6 +103,16 @@ export class CharacterAnimator {
       return false;
     }
 
+    if (
+      this.currentAnimName === name &&
+      this.currentAction === nextAction &&
+      !onFinished &&
+      nextAction.loop === THREE.LoopRepeat &&
+      nextAction.isRunning()
+    ) {
+      return true;
+    }
+
     if (onFinished) {
       this.oneShotCallbacks.set(name, onFinished);
     }

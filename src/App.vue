@@ -1,5 +1,13 @@
 <script setup>
-import { onMounted, ref, reactive, computed, onBeforeUnmount } from "vue";
+import {
+  onMounted,
+  ref,
+  reactive,
+  computed,
+  watch,
+  nextTick,
+  onBeforeUnmount,
+} from "vue";
 import {
   Sun,
   Moon,
@@ -103,6 +111,8 @@ const isInterrupting = ref(false);
 const commandFeedback = ref(null);
 const replyingPermissionId = ref(null);
 const permissionError = ref(null);
+const sessionLogEntries = ref([]);
+const logContainerRef = ref(null);
 
 const newTask = reactive({
   title: "",
@@ -146,6 +156,10 @@ const demoTasksCount = computed(
 
 const activePermission = computed(
   () => openCodeState.value.pendingPermissions?.[0] || null,
+);
+
+const activeLogSessionId = computed(
+  () => commandForm.sessionId || openCodeState.value.activeSessionId || "",
 );
 
 const taskCountByStatus = computed(() => {
@@ -276,7 +290,27 @@ let unsubBusHistory = null;
 let unsubProfileSync = null;
 let unsubTaskSync = null;
 let unsubOpenCode = null;
+let unsubSessionLog = null;
 let copyFeedbackTimer = null;
+
+function scrollLogToBottom(force = false) {
+  const el = logContainerRef.value;
+  if (!el) return;
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 52;
+  if (force || nearBottom) {
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+function syncSessionLogView() {
+  const sid = activeLogSessionId.value;
+  sessionLogEntries.value = sid ? openCodeBridge.getSessionLog(sid) : [];
+}
+
+watch(activeLogSessionId, () => {
+  syncSessionLogView();
+  nextTick(() => scrollLogToBottom(true));
+});
 
 function syncProfileDraft(agentId = selectedAgentId.value) {
   if (!agentId) return;
@@ -345,6 +379,27 @@ onMounted(() => {
       permissionError.value = null;
     }
   });
+  unsubSessionLog = officeEventBus.on(
+    OFFICE_EVENTS.OPENCODE_SESSION_LOG,
+    (payload) => {
+      if (payload?.cleared && !payload?.sessionId) {
+        sessionLogEntries.value = [];
+        return;
+      }
+      if (!payload?.sessionId || payload.sessionId === activeLogSessionId.value) {
+        const el = logContainerRef.value;
+        const shouldAutoScroll =
+          !el || el.scrollHeight - el.scrollTop - el.clientHeight < 52;
+        sessionLogEntries.value = Array.isArray(payload?.entries)
+          ? payload.entries
+          : [];
+        if (shouldAutoScroll) {
+          nextTick(() => scrollLogToBottom(true));
+        }
+      }
+    },
+  );
+  syncSessionLogView();
   eventLog.value = officeEventBus.getHistory(5);
   const resources = new Resources(ASSETS_MANIFEST);
 
@@ -623,6 +678,12 @@ async function handleInterruptOpenCode() {
   ambientAudio.playSoftTick();
 }
 
+function handleClearSessionLog() {
+  if (!activeLogSessionId.value) return;
+  openCodeBridge.clearSessionLog(activeLogSessionId.value);
+  ambientAudio.playSoftTick();
+}
+
 async function handleReplyPermission(requestId, response) {
   if (replyingPermissionId.value) return;
   replyingPermissionId.value = requestId;
@@ -710,6 +771,7 @@ onBeforeUnmount(() => {
   unsubProfileSync?.();
   unsubTaskSync?.();
   unsubOpenCode?.();
+  unsubSessionLog?.();
   if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
   openCodeBridge.dispose();
   ambientAudio.dispose();
@@ -914,7 +976,7 @@ onBeforeUnmount(() => {
           <!-- Panel Conexión y Configuración OpenCode -->
           <div
             v-if="isOpenCodePanelOpen"
-            class="px-5 py-4 border-b border-slate-800 bg-slate-900/80 max-h-[40vh] overflow-y-auto"
+            class="px-5 py-4 border-b border-slate-800 bg-slate-900/80 max-h-[50vh] overflow-y-auto"
           >
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div class="flex items-center gap-2.5 text-sm font-semibold text-slate-100">
@@ -1288,6 +1350,165 @@ onBeforeUnmount(() => {
                   </span>
                 </div>
               </form>
+
+              <!-- Bitácora / Consola de salida en vivo por sesión -->
+              <div
+                v-if="openCodeState.status === 'connected'"
+                class="pt-2.5 border-t border-slate-800/80 space-y-2"
+              >
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div class="flex items-center gap-2 text-xs text-slate-300">
+                    <Terminal class="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                    <span class="font-medium text-slate-200">Bitácora en vivo</span>
+                    <span aria-hidden="true" class="text-slate-600">·</span>
+                    <span class="font-mono text-[11px] text-slate-400 tabular-nums">
+                      {{ sessionLogEntries.length }} eventos
+                    </span>
+                    <template v-if="activeLogSessionId">
+                      <span aria-hidden="true" class="text-slate-600">·</span>
+                      <span class="font-mono text-[11px] text-slate-500 truncate max-w-[140px]">
+                        {{ activeLogSessionId.slice(0, 14) }}
+                      </span>
+                    </template>
+                  </div>
+
+                  <button
+                    type="button"
+                    :disabled="sessionLogEntries.length === 0"
+                    @click="handleClearSessionLog"
+                    class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[11px] font-medium text-slate-300 flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-40"
+                  >
+                    <Trash2 class="w-3 h-3" />
+                    <span>Limpiar</span>
+                  </button>
+                </div>
+
+                <div
+                  ref="logContainerRef"
+                  class="max-h-56 overflow-y-auto rounded-lg bg-slate-950 border border-slate-800 p-2.5 space-y-1.5"
+                >
+                  <div
+                    v-if="sessionLogEntries.length === 0"
+                    class="py-4 text-center text-xs text-slate-500"
+                  >
+                    Sin actividad en esta sesión todavía. Envía una instrucción para ver el razonamiento plegable, herramientas y respuesta final en tiempo real.
+                  </div>
+
+                  <template v-for="entry in sessionLogEntries" :key="entry.id">
+                    <!-- Prompt enviado por el usuario -->
+                    <div
+                      v-if="entry.kind === 'prompt'"
+                      class="rounded-md bg-slate-900/90 border border-slate-800 px-2.5 py-1.5 space-y-0.5"
+                    >
+                      <div class="flex items-center justify-between gap-2 text-[11px] text-slate-400">
+                        <span class="font-medium text-sky-300">
+                          Tú · @{{ entry.agentId }}
+                        </span>
+                      </div>
+                      <div class="text-xs text-slate-100 whitespace-pre-wrap select-text">
+                        {{ entry.content }}
+                      </div>
+                    </div>
+
+                    <!-- Razonamiento plegable -->
+                    <details
+                      v-else-if="entry.kind === 'reasoning'"
+                      class="rounded-md bg-slate-900/65 border border-slate-800/90"
+                    >
+                      <summary class="flex items-center justify-between gap-2 px-2.5 py-1.5 cursor-pointer text-[11px] text-sky-300 select-none">
+                        <span class="flex items-center gap-1.5 min-w-0 truncate">
+                          <span class="font-medium">Razonamiento</span>
+                          <span aria-hidden="true" class="text-slate-600">·</span>
+                          <span class="text-slate-300">
+                            {{ profileMap[entry.agentId]?.name || entry.agentId }}
+                          </span>
+                          <span aria-hidden="true" class="text-slate-600">·</span>
+                          <span :class="entry.status === 'running' ? 'text-sky-300' : 'text-slate-400'">
+                            {{ entry.status === "running" ? "Pensando..." : "Completado" }}
+                          </span>
+                        </span>
+                        <span class="font-mono text-[10px] text-slate-500 tabular-nums shrink-0">
+                          {{ entry.content.length }} chars
+                        </span>
+                      </summary>
+                      <div class="px-2.5 pb-2 pt-1.5 text-[11px] text-slate-300 whitespace-pre-wrap leading-relaxed border-t border-slate-800/70 max-h-40 overflow-y-auto select-text">
+                        {{ entry.content || "Analizando problema..." }}
+                      </div>
+                    </details>
+
+                    <!-- Línea compacta por herramienta -->
+                    <div
+                      v-else-if="entry.kind === 'tool'"
+                      class="flex items-center justify-between gap-2 px-2.5 py-1 rounded bg-slate-900/45 text-[11px] font-mono"
+                    >
+                      <div class="flex items-center gap-1.5 min-w-0 truncate">
+                        <span
+                          :class="[
+                            'shrink-0 font-bold',
+                            entry.status === 'done'
+                              ? 'text-emerald-400'
+                              : entry.status === 'error'
+                                ? 'text-rose-400'
+                                : 'text-sky-400',
+                          ]"
+                        >
+                          {{
+                            entry.status === "done"
+                              ? "✓"
+                              : entry.status === "error"
+                                ? "✕"
+                                : "…"
+                          }}
+                        </span>
+                        <span class="text-slate-200 shrink-0">{{ entry.toolName }}</span>
+                        <span
+                          v-if="entry.target"
+                          class="text-slate-400 truncate"
+                        >
+                          · {{ entry.target }}
+                        </span>
+                      </div>
+                      <span class="text-[10px] text-slate-500 shrink-0">
+                        {{ profileMap[entry.agentId]?.name || entry.agentId }}
+                      </span>
+                    </div>
+
+                    <!-- Texto en streaming / respuesta final -->
+                    <div
+                      v-else-if="entry.kind === 'text'"
+                      class="rounded-md bg-slate-900/60 border border-slate-800/80 px-2.5 py-2 space-y-1"
+                    >
+                      <div class="flex items-center justify-between gap-2 text-[11px]">
+                        <div class="flex items-center gap-1.5 text-slate-300 font-medium">
+                          <span
+                            class="w-2 h-2 rounded-xs shrink-0"
+                            :style="{
+                              backgroundColor:
+                                profileMap[entry.agentId]?.color || '#38BDF8',
+                            }"
+                          ></span>
+                          <span>{{ profileMap[entry.agentId]?.name || entry.agentId }}</span>
+                          <span aria-hidden="true" class="text-slate-600">·</span>
+                          <span :class="entry.status === 'running' ? 'text-sky-300' : 'text-emerald-300'">
+                            {{ entry.status === "running" ? "Escribiendo..." : "Respuesta" }}
+                          </span>
+                        </div>
+                      </div>
+                      <div class="text-xs text-slate-100 whitespace-pre-wrap leading-relaxed select-text">
+                        {{ entry.content }}
+                      </div>
+                    </div>
+
+                    <!-- Error de sesión -->
+                    <div
+                      v-else
+                      class="rounded-md bg-rose-950/60 border border-rose-500/35 px-2.5 py-1.5 text-xs text-rose-200 select-text"
+                    >
+                      {{ entry.content }}
+                    </div>
+                  </template>
+                </div>
+              </div>
             </div>
 
             <!-- Pestaña 3: Mapeo de los 5 Agentes -->

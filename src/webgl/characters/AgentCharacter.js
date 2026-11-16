@@ -45,11 +45,17 @@ export class AgentCharacter {
     this.animator.onClipChanged = (clipName) => {
       if (clipName === "typing" || clipName === "sittingIdle") {
         // Al regresar a estado base sentado, limpiar props y acentos de reacciones temporales
-        if (this.state === "WORKING" || this.state === "IDLE") {
+        if (
+          this.state === "WORKING" ||
+          this.state === "THINKING" ||
+          this.state === "IDLE"
+        ) {
           this.propSockets.detachAll();
-          if (this.socialMode !== "DESK_REVIEW") {
+          if (this.socialMode !== "DESK_REVIEW" && this.state !== "THINKING") {
             this.taskAccentColor = null;
-            this.currentActionLabel = "Tecleando código";
+            if (!this.taskTitle) {
+              this.currentActionLabel = "Tecleando código";
+            }
           }
         }
       }
@@ -152,7 +158,10 @@ export class AgentCharacter {
           ? `Revisión · ${this.socialPartnerName}`
           : `Revisando · ${this.socialPartnerName}`;
       color = "#38BDF8";
-    } else if (this.taskTitle && this.state === "WORKING") {
+    } else if (
+      this.taskTitle &&
+      (this.state === "WORKING" || this.state === "THINKING")
+    ) {
       text = this.taskTitle;
     }
 
@@ -173,7 +182,12 @@ export class AgentCharacter {
     this.overrideRotY = null;
   }
 
-  applyTaskFeedback({ status = "started", label = null, onSeated = null } = {}) {
+  applyTaskFeedback({
+    status = "started",
+    phase = null,
+    label = null,
+    onSeated = null,
+  } = {}) {
     if (label) this.taskTitle = label;
 
     const accentColor =
@@ -181,14 +195,17 @@ export class AgentCharacter {
         ? "#10B981"
         : status === "failed"
           ? "#EF4444"
-          : null;
+          : phase === "thinking"
+            ? "#38BDF8"
+            : null;
 
     // Si está fuera del escritorio o aún viajando, ejecutar preempción limpia hacia casa
-    // y diferir el estado WORKING + actualización de monitores hasta sentarse en su silla.
+    // y diferir el estado WORKING/THINKING + actualización de monitores hasta sentarse en su silla.
     if (this.currentCheckpointId !== this.homeCheckpointId || !this.isSeated) {
       this.returnHome({
         pendingLiveTask: {
           status,
+          phase,
           label,
           accentColor,
           onSeated,
@@ -198,14 +215,22 @@ export class AgentCharacter {
     }
 
     if (status === "passed") {
+      this.state = "WORKING";
       this.taskAccentColor = "#10B981";
       this.currentActionLabel = label || "Pruebas en verde";
       this.applyActionProfile("sittingCheer", { customLabel: this.currentActionLabel });
     } else if (status === "failed") {
+      this.state = "WORKING";
       this.taskAccentColor = "#EF4444";
       this.currentActionLabel = label || "Fallo detectado";
       this.applyActionProfile("sittingDisbelief", { customLabel: this.currentActionLabel });
+    } else if (phase === "thinking") {
+      this.state = "THINKING";
+      this.taskAccentColor = "#38BDF8";
+      this.currentActionLabel = label || "Pensando...";
+      this.applyActionProfile("typing", { customLabel: this.currentActionLabel });
     } else {
+      this.state = "WORKING";
       this.taskAccentColor = null;
       this.currentActionLabel = label || "Tecleando código";
       this.applyActionProfile("typing", { customLabel: this.currentActionLabel });
@@ -357,10 +382,12 @@ export class AgentCharacter {
         if (isHome) this.pendingLiveArrival = null;
 
         if (pending) {
-          this.state = "WORKING";
+          this.state = pending.phase === "thinking" ? "THINKING" : "WORKING";
           this.taskTitle = pending.label || this.taskTitle;
           this.taskAccentColor = pending.accentColor || null;
-          this.currentActionLabel = pending.label || "Tecleando código";
+          this.currentActionLabel =
+            pending.label ||
+            (pending.phase === "thinking" ? "Pensando..." : "Tecleando código");
           this.propSockets.detachAll();
 
           if (pending.status === "passed") {
@@ -458,9 +485,11 @@ export class AgentCharacter {
 
     if (this.currentCheckpointId === this.homeCheckpointId && this.isSeated) {
       this.pendingLiveArrival = null;
-      this.state = "WORKING";
+      this.state = pendingLiveTask?.phase === "thinking" ? "THINKING" : "WORKING";
       this.taskTitle = pendingLiveTask?.label || this.taskTitle;
-      const customLabel = pendingLiveTask?.label || "Tecleando código";
+      const customLabel =
+        pendingLiveTask?.label ||
+        (pendingLiveTask?.phase === "thinking" ? "Pensando..." : "Tecleando código");
       if (pendingLiveTask?.status === "passed") {
         this.applyActionProfile("sittingCheer", { customLabel });
       } else if (pendingLiveTask?.status === "failed") {

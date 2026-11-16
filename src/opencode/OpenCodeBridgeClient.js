@@ -7,6 +7,19 @@ const WATCHDOG_SILENCE_MS = 30000;
 const WATCHDOG_CHECK_INTERVAL_MS = 5000;
 const AGENT_THROTTLE_MS = 250;
 const IDLE_DEBOUNCE_MS = 3000;
+const MAX_SESSION_LOG_ENTRIES = 200;
+
+function extractReasoningExcerpt(rawText) {
+  const cleaned = String(rawText || "").replace(/\s+/g, " ").trim();
+  if (!cleaned) return "";
+  const segments = cleaned
+    .split(/[.!?\n]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const candidate = segments[segments.length - 1] || cleaned;
+  if (candidate.length <= 28) return candidate;
+  return `…${candidate.slice(-27).trimStart()}`;
+}
 
 const TOOL_LABELS_ES = {
   read: "Leyendo código",
@@ -128,6 +141,12 @@ export class OpenCodeBridgeClient {
     this.pendingPermissions = new Map();
     this.liveTaskMeta = new Map(); // externalKey -> { title, file }
     this.capabilities = null;
+
+    // Bitácora por sesión y buffers de razonamiento/delegación en vivo
+    this.sessionLogsById = new Map();
+    this.reasoningBuffers = new Map();
+    this.activeStreamEntryIds = new Map();
+    this.emittedDelegations = new Set();
 
     // Cola de throttling por agente para proteger CanvasTexture de monitores 3D
     this.lastAgentEmitAt = new Map();
@@ -260,6 +279,218 @@ export class OpenCodeBridgeClient {
   getPendingPermissions() {
     return Array.from(this.pendingPermissions.values()).sort(
       (a, b) => (a.createdAt || 0) - (b.createdAt || 0),
+    );
+  }
+
+  getSessionLog(sessionId = this.activeSessionId) {
+    const sid = sessionId || this.activeSessionId;
+    if (!sid) return [];
+    const list = this.sessionLogsById.get(sid);
+    return Array.isArray(list) ? list.map((item) => ({ ...item })) : [];
+  }
+
+  clearSessionLog(sessionId = this.activeSessionId) {
+    const sid = sessionId || this.activeSessionId;
+    if (!sid) return;
+    this.sessionLogsById.delete(sid);
+    for (const key of Array.from(this.activeStreamEntryIds.keys())) {
+      if (key.startsWith(`${sid}:`)) {
+        this.activeStreamEntryIds.delete(key);
+      }
+    }
+    for (const key of Array.from(this.reasoningBuffers.keys())) {
+      if (key.startsWith(`${sid}:`)) {
+        this.reasoningBuffers.delete(key);
+      }
+    }
+    officeEventBus.emit(
+      OFFICE_EVENTS.OPENCODE_SESSION_LOG,
+      { sessionId: sid, entries: [], cleared: true },
+      "opencode-sse",
+    );
+  }
+
+  _emitSessionLog(sessionId) {
+    if (!sessionId) return;
+    officeEventBus.emit(
+      OFFICE_EVENTS.OPENCODE_SESSION_LOG,
+      { sessionId, entries: this.getSessionLog(sessionId) },
+      "opencode-sse",
+    );
+  }
+
+  _ensureSessionLogList(sessionId) {
+    const sid = sessionId || this.activeSessionId || "global";
+    if (!this.sessionLogsById.has(sid)) {
+      this.sessionLogsById.set(sid, []);
+    }
+    return { sid, list: this.sessionLogsById.get(sid) };
+  }
+
+  _appendSessionLogEntry(sessionId, entry = {}) {
+    const { sid, list } = this._ensureSessionLogList(sessionId);
+    const id =
+      entry.id ||
+      `${entry.kind || "log"}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const record = {
+      id,
+      sessionId: sid,
+      kind: entry.kind || "text",
+      agentId: entry.agentId || "architect",
+      toolName: entry.toolName || null,
+      target: entry.target || null,
+      content: String(entry.content || ""),
+      status: entry.status || "done",
+      timestamp: entry.timestamp || Date.now(),
+    };
+    list.push(record);
+    if (list.length > MAX_SESSION_LOG_ENTRIES) {
+      list.splice(0, list.length - MAX_SESSION_LOG_ENTRIES);
+    }
+    this._emitSessionLog(sid);
+    return record;
+  }
+
+  _upsertStreamingLogEntry(
+    sessionId,
+    {
+      streamKey,
+      kind = "text",
+      agentId = "architect",
+      deltaText = "",
+      fullText = null,
+      status = "running",
+      replaceContent = false,
+    } = {},
+  ) {
+    const { sid, list } = this._ensureSessionLogList(sessionId);
+    const activeKey = `${sid}:${kind}:${streamKey || "default"}`;
+    let entryId = this.activeStreamEntryIds.get(activeKey);
+    let existing = entryId ? list.find((item) => item.id === entryId) : null;
+
+    if (!existing || (existing.status === "done" && status === "running")) {
+      entryId = `${kind}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      existing = {
+        id: entryId,
+        sessionId: sid,
+        kind,
+        agentId: agentId || "architect",
+        toolName: null,
+        target: null,
+        content: "",
+        status,
+        timestamp: Date.now(),
+      };
+      list.push(existing);
+      if (list.length > MAX_SESSION_LOG_ENTRIES) {
+        list.splice(0, list.length - MAX_SESSION_LOG_ENTRIES);
+      }
+      this.activeStreamEntryIds.set(activeKey, entryId);
+    }
+
+    if (agentId) existing.agentId = agentId;
+    if (replaceContent && typeof fullText === "string") {
+      existing.content = fullText;
+    } else if (typeof deltaText === "string" && deltaText.length > 0) {
+      existing.content += deltaText;
+    } else if (typeof fullText === "string" && fullText.length > existing.content.length) {
+      existing.content = fullText;
+    }
+    existing.status = status;
+    existing.timestamp = Date.now();
+
+    if (status === "done") {
+      this.activeStreamEntryIds.delete(activeKey);
+    }
+
+    this._emitSessionLog(sid);
+    return existing;
+  }
+
+  _upsertToolLogEntry(
+    sessionId,
+    {
+      callKey = null,
+      agentId = "architect",
+      toolName = "tool",
+      target = null,
+      status = "running",
+      errorMessage = null,
+    } = {},
+  ) {
+    const { sid, list } = this._ensureSessionLogList(sessionId);
+    let existing = null;
+    if (callKey) {
+      existing = list.find(
+        (item) => item.kind === "tool" && item.callKey === callKey,
+      );
+    } else {
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const item = list[i];
+        if (
+          item.kind === "tool" &&
+          item.toolName === toolName &&
+          item.status === "running"
+        ) {
+          existing = item;
+          break;
+        }
+      }
+    }
+
+    if (!existing) {
+      existing = {
+        id: `tool_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        callKey,
+        sessionId: sid,
+        kind: "tool",
+        agentId: agentId || "architect",
+        toolName,
+        target: target || null,
+        content: errorMessage ? String(errorMessage) : "",
+        status,
+        timestamp: Date.now(),
+      };
+      list.push(existing);
+      if (list.length > MAX_SESSION_LOG_ENTRIES) {
+        list.splice(0, list.length - MAX_SESSION_LOG_ENTRIES);
+      }
+    } else {
+      if (agentId) existing.agentId = agentId;
+      if (target) existing.target = target;
+      if (errorMessage) existing.content = String(errorMessage);
+      existing.status = status;
+      existing.timestamp = Date.now();
+    }
+
+    this._emitSessionLog(sid);
+    return existing;
+  }
+
+  _emitDelegationEvent({
+    sessionId = null,
+    hostAgentId = "architect",
+    subagentId = null,
+    topic = null,
+    callKey = null,
+  } = {}) {
+    if (!hostAgentId || !subagentId || hostAgentId === subagentId) return;
+    const dedupKey = callKey
+      ? `${sessionId || "global"}:${callKey}`
+      : `${sessionId || "global"}:${hostAgentId}:${subagentId}`;
+    if (callKey && this.emittedDelegations.has(dedupKey)) return;
+    this.emittedDelegations.add(dedupKey);
+
+    officeEventBus.emit(
+      OFFICE_EVENTS.OPENCODE_DELEGATION,
+      {
+        sessionId: sessionId || this.activeSessionId,
+        hostAgentId,
+        subagentId,
+        topic: topic || `Subtarea @${subagentId}`,
+        active: true,
+      },
+      "opencode-sse",
     );
   }
 
@@ -749,42 +980,76 @@ export class OpenCodeBridgeClient {
       const toolName = String(rawName).toLowerCase();
       const input = props.input || props.args || {};
       const file = formatToolTarget(input);
+      const callKey = props.id || props.callID || props.partID || null;
+      const isFinished =
+        eventType === "session.tool.success" ||
+        eventType === "session.tool.completed";
+      const isError =
+        eventType === "session.tool.error" ||
+        eventType === "session.tool.failed";
 
       const agentId = this._resolveEventAgentId(eventType, props);
       if (!agentId) return null;
 
+      let parentAgentForTask = null;
       if (toolName === "task") {
-        const parentAgent =
+        parentAgentForTask =
           this.resolveAgentId(this.sessionAgentMap.get(sessionId)) ||
           this.resolveAgentId(this.sessionsById.get(sessionId)?.agent) ||
           "architect";
-        if (parentAgent && sessionId) {
-          this.busySessions.set(sessionId, parentAgent);
+        if (parentAgentForTask && sessionId) {
+          this.busySessions.set(sessionId, parentAgentForTask);
         }
-        if (parentAgent && parentAgent !== agentId) {
+        if (parentAgentForTask && parentAgentForTask !== agentId) {
           const coordLabel = `Coordinando @${agentId}`;
+          const topic = file || input.description || `Subtarea @${agentId}`;
+          if (!isFinished && !isError) {
+            this._emitDelegationEvent({
+              sessionId,
+              hostAgentId: parentAgentForTask,
+              subagentId: agentId,
+              topic,
+              callKey,
+            });
+          }
           this._emitLiveKanbanSync({
             sessionId,
-            agentId: parentAgent,
+            agentId: parentAgentForTask,
             status: "in_progress",
             title: coordLabel,
             file,
           });
-          this._queueAgentTask(parentAgent, {
+          this._queueAgentTask(parentAgentForTask, {
             status: "started",
+            phase: "working",
             label: coordLabel,
             file,
+            delegationEvent: !isFinished && !isError,
           });
         }
       } else if (sessionId) {
         this.busySessions.set(sessionId, agentId);
       }
 
+      const logTarget =
+        toolName === "task" && parentAgentForTask && parentAgentForTask !== agentId
+          ? `@${agentId}${file ? ` · ${file}` : ""}`
+          : file || (typeof input.description === "string" ? input.description.slice(0, 40) : null);
+
+      this._upsertToolLogEntry(sessionId || this.activeSessionId, {
+        callKey,
+        agentId:
+          toolName === "task" && parentAgentForTask ? parentAgentForTask : agentId,
+        toolName,
+        target: logTarget,
+        status: isError ? "error" : isFinished ? "done" : "running",
+        errorMessage: isError
+          ? props.error?.data?.message || props.error?.message || props.message || null
+          : null,
+      });
+
       // Preguntas / formularios interactivos (`question`) requieren respuesta en CLI
       if (toolName === "question") {
-        const isFinished =
-          eventType === "session.tool.success" ||
-          eventType === "session.tool.completed";
         if (!isFinished) {
           this._emitLiveKanbanSync({
             sessionId,
@@ -806,10 +1071,7 @@ export class OpenCodeBridgeClient {
         }
       }
 
-      if (
-        eventType === "session.tool.error" ||
-        eventType === "session.tool.failed"
-      ) {
+      if (isError) {
         const errLabel = `Fallo en ${toolName}`;
         this._emitLiveKanbanSync({
           sessionId,
@@ -831,10 +1093,7 @@ export class OpenCodeBridgeClient {
       }
 
       const baseLabel = TOOL_LABELS_ES[toolName] || `Tool: ${toolName}`;
-      const label =
-        eventType === "session.tool.success" || eventType === "session.tool.completed"
-          ? `${baseLabel} ✓`
-          : baseLabel;
+      const label = isFinished ? `${baseLabel} ✓` : baseLabel;
 
       this._emitLiveKanbanSync({
         sessionId,
@@ -845,8 +1104,12 @@ export class OpenCodeBridgeClient {
       });
       this._queueAgentTask(agentId, {
         status: "started",
+        phase: "working",
         label,
         file,
+        delegationEvent:
+          toolName === "task" &&
+          Boolean(parentAgentForTask && parentAgentForTask !== agentId && !isFinished),
       });
       return agentId;
     }
@@ -873,6 +1136,7 @@ export class OpenCodeBridgeClient {
         agentId,
         {
           status: resolvedForm ? "started" : "failed",
+          phase: "working",
           label: resolvedForm ? "Continuando tarea" : "Esperando respuesta en CLI",
           file: null,
         },
@@ -882,32 +1146,127 @@ export class OpenCodeBridgeClient {
     }
 
     if (
-      eventType === "session.text.delta" ||
-      eventType === "session.reasoning.delta"
+      eventType === "session.reasoning.started" ||
+      eventType === "session.reasoning.delta" ||
+      eventType === "session.reasoning.ended"
     ) {
-      if (sessionId) {
-        this._cancelSessionIdleTimer(sessionId);
-      }
+      const sid = sessionId || this.activeSessionId || "global";
+      this._cancelSessionIdleTimer(sid);
       const agentId = this._resolveEventAgentId(eventType, props);
       if (!agentId) return null;
 
-      if (sessionId) {
-        this.busySessions.set(sessionId, agentId);
+      this.busySessions.set(sid, agentId);
+      const chunk = String(
+        props.delta ?? props.text ?? props.part?.text ?? "",
+      );
+      const streamId = props.id || props.partID || props.messageID || "active";
+      const bufferKey = `${sid}:${agentId}`;
+
+      if (eventType === "session.reasoning.started") {
+        this.reasoningBuffers.set(bufferKey, chunk);
+        this._upsertStreamingLogEntry(sid, {
+          streamKey: streamId,
+          kind: "reasoning",
+          agentId,
+          fullText: chunk,
+          status: "running",
+          replaceContent: true,
+        });
+      } else if (eventType === "session.reasoning.delta") {
+        const nextBuf = `${this.reasoningBuffers.get(bufferKey) || ""}${chunk}`.slice(-500);
+        this.reasoningBuffers.set(bufferKey, nextBuf);
+        this._upsertStreamingLogEntry(sid, {
+          streamKey: streamId,
+          kind: "reasoning",
+          agentId,
+          deltaText: chunk,
+          status: "running",
+        });
+      } else {
+        this._upsertStreamingLogEntry(sid, {
+          streamKey: streamId,
+          kind: "reasoning",
+          agentId,
+          fullText: chunk || undefined,
+          status: "done",
+        });
       }
-      const label =
-        eventType === "session.reasoning.delta"
-          ? "Analizando solución"
-          : "Redactando respuesta";
+
+      const excerpt = extractReasoningExcerpt(
+        this.reasoningBuffers.get(bufferKey) || chunk,
+      );
+      const bubbleLabel = excerpt ? `Pensando · ${excerpt}` : "Pensando...";
+
       this._emitLiveKanbanSync({
-        sessionId,
+        sessionId: sid,
         agentId,
         status: "in_progress",
-        title: label,
+        title: "Pensando...",
         preserveTitle: true,
       });
       this._queueAgentTask(agentId, {
         status: "started",
-        label,
+        phase: "thinking",
+        label: bubbleLabel,
+        file: null,
+      });
+      return agentId;
+    }
+
+    if (
+      eventType === "session.text.started" ||
+      eventType === "session.text.delta" ||
+      eventType === "session.text.ended"
+    ) {
+      const sid = sessionId || this.activeSessionId || "global";
+      this._cancelSessionIdleTimer(sid);
+      const agentId = this._resolveEventAgentId(eventType, props);
+      if (!agentId) return null;
+
+      this.busySessions.set(sid, agentId);
+      const chunk = String(
+        props.delta ?? props.text ?? props.part?.text ?? "",
+      );
+      const streamId = props.id || props.partID || props.messageID || "active";
+
+      if (eventType === "session.text.started") {
+        this._upsertStreamingLogEntry(sid, {
+          streamKey: streamId,
+          kind: "text",
+          agentId,
+          fullText: chunk,
+          status: "running",
+          replaceContent: true,
+        });
+      } else if (eventType === "session.text.delta") {
+        this._upsertStreamingLogEntry(sid, {
+          streamKey: streamId,
+          kind: "text",
+          agentId,
+          deltaText: chunk,
+          status: "running",
+        });
+      } else {
+        this._upsertStreamingLogEntry(sid, {
+          streamKey: streamId,
+          kind: "text",
+          agentId,
+          fullText: chunk || undefined,
+          status: "done",
+        });
+      }
+
+      this._emitLiveKanbanSync({
+        sessionId: sid,
+        agentId,
+        status: "in_progress",
+        title: "Redactando respuesta",
+        preserveTitle: true,
+      });
+      this._queueAgentTask(agentId, {
+        status: "started",
+        phase: "working",
+        label: "Redactando respuesta",
         file: null,
       });
       return agentId;
@@ -1024,6 +1383,12 @@ export class OpenCodeBridgeClient {
         props.error?.name ||
         props.message ||
         "Error en sesión OpenCode";
+      this._appendSessionLogEntry(sessionId || this.activeSessionId, {
+        kind: "error",
+        agentId,
+        content: String(errMsg),
+        status: "error",
+      });
       this._releaseSessionNow(sessionId, agentId, {
         status: "failed",
         label: String(errMsg).slice(0, 34),
@@ -1096,20 +1461,34 @@ export class OpenCodeBridgeClient {
       if (!agentId) return null;
 
       if (part.type === "tool") {
-        const toolName = String(part.tool || "tool").toLowerCase();
+        const toolName = String(part.tool || part.name || "tool").toLowerCase();
         const stateStatus = part.state?.status || "running";
         const input = part.state?.input || part.input || {};
         const file = formatToolTarget(input);
+        const callKey = part.callID || part.id || props.id || null;
+        const isDone = stateStatus === "completed";
+        const isErr = stateStatus === "error";
 
+        let parentAgent = null;
         // Si tool="task" delega a un subagente, también notificar al agente primario
         if (toolName === "task") {
-          const parentAgent =
+          parentAgent =
             this.resolveAgentId(
               this.sessionAgentMap.get(part.sessionID) ||
                 this.sessionsById.get(part.sessionID)?.agent,
             ) || "architect";
           if (parentAgent && parentAgent !== agentId) {
             const coordLabel = `Coordinando @${agentId}`;
+            const topic = file || input.description || `Subtarea @${agentId}`;
+            if (!isDone && !isErr) {
+              this._emitDelegationEvent({
+                sessionId: part.sessionID || sessionId,
+                hostAgentId: parentAgent,
+                subagentId: agentId,
+                topic,
+                callKey,
+              });
+            }
             this._emitLiveKanbanSync({
               sessionId: part.sessionID,
               agentId: parentAgent,
@@ -1119,13 +1498,28 @@ export class OpenCodeBridgeClient {
             });
             this._queueAgentTask(parentAgent, {
               status: "started",
+              phase: "working",
               label: coordLabel,
               file,
+              delegationEvent: !isDone && !isErr,
             });
           }
         } else if (sessionId) {
           this.busySessions.set(sessionId, agentId);
         }
+
+        const logTarget =
+          toolName === "task" && parentAgent && parentAgent !== agentId
+            ? `@${agentId}${file ? ` · ${file}` : ""}`
+            : file || (typeof input.description === "string" ? input.description.slice(0, 40) : null);
+
+        this._upsertToolLogEntry(part.sessionID || sessionId || this.activeSessionId, {
+          callKey,
+          agentId: toolName === "task" && parentAgent ? parentAgent : agentId,
+          toolName,
+          target: logTarget,
+          status: isErr ? "error" : isDone ? "done" : "running",
+        });
 
         if (toolName === "question" && stateStatus !== "completed") {
           this._emitLiveKanbanSync({
@@ -1192,31 +1586,77 @@ export class OpenCodeBridgeClient {
           });
           this._queueAgentTask(agentId, {
             status: "started",
+            phase: "working",
             label,
             file,
+            delegationEvent:
+              toolName === "task" && Boolean(parentAgent && parentAgent !== agentId && !isDone),
           });
         }
         return agentId;
       }
 
       if (part.type === "text" || part.type === "reasoning") {
-        if (sessionId) this.busySessions.set(sessionId, agentId);
-        const label =
-          part.type === "reasoning"
-            ? "Analizando solución"
-            : "Redactando respuesta";
-        this._emitLiveKanbanSync({
-          sessionId,
-          agentId,
-          status: "in_progress",
-          title: label,
-          preserveTitle: true,
-        });
-        this._queueAgentTask(agentId, {
-          status: "started",
-          label,
-          file: null,
-        });
+        const sid = part.sessionID || sessionId || this.activeSessionId || "global";
+        this.busySessions.set(sid, agentId);
+        const partText = typeof part.text === "string" ? part.text : "";
+        const delta = typeof props.delta === "string" ? props.delta : "";
+        const isReasoning = part.type === "reasoning";
+        const isDone = Boolean(part.time?.end);
+        const streamId = part.id || part.messageID || "active";
+
+        if (isReasoning) {
+          const bufKey = `${sid}:${agentId}`;
+          const sourceText = partText || `${this.reasoningBuffers.get(bufKey) || ""}${delta}`;
+          this.reasoningBuffers.set(bufKey, sourceText.slice(-500));
+          this._upsertStreamingLogEntry(sid, {
+            streamKey: streamId,
+            kind: "reasoning",
+            agentId,
+            deltaText: delta,
+            fullText: partText || undefined,
+            status: isDone ? "done" : "running",
+            replaceContent: Boolean(partText),
+          });
+          const excerpt = extractReasoningExcerpt(sourceText);
+          const bubbleLabel = excerpt ? `Pensando · ${excerpt}` : "Pensando...";
+          this._emitLiveKanbanSync({
+            sessionId: sid,
+            agentId,
+            status: "in_progress",
+            title: "Pensando...",
+            preserveTitle: true,
+          });
+          this._queueAgentTask(agentId, {
+            status: "started",
+            phase: "thinking",
+            label: bubbleLabel,
+            file: null,
+          });
+        } else {
+          this._upsertStreamingLogEntry(sid, {
+            streamKey: streamId,
+            kind: "text",
+            agentId,
+            deltaText: delta,
+            fullText: partText || undefined,
+            status: isDone ? "done" : "running",
+            replaceContent: Boolean(partText),
+          });
+          this._emitLiveKanbanSync({
+            sessionId: sid,
+            agentId,
+            status: "in_progress",
+            title: "Redactando respuesta",
+            preserveTitle: true,
+          });
+          this._queueAgentTask(agentId, {
+            status: "started",
+            phase: "working",
+            label: "Redactando respuesta",
+            file: null,
+          });
+        }
       }
       return agentId;
     }
@@ -1270,8 +1710,10 @@ export class OpenCodeBridgeClient {
     const enriched = {
       agentId,
       status: payload.status || "started",
+      phase: payload.phase || "working",
       label: payload.label || "Trabajando en OpenCode",
       file: payload.file || null,
+      delegationEvent: Boolean(payload.delegationEvent),
       live: true,
       idleCooldownSec: this.config.idleCooldownSec,
     };
@@ -2075,15 +2517,23 @@ export class OpenCodeBridgeClient {
           ]);
 
           if (!raceOutcome.settled) {
-            this.busySessions.set(targetSessionId, agent || "architect");
+            const targetAgentId = this.resolveAgentId(agent) || "architect";
+            this.busySessions.set(targetSessionId, targetAgentId);
+            this._appendSessionLogEntry(targetSessionId, {
+              kind: "prompt",
+              agentId: targetAgentId,
+              content: cleanText,
+              status: "done",
+            });
             this._emitLiveKanbanSync({
               sessionId: targetSessionId,
-              agentId: this.resolveAgentId(agent) || "architect",
+              agentId: targetAgentId,
               status: "in_progress",
               title: cleanText.slice(0, 48),
             });
-            this._queueAgentTask(this.resolveAgentId(agent) || "architect", {
+            this._queueAgentTask(targetAgentId, {
               status: "started",
+              phase: "working",
               label: "Procesando prompt",
               file: null,
             });
@@ -2138,18 +2588,23 @@ export class OpenCodeBridgeClient {
             };
           }
 
-          this.busySessions.set(
-            targetSessionId,
-            this.resolveAgentId(agent) || "architect",
-          );
+          const targetAgentId = this.resolveAgentId(agent) || "architect";
+          this.busySessions.set(targetSessionId, targetAgentId);
+          this._appendSessionLogEntry(targetSessionId, {
+            kind: "prompt",
+            agentId: targetAgentId,
+            content: cleanText,
+            status: "done",
+          });
           this._emitLiveKanbanSync({
             sessionId: targetSessionId,
-            agentId: this.resolveAgentId(agent) || "architect",
+            agentId: targetAgentId,
             status: "in_progress",
             title: cleanText.slice(0, 48),
           });
-          this._queueAgentTask(this.resolveAgentId(agent) || "architect", {
+          this._queueAgentTask(targetAgentId, {
             status: "started",
+            phase: "working",
             label: "Prompt recibido",
             file: null,
           });
@@ -2640,8 +3095,17 @@ export class OpenCodeBridgeClient {
     this.liveTaskMeta.clear();
     this.taskCallsByChildSession.clear();
     this.taskCallsByPartId.clear();
+    this.sessionLogsById.clear();
+    this.reasoningBuffers.clear();
+    this.activeStreamEntryIds.clear();
+    this.emittedDelegations.clear();
     this.status = "disconnected";
     this.lastError = null;
+    officeEventBus.emit(
+      OFFICE_EVENTS.OPENCODE_SESSION_LOG,
+      { sessionId: null, entries: [], cleared: true },
+      "opencode-sse",
+    );
     this._emitPermissionsState(false, null);
   }
 
