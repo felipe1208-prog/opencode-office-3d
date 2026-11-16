@@ -16,11 +16,11 @@ export const AGENT_COLOR_PALETTE = [
 ];
 
 export const TASK_COLUMNS = [
-  { id: "todo", label: "Pendiente", accent: "text-slate-300" },
-  { id: "in_progress", label: "En Curso", accent: "text-sky-300" },
-  { id: "review", label: "En Revisión", accent: "text-violet-300" },
-  { id: "done", label: "Completada", accent: "text-emerald-300" },
-  { id: "blocked", label: "Bloqueada", accent: "text-rose-300" },
+  { id: "todo", label: "Pendiente", accent: "text-[#9CA3AF]", hex: "#9CA3AF" },
+  { id: "in_progress", label: "En Curso", accent: "text-[#D97706]", hex: "#D97706" },
+  { id: "review", label: "En Revisión", accent: "text-[#8B5CF6]", hex: "#8B5CF6" },
+  { id: "done", label: "Completada", accent: "text-[#10B981]", hex: "#10B981" },
+  { id: "blocked", label: "Bloqueada", accent: "text-[#E11D48]", hex: "#E11D48" },
 ];
 
 const DEFAULT_TASK_IDS = new Set([

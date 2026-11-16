@@ -2,7 +2,12 @@
 
 @theme {
   --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-mono: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --color-surface-base: #111318;
+  --color-surface-panel: #181b22;
+  --color-surface-elevated: #1f232d;
+  --color-accent-opencode: #4f6ef7;
+  --color-accent-opencode-tint: #1e243b;
 }
 
 html,
@@ -13,6 +18,39 @@ body,
   margin: 0;
   padding: 0;
   overflow: hidden;
-  background-color: #0b0f19;
+  background-color: #111318;
   font-family: var(--font-sans);
+  color: #f3f4f6;
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Scrollbar editorial mate oscura */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2a303d #14171f;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #14171f;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #2a303d;
+  border-radius: 3px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #373f50;
 }

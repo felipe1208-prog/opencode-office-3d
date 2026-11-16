@@ -39,6 +39,8 @@ export class AgentCharacter {
     this.socialPartnerName = null;
     this.overrideRotY = null;
     this.pendingLiveArrival = null;
+    this.pendingStationOnSeated = null;
+    this.isTransitioningSeat = false;
 
     this.pendingTimers = new Set();
 
@@ -81,6 +83,7 @@ export class AgentCharacter {
       clearTimeout(id);
     }
     this.pendingTimers.clear();
+    this.isTransitioningSeat = false;
     this.animator.clearPendingCallbacks();
   }
 
@@ -194,14 +197,18 @@ export class AgentCharacter {
       status === "passed"
         ? "#10B981"
         : status === "failed"
-          ? "#EF4444"
+          ? "#E11D48"
           : phase === "thinking"
-            ? "#38BDF8"
+            ? "#4F6EF7"
             : null;
 
-    // Si está fuera del escritorio o aún viajando, ejecutar preempción limpia hacia casa
+    // Si está fuera del escritorio, viajando o en transición de silla, ejecutar retorno limpio
     // y diferir el estado WORKING/THINKING + actualización de monitores hasta sentarse en su silla.
-    if (this.currentCheckpointId !== this.homeCheckpointId || !this.isSeated) {
+    if (
+      this.currentCheckpointId !== this.homeCheckpointId ||
+      !this.isSeated ||
+      this.isTransitioningSeat
+    ) {
       this.returnHome({
         pendingLiveTask: {
           status,
@@ -221,12 +228,12 @@ export class AgentCharacter {
       this.applyActionProfile("sittingCheer", { customLabel: this.currentActionLabel });
     } else if (status === "failed") {
       this.state = "WORKING";
-      this.taskAccentColor = "#EF4444";
+      this.taskAccentColor = "#E11D48";
       this.currentActionLabel = label || "Fallo detectado";
       this.applyActionProfile("sittingDisbelief", { customLabel: this.currentActionLabel });
     } else if (phase === "thinking") {
       this.state = "THINKING";
-      this.taskAccentColor = "#38BDF8";
+      this.taskAccentColor = "#4F6EF7";
       this.currentActionLabel = label || "Pensando...";
       this.applyActionProfile("typing", { customLabel: this.currentActionLabel });
     } else {
@@ -264,14 +271,36 @@ export class AgentCharacter {
       socialMode = null,
       socialPartnerName = null,
       overrideRotY = null,
+      onSeated = null,
     } = {},
   ) {
     const targetCP = checkpointManager.get(checkpointId);
     if (!targetCP) return false;
 
+    if (
+      this.currentCheckpointId === checkpointId &&
+      !this.isTransitioningSeat &&
+      this.state !== "TRAVELING"
+    ) {
+      if (overrideAction && this.currentActionKey !== overrideAction) {
+        this.applyActionProfile(overrideAction);
+      }
+      onSeated?.(this);
+      return true;
+    }
+
+    if (
+      this.state === "TRAVELING" &&
+      this.targetCheckpointId === checkpointId
+    ) {
+      this.pendingStationOnSeated = onSeated || this.pendingStationOnSeated;
+      return true;
+    }
+
     this.clearTimers();
     this.clearSocialContext();
     this.pendingLiveArrival = null;
+    this.pendingStationOnSeated = onSeated;
     this.taskAccentColor = null;
     if (socialMode) {
       this.socialMode = socialMode;
@@ -330,15 +359,18 @@ export class AgentCharacter {
 
     if (this.isSeated) {
       this.isSeated = false;
+      this.isTransitioningSeat = true;
       this.bubble?.setSeated(false);
       this.targetY = FLOOR_Y;
       this.animator.play("sitToStand", 0.18);
       this.scheduleTimer(() => {
+        this.isTransitioningSeat = false;
         this.model.position.y = FLOOR_Y;
         this.animator.play("walking", 0.2);
         if (onReadyToWalk) onReadyToWalk();
       }, 650);
     } else {
+      this.isTransitioningSeat = false;
       this.targetY = FLOOR_Y;
       this.model.position.y = FLOOR_Y;
       this.bubble?.setSeated(false);
@@ -373,10 +405,12 @@ export class AgentCharacter {
       const isHome = cp.id === this.homeCheckpointId;
       this.state = isHome ? "WORKING" : "INTERACTING";
       this.isSeated = true;
+      this.isTransitioningSeat = true;
       this.targetY = cp.pos.y;
       this.animator.play("standToSit", 0.2);
 
       this.scheduleTimer(() => {
+        this.isTransitioningSeat = false;
         this.model.position.y = cp.pos.y;
         const pending = isHome ? this.pendingLiveArrival : null;
         if (isHome) this.pendingLiveArrival = null;
@@ -413,13 +447,21 @@ export class AgentCharacter {
         } else {
           this.applyActionProfile(chosenAction);
         }
+
+        const stationCb = this.pendingStationOnSeated;
+        this.pendingStationOnSeated = null;
+        stationCb?.(this);
       }, 620);
     } else {
       this.state = "INTERACTING";
       this.isSeated = false;
+      this.isTransitioningSeat = false;
       this.targetY = FLOOR_Y;
       this.model.position.y = FLOOR_Y;
       this.applyActionProfile(chosenAction);
+      const stationCb = this.pendingStationOnSeated;
+      this.pendingStationOnSeated = null;
+      stationCb?.(this);
     }
 
     this.notifyStateChange();
@@ -468,8 +510,31 @@ export class AgentCharacter {
     const home = checkpointManager.get(this.homeCheckpointId);
     if (!home) return;
 
+    // Si ya está caminando hacia su escritorio o terminando standToSit en casa,
+    // actualizar únicamente el estado diferido sin reiniciar la ruta A*.
+    const alreadyGoingHome =
+      (this.state === "TRAVELING" && this.targetCheckpointId === this.homeCheckpointId) ||
+      (this.currentCheckpointId === this.homeCheckpointId && this.isTransitioningSeat);
+
+    if (alreadyGoingHome) {
+      if (pendingLiveTask) {
+        this.pendingLiveArrival = pendingLiveTask;
+        this.taskAccentColor = pendingLiveTask.accentColor || null;
+        if (pendingLiveTask.label) {
+          this.taskTitle = pendingLiveTask.label;
+          if (this.state === "TRAVELING") {
+            this.currentActionLabel = `Regresando · ${pendingLiveTask.label}`;
+          }
+        }
+        this.syncBubble();
+        this.notifyStateChange();
+      }
+      return;
+    }
+
     this.clearTimers();
     this.clearSocialContext();
+    this.pendingStationOnSeated = null;
     this.taskAccentColor = pendingLiveTask?.accentColor || null;
 
     // Blindaje 3: liberar de inmediato cualquier reserva previa (en viaje, espera o estación)
@@ -483,7 +548,11 @@ export class AgentCharacter {
       this.waitingSeatId = null;
     }
 
-    if (this.currentCheckpointId === this.homeCheckpointId && this.isSeated) {
+    if (
+      this.currentCheckpointId === this.homeCheckpointId &&
+      this.isSeated &&
+      !this.isTransitioningSeat
+    ) {
       this.pendingLiveArrival = null;
       this.state = pendingLiveTask?.phase === "thinking" ? "THINKING" : "WORKING";
       this.taskTitle = pendingLiveTask?.label || this.taskTitle;

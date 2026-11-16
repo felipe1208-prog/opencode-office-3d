@@ -38,6 +38,7 @@ import {
   Send,
   Square,
   ShieldAlert,
+  AlertTriangle,
 } from "@lucide/vue";
 import { Resources } from "./webgl/core/Resources";
 import { Experience } from "./webgl/Experience";
@@ -67,7 +68,7 @@ const isDockCollapsed = ref(false);
 const showBubbles = ref(true);
 const isTaskBoardOpen = ref(false);
 const isOpenCodePanelOpen = ref(false);
-const openCodeTab = ref("connection"); // 'connection' | 'command' | 'mapping' | 'guide'
+const openCodeTab = ref("connection"); // 'command' | 'connection' | 'mapping' | 'guide'
 const activeInspectorTab = ref("routes"); // 'routes' | 'animations' | 'events' | 'profile'
 const eventLog = ref([]);
 
@@ -76,6 +77,7 @@ const tasks = ref(taskBoardManager.getTasks());
 const taskSourceFilter = ref("all"); // 'all' | 'opencode' | 'manual'
 const audioEnabled = ref(false);
 const audioVolume = ref(0.45);
+const dismissedBlockedAlertKeys = ref(new Set());
 
 const initialOpenCodeCfg = openCodeBridge.getConfig();
 const openCodeState = ref(openCodeBridge.getSnapshot());
@@ -157,6 +159,23 @@ const demoTasksCount = computed(
 const activePermission = computed(
   () => openCodeState.value.pendingPermissions?.[0] || null,
 );
+
+const blockedCliAlerts = computed(() => {
+  const permSessions = new Set(
+    (openCodeState.value.pendingPermissions || [])
+      .map((p) => p.sessionID)
+      .filter(Boolean),
+  );
+  return tasks.value
+    .filter(
+      (t) =>
+        t.source === "opencode" &&
+        t.status === "blocked" &&
+        !permSessions.has(t.sessionId) &&
+        !dismissedBlockedAlertKeys.value.has(`${t.id}:${t.updatedAt}`),
+    )
+    .slice(0, 2);
+});
 
 const activeLogSessionId = computed(
   () => commandForm.sessionId || openCodeState.value.activeSessionId || "",
@@ -292,6 +311,33 @@ let unsubTaskSync = null;
 let unsubOpenCode = null;
 let unsubSessionLog = null;
 let copyFeedbackTimer = null;
+
+function hexToRgba(hex, alpha = 0.12) {
+  const clean = String(hex || "#4F6EF7").replace("#", "");
+  if (clean.length !== 6) return `rgba(79, 110, 247, ${alpha})`;
+  const r = parseInt(clean.slice(0, 2), 16);
+  const g = parseInt(clean.slice(2, 4), 16);
+  const b = parseInt(clean.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function getAgentAvatarStyle(agent) {
+  const isSelected = selectedAgentId.value === agent.id;
+  const isLive = openCodeState.value.activeAgents.includes(agent.id);
+  if (isSelected) {
+    return {
+      backgroundColor: hexToRgba(agent.color, 0.14),
+      borderColor: hexToRgba(agent.color, 0.45),
+    };
+  }
+  if (isLive) {
+    return {
+      backgroundColor: hexToRgba(agent.color, 0.1),
+      borderColor: hexToRgba(agent.color, 0.28),
+    };
+  }
+  return {};
+}
 
 function scrollLogToBottom(force = false) {
   const el = logContainerRef.value;
@@ -476,7 +522,13 @@ function toggleDirectorPause() {
 
 function toggleDirectorSpeed() {
   if (!experience) return;
-  experience.setSimulationSpeed(directorState.speedMultiplier === 1 ? 2 : 1);
+  const next =
+    directorState.speedMultiplier === 1
+      ? 1.5
+      : directorState.speedMultiplier === 1.5
+        ? 2
+        : 1;
+  experience.setSimulationSpeed(next);
 }
 
 function setLightingMode(mode) {
@@ -495,7 +547,6 @@ function toggleTaskBoard() {
   isTaskBoardOpen.value = !isTaskBoardOpen.value;
   if (isTaskBoardOpen.value) {
     isOpenCodePanelOpen.value = false;
-    isDockCollapsed.value = false;
   }
   ambientAudio.playSoftTick();
 }
@@ -504,9 +555,18 @@ function toggleOpenCodePanel() {
   isOpenCodePanelOpen.value = !isOpenCodePanelOpen.value;
   if (isOpenCodePanelOpen.value) {
     isTaskBoardOpen.value = false;
-    isDockCollapsed.value = false;
+    if (openCodeState.value.status === "connected") {
+      openCodeTab.value = "command";
+    }
   }
   ambientAudio.playSoftTick();
+}
+
+function dismissBlockedAlert(task) {
+  if (!task) return;
+  const next = new Set(dismissedBlockedAlertKeys.value);
+  next.add(`${task.id}:${task.updatedAt}`);
+  dismissedBlockedAlertKeys.value = next;
 }
 
 function downloadTextFile(filename, content, mimeType = "text/plain;charset=utf-8") {
@@ -606,7 +666,6 @@ function openCommandComposer() {
   isOpenCodePanelOpen.value = true;
   openCodeTab.value = "command";
   isTaskBoardOpen.value = false;
-  isDockCollapsed.value = false;
   ambientAudio.playSoftTick();
 }
 
@@ -781,9 +840,9 @@ onBeforeUnmount(() => {
 
 <template>
   <main
-    class="w-full h-screen relative bg-slate-950 overflow-hidden font-sans select-none text-slate-100"
+    class="w-full h-screen relative bg-[#111318] overflow-hidden font-sans select-none text-[#F3F4F6]"
   >
-    <!-- Contenedor aislado del Canvas WebGL -->
+    <!-- Contenedor aislado del Canvas WebGL (100% intacto sin resize lateral) -->
     <div class="w-full h-full relative">
       <canvas ref="canvasRef" class="w-full h-full block outline-none" />
     </div>
@@ -791,1257 +850,442 @@ onBeforeUnmount(() => {
     <!-- Pantalla de carga inicial -->
     <div
       v-if="!isReady"
-      class="absolute inset-0 bg-slate-950 flex flex-col items-center justify-center p-6 z-50"
+      class="absolute inset-0 bg-[#111318] flex flex-col items-center justify-center p-6 z-50"
     >
       <div class="w-80 space-y-3">
-        <div class="flex items-center justify-between text-xs text-slate-400">
-          <span class="font-medium text-slate-200"
-            >Inicializando Oficina Virtual 3D</span
-          >
-          <span class="font-mono tabular-nums">{{ loadProgress }}%</span>
+        <div class="flex items-center justify-between text-xs text-[#9CA3AF]">
+          <span class="font-medium text-[#F3F4F6]">
+            Inicializando Oficina Virtual 3D
+          </span>
+          <span class="tabular-nums">{{ loadProgress }}%</span>
         </div>
-        <div class="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+        <div class="w-full h-1.5 bg-[#1F232D] rounded-md overflow-hidden">
           <div
-            class="h-full bg-sky-500 transition-all duration-150 ease-out"
+            class="h-full bg-[#4F6EF7] transition-all duration-150 ease-out"
             :style="{ width: `${loadProgress}%` }"
           ></div>
         </div>
       </div>
     </div>
 
-    <!-- Título discreto superior izquierdo (sin ocluir el centro del diorama) -->
-    <div
+    <!-- ZONA 1: Isla Superior Izquierda (Telemetría + Iluminación + Vista General) -->
+    <header
       v-if="isReady"
-      class="absolute top-4 left-5 z-20 pointer-events-none flex items-center gap-3 px-3.5 py-2 rounded-lg bg-slate-950/88 border border-slate-800"
+      class="absolute top-4 left-4 z-20 flex flex-wrap items-center gap-2.5 px-3.5 py-2 rounded-xl bg-[#111318]/94 border border-white/[0.08] pointer-events-auto max-w-[calc(100vw-2rem)]"
     >
-      <h1 class="text-sm font-semibold tracking-tight text-slate-100">
-        Oficina Virtual 3D
-      </h1>
-      <span aria-hidden="true" class="text-slate-600">·</span>
-      <span class="text-xs text-slate-400">
-        {{
-          openCodeState.status === "connected"
-            ? "Híbrido OpenCode"
-            : directorState.paused
-              ? "Simulación en pausa"
-              : "Simulación autónoma"
-        }}
-      </span>
-    </div>
-
-    <!-- Acceso directo superior derecho a OpenCode CLI (siempre visible) -->
-    <div
-      v-if="isReady"
-      class="absolute top-4 right-5 z-30 flex items-center gap-2 pointer-events-auto"
-    >
-      <button
-        v-if="openCodeState.status === 'connected'"
-        type="button"
-        @click="openCommandComposer"
-        class="px-3 py-2 rounded-lg border border-sky-500/45 bg-sky-600/20 hover:bg-sky-600/30 text-xs font-medium text-sky-100 flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shadow-lg"
-      >
-        <Send class="w-3.5 h-3.5 text-sky-300" />
-        <span>Comando</span>
-      </button>
-
-      <button
-        type="button"
-        @click="toggleOpenCodePanel"
-        :class="[
-          'px-3 py-2 rounded-lg border text-xs font-medium flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap shadow-lg',
-          isOpenCodePanelOpen || openCodeState.status === 'connected'
-            ? 'bg-sky-600/25 border-sky-500/50 text-sky-100'
-            : openCodeState.status === 'error'
-              ? 'bg-rose-950/92 border-rose-500/50 text-rose-200'
-              : 'bg-slate-950/92 border-slate-700 text-slate-100 hover:bg-slate-900 hover:border-sky-500/50',
-        ]"
-      >
-        <Terminal class="w-3.5 h-3.5 text-sky-400" />
-        <span>OpenCode</span>
-        <span aria-hidden="true" class="text-slate-600">·</span>
+      <div class="flex items-center gap-2.5 pr-1">
+        <h1 class="text-[13px] font-semibold tracking-tight text-[#F3F4F6] whitespace-nowrap">
+          Oficina Virtual 3D
+        </h1>
+        <span aria-hidden="true" class="text-[#4B5563]">·</span>
         <span
           :class="[
-            'font-mono text-[11px] tabular-nums',
+            'text-xs font-medium tabular-nums whitespace-nowrap',
             openCodeState.status === 'connected'
-              ? 'text-emerald-300'
+              ? 'text-[#93A8FA]'
               : openCodeState.status === 'error'
-                ? 'text-rose-300'
-                : 'text-slate-400',
+                ? 'text-[#FB7185]'
+                : openCodeState.status === 'connecting'
+                  ? 'text-[#D97706]'
+                  : 'text-[#9CA3AF]',
           ]"
         >
           {{
             openCodeState.status === "connected"
-              ? `${openCodeState.activeAgents.length}/5 vivo`
+              ? `OpenCode ${openCodeState.activeAgents.length}/5`
               : openCodeState.status === "connecting"
                 ? "Conectando"
                 : openCodeState.status === "error"
-                  ? "Error"
-                  : "Configurar"
+                  ? "Error de enlace"
+                  : directorState.paused
+                    ? "Simulación en pausa"
+                    : "Autónoma"
           }}
         </span>
+        <span aria-hidden="true" class="text-[#4B5563]">·</span>
+        <span class="text-xs text-[#9CA3AF] whitespace-nowrap">
+          {{ openCodeState.mode === "bridge" ? "Puente" : "Directo" }}
+        </span>
+      </div>
+
+      <div class="w-px h-4 bg-white/[0.08] hidden sm:block"></div>
+
+      <!-- Selector de Iluminación -->
+      <div
+        class="flex items-center gap-0.5 p-0.5 rounded-lg bg-[#181B22] border border-white/[0.08]"
+      >
+        <button
+          type="button"
+          @click="setLightingMode('day')"
+          :class="[
+            'px-2 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap',
+            timeMode === 'day'
+              ? 'bg-[#26221A] text-[#F59E0B]'
+              : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
+          ]"
+        >
+          <Sun class="w-3.5 h-3.5" />
+          <span>Día</span>
+        </button>
+        <button
+          type="button"
+          @click="setLightingMode('night')"
+          :class="[
+            'px-2 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap',
+            timeMode === 'night'
+              ? 'bg-[#1E243B] text-[#93A8FA]'
+              : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
+          ]"
+        >
+          <Moon class="w-3.5 h-3.5" />
+          <span>Noche</span>
+        </button>
+        <button
+          type="button"
+          @click="setLightingMode('auto')"
+          :class="[
+            'px-2 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap',
+            timeMode === 'auto'
+              ? 'bg-[#232834] text-[#E5E7EB]'
+              : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
+          ]"
+        >
+          <RefreshCw class="w-3.5 h-3.5" />
+          <span>Auto</span>
+        </button>
+      </div>
+
+      <!-- Reset Cámara -->
+      <button
+        type="button"
+        @click="
+          experience?.handleStationSelect(null);
+          experience?.resetCamera();
+        "
+        class="px-2.5 py-1.5 rounded-lg bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] hover:text-[#F3F4F6] flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+      >
+        <RotateCcw class="w-3.5 h-3.5" />
+        <span>Vista General</span>
       </button>
-    </div>
+    </header>
 
-    <!-- Aviso flotante de Permisos CLI pendientes en vivo -->
+    <!-- ZONA 2: Esquina Superior Derecha (Triggers OpenCode & Tablero + Pila de Toasts) -->
     <div
-      v-if="isReady && activePermission"
-      class="absolute top-16 right-5 z-30 w-[min(420px,92vw)] rounded-xl bg-slate-950/94 border border-amber-500/45 shadow-2xl p-3.5 space-y-2.5 pointer-events-auto"
+      v-if="isReady"
+      class="absolute top-4 right-4 z-30 flex flex-col items-end gap-2.5 pointer-events-none"
     >
-      <div class="flex items-center justify-between gap-2">
-        <div class="flex items-center gap-2 text-xs font-semibold text-amber-200">
-          <ShieldAlert class="w-4 h-4 text-amber-400 shrink-0" />
-          <span>Permiso CLI pendiente</span>
-        </div>
-        <div class="flex items-center gap-2 text-[11px] text-slate-400 font-mono tabular-nums">
-          <span>{{ profileMap[activePermission.agentId]?.name || activePermission.agentId }}</span>
-          <span aria-hidden="true" class="text-slate-600">·</span>
-          <span>1 de {{ openCodeState.pendingPermissions.length }}</span>
-        </div>
-      </div>
-
-      <div class="space-y-1">
-        <div class="text-xs font-medium text-slate-100">
-          {{ activePermission.title }}
-          <span aria-hidden="true" class="text-slate-500 mx-1">·</span>
-          <span class="font-mono text-sky-300">{{ activePermission.toolName }}</span>
-        </div>
-        <div class="text-[11px] font-mono text-slate-300 bg-slate-900 border border-slate-800 rounded-md px-2.5 py-1.5 truncate">
-          {{ activePermission.targetSummary }}
-        </div>
-      </div>
-
-      <div v-if="permissionError" class="text-xs text-rose-300">
-        {{ permissionError }}
-      </div>
-
-      <div class="flex flex-wrap items-center gap-2">
+      <div class="flex items-center gap-2 pointer-events-auto">
         <button
           type="button"
-          :disabled="replyingPermissionId === activePermission.id"
-          @click="handleReplyPermission(activePermission.id, 'once')"
-          class="px-2.5 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-xs font-medium text-white transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+          @click="toggleOpenCodePanel"
+          :class="[
+            'px-3 py-2 rounded-xl border text-xs font-medium flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap',
+            isOpenCodePanelOpen || openCodeState.status === 'connected'
+              ? 'bg-[#1E243B] border-[#4F6EF7]/45 text-[#E0E7FF] hover:bg-[#252D49]'
+              : openCodeState.status === 'error'
+                ? 'bg-[#2B141C] border-[#E11D48]/45 text-[#FECDD3] hover:bg-[#381A24]'
+                : 'bg-[#111318]/94 border-white/[0.08] text-[#E5E7EB] hover:bg-[#1F232D] hover:border-[#2E3442]',
+          ]"
         >
-          Permitir una vez
+          <Terminal class="w-3.5 h-3.5 text-[#4F6EF7]" />
+          <span>OpenCode</span>
+          <span aria-hidden="true" class="text-[#4B5563]">·</span>
+          <span
+            :class="[
+              'text-[11px] tabular-nums',
+              openCodeState.status === 'connected'
+                ? 'text-[#10B981]'
+                : openCodeState.status === 'error'
+                  ? 'text-[#FB7185]'
+                  : 'text-[#9CA3AF]',
+            ]"
+          >
+            {{
+              openCodeState.status === "connected"
+                ? `${openCodeState.activeAgents.length}/5 vivo`
+                : openCodeState.status === "connecting"
+                  ? "Conectando"
+                  : openCodeState.status === "error"
+                    ? "Error"
+                    : "Configurar"
+            }}
+          </span>
+          <span
+            v-if="openCodeState.pendingPermissions.length > 0"
+            class="px-1.5 py-0.5 rounded bg-[#D97706] text-[10px] font-semibold text-[#111318] tabular-nums"
+          >
+            {{ openCodeState.pendingPermissions.length }}
+          </span>
         </button>
+
         <button
           type="button"
-          :disabled="replyingPermissionId === activePermission.id"
-          @click="handleReplyPermission(activePermission.id, 'always')"
-          class="px-2.5 py-1.5 rounded-md bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+          @click="toggleTaskBoard"
+          :class="[
+            'px-3 py-2 rounded-xl border text-xs font-medium flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap',
+            isTaskBoardOpen
+              ? 'bg-[#1E243B] border-[#4F6EF7]/45 text-[#E0E7FF]'
+              : 'bg-[#111318]/94 border-white/[0.08] text-[#E5E7EB] hover:bg-[#1F232D] hover:border-[#2E3442]',
+          ]"
         >
-          Permitir siempre
+          <ListTodo class="w-3.5 h-3.5 text-[#9CA3AF]" />
+          <span>Tablero</span>
+          <span aria-hidden="true" class="text-[#4B5563]">·</span>
+          <span class="text-[11px] text-[#9CA3AF] tabular-nums">
+            {{ tasks.length }}
+          </span>
         </button>
-        <button
-          type="button"
-          :disabled="replyingPermissionId === activePermission.id"
-          @click="handleReplyPermission(activePermission.id, 'reject')"
-          class="px-2.5 py-1.5 rounded-md bg-rose-600/20 hover:bg-rose-600/35 border border-rose-500/40 text-xs font-medium text-rose-200 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+      </div>
+
+      <!-- Pila discreta de Toasts (Permisos CLI y alertas bloqueadas question/form) -->
+      <div
+        v-if="activePermission || blockedCliAlerts.length > 0"
+        class="w-[min(390px,92vw)] flex flex-col gap-2 pointer-events-auto"
+      >
+        <!-- Toast de Permiso CLI -->
+        <div
+          v-if="activePermission"
+          class="rounded-xl bg-[#111318]/96 border border-[#D97706]/45 p-3.5 space-y-2.5"
         >
-          Rechazar
-        </button>
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2 text-xs font-semibold text-[#FBBF24]">
+              <ShieldAlert class="w-4 h-4 text-[#D97706] shrink-0" />
+              <span>Permiso CLI pendiente</span>
+            </div>
+            <div class="flex items-center gap-1.5 text-[11px] text-[#9CA3AF] tabular-nums">
+              <span>{{ profileMap[activePermission.agentId]?.name || activePermission.agentId }}</span>
+              <span aria-hidden="true" class="text-[#4B5563]">·</span>
+              <span>1 de {{ openCodeState.pendingPermissions.length }}</span>
+            </div>
+          </div>
+
+          <div class="space-y-1.5">
+            <div class="text-xs font-medium text-[#F3F4F6]">
+              {{ activePermission.title }}
+              <span aria-hidden="true" class="text-[#4B5563] mx-1">·</span>
+              <span class="text-[#93A8FA]">{{ activePermission.toolName }}</span>
+            </div>
+            <div class="text-[11px] text-[#D1D5DB] bg-[#181B22] border border-white/[0.06] rounded-lg px-2.5 py-1.5 truncate tabular-nums">
+              {{ activePermission.targetSummary }}
+            </div>
+          </div>
+
+          <div v-if="permissionError" class="text-xs text-[#FB7185]">
+            {{ permissionError }}
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              :disabled="replyingPermissionId === activePermission.id"
+              @click="handleReplyPermission(activePermission.id, 'once')"
+              class="px-2.5 py-1.5 rounded-lg bg-[#0E9F6E] hover:bg-[#10B981] text-xs font-medium text-[#F8FAFC] transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+            >
+              Permitir una vez
+            </button>
+            <button
+              type="button"
+              :disabled="replyingPermissionId === activePermission.id"
+              @click="handleReplyPermission(activePermission.id, 'always')"
+              class="px-2.5 py-1.5 rounded-lg bg-[#4F6EF7] hover:bg-[#5E7BF8] text-xs font-medium text-[#F8FAFC] transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+            >
+              Permitir siempre
+            </button>
+            <button
+              type="button"
+              :disabled="replyingPermissionId === activePermission.id"
+              @click="handleReplyPermission(activePermission.id, 'reject')"
+              class="px-2.5 py-1.5 rounded-lg bg-[#2B141C] hover:bg-[#3A1B26] border border-[#E11D48]/35 text-xs font-medium text-[#FECDD3] transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+            >
+              Rechazar
+            </button>
+          </div>
+        </div>
+
+        <!-- Toast de Sesiones bloqueadas / Esperando respuesta en CLI (question/form) -->
+        <div
+          v-for="alert in blockedCliAlerts"
+          :key="alert.id"
+          class="rounded-xl bg-[#111318]/96 border border-[#E11D48]/40 p-3 space-y-2"
+        >
+          <div class="flex items-start justify-between gap-2">
+            <div class="flex items-center gap-2 text-xs font-semibold text-[#FDA4AF]">
+              <AlertTriangle class="w-4 h-4 text-[#E11D48] shrink-0" />
+              <span>{{ alert.title }}</span>
+            </div>
+            <button
+              type="button"
+              @click="dismissBlockedAlert(alert)"
+              aria-label="Cerrar alerta"
+              class="p-0.5 rounded text-[#9CA3AF] hover:text-[#F3F4F6] hover:bg-[#1F232D] transition-colors cursor-pointer"
+            >
+              <X class="w-3.5 h-3.5" />
+            </button>
+          </div>
+          <div class="flex items-center justify-between gap-2 text-[11px] text-[#9CA3AF]">
+            <span class="truncate">
+              {{ profileMap[alert.assigneeId]?.name || alert.assigneeId }} · {{ alert.file }}
+            </span>
+            <button
+              type="button"
+              @click="openCommandComposer"
+              class="px-2 py-1 rounded-md bg-[#1F232D] hover:bg-[#282D3B] border border-white/[0.08] text-[11px] font-medium text-[#E5E7EB] transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              Ver Comando
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 
-    <!-- Dock inferior colapsable unificado -->
+    <!-- ZONA 3: Isla Inferior Compacta + Popover Contextual del Inspector -->
     <section
       v-if="isReady"
-      class="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 flex flex-col items-center w-[min(1080px,95vw)] pointer-events-none"
+      class="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 flex flex-col items-center w-auto max-w-[95vw] pointer-events-none"
     >
-      <!-- Botón de colapsar / expandir (Tecla H) -->
-      <button
-        @click="isDockCollapsed = !isDockCollapsed"
-        type="button"
-        class="pointer-events-auto mb-1.5 px-3 py-1 rounded-t-md bg-slate-950/92 border border-b-0 border-slate-800 text-[11px] font-medium text-slate-300 hover:text-white flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
-      >
-        <ChevronDown v-if="!isDockCollapsed" class="w-3.5 h-3.5" />
-        <ChevronUp v-else class="w-3.5 h-3.5" />
-        <span>{{
-          isDockCollapsed ? "Mostrar controles (H)" : "Ocultar controles (H)"
-        }}</span>
-      </button>
-
-      <!-- Cuerpo del Dock + Paneles + Inspector contextual -->
+      <!-- Inspector Compacto sobre la isla inferior al seleccionar avatar -->
       <transition
-        enter-active-class="transition duration-200 ease-out"
-        enter-from-class="opacity-0 translate-y-3"
+        enter-active-class="transition duration-150 ease-out"
+        enter-from-class="opacity-0 translate-y-2"
         enter-to-class="opacity-100 translate-y-0"
-        leave-active-class="transition duration-150 ease-in"
+        leave-active-class="transition duration-120 ease-in"
         leave-from-class="opacity-100 translate-y-0"
-        leave-to-class="opacity-0 translate-y-3"
+        leave-to-class="opacity-0 translate-y-2"
       >
         <div
-          v-show="!isDockCollapsed"
-          class="pointer-events-auto w-full rounded-xl bg-slate-950/94 border border-slate-800 shadow-2xl overflow-hidden"
+          v-if="selectedSnapshot && !isDockCollapsed"
+          class="pointer-events-auto mb-2.5 w-[min(780px,94vw)] rounded-xl bg-[#111318]/96 border border-white/[0.08] p-3.5 space-y-3"
         >
-          <!-- Panel Conexión y Configuración OpenCode -->
-          <div
-            v-if="isOpenCodePanelOpen"
-            class="px-5 py-4 border-b border-slate-800 bg-slate-900/80 max-h-[50vh] overflow-y-auto"
-          >
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <div class="flex items-center gap-2.5 text-sm font-semibold text-slate-100">
-                <Terminal class="w-4 h-4 text-sky-400" />
-                <span>Conexión OpenCode CLI</span>
-                <span aria-hidden="true" class="text-slate-600">·</span>
-                <span
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="flex items-center gap-2.5 min-w-0">
+              <span
+                class="w-3 h-3 rounded-[3px] shrink-0"
+                :style="{ backgroundColor: selectedSnapshot.color }"
+              ></span>
+              <div class="min-w-0">
+                <div class="flex items-center gap-2 text-xs font-semibold text-[#F3F4F6]">
+                  <span class="truncate">{{ selectedSnapshot.name }}</span>
+                  <span aria-hidden="true" class="text-[#4B5563]">·</span>
+                  <span class="font-normal text-[#9CA3AF] truncate">
+                    {{ selectedSnapshot.role }}
+                  </span>
+                </div>
+                <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-0.5 text-[11px] text-[#9CA3AF] tabular-nums">
+                  <span class="text-[#E5E7EB]">{{ selectedSnapshot.state }}</span>
+                  <span aria-hidden="true" class="text-[#4B5563]">·</span>
+                  <span>Zona: {{ selectedSnapshot.zone }}</span>
+                  <span aria-hidden="true" class="text-[#4B5563]">·</span>
+                  <span>Clip: {{ selectedSnapshot.animation }}</span>
+                  <span aria-hidden="true" class="text-[#4B5563]">·</span>
+                  <span>Prop: {{ selectedSnapshot.prop }}</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-1.5 shrink-0">
+              <div
+                class="flex items-center gap-0.5 p-0.5 rounded-lg bg-[#181B22] border border-white/[0.08]"
+              >
+                <button
+                  type="button"
+                  @click="activeInspectorTab = 'routes'"
                   :class="[
-                    'text-xs font-normal',
-                    openCodeState.status === 'connected'
-                      ? 'text-emerald-300'
-                      : openCodeState.status === 'error'
-                        ? 'text-rose-300'
-                        : openCodeState.status === 'connecting'
-                          ? 'text-amber-300'
-                          : 'text-slate-400',
+                    'px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
+                    activeInspectorTab === 'routes'
+                      ? 'bg-[#252A36] text-[#F3F4F6]'
+                      : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
                   ]"
                 >
-                  {{
-                    openCodeState.status === "connected"
-                      ? "Conectado (stream SSE activo)"
-                      : openCodeState.status === "connecting"
-                        ? "Conectando..."
-                        : openCodeState.status === "error"
-                          ? "Error de enlace"
-                          : "Desconectado"
-                  }}
-                </span>
-              </div>
-
-              <div class="flex items-center gap-2">
-                <div
-                  class="flex items-center gap-1 p-0.5 rounded-md bg-slate-950 border border-slate-800"
-                >
-                  <button
-                    type="button"
-                    @click="openCodeTab = 'connection'"
-                    :class="[
-                      'px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
-                      openCodeTab === 'connection'
-                        ? 'bg-slate-800 text-white'
-                        : 'text-slate-400 hover:text-slate-200',
-                    ]"
-                  >
-                    Conexión
-                  </button>
-                  <button
-                    type="button"
-                    @click="openCodeTab = 'command'"
-                    :class="[
-                      'px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
-                      openCodeTab === 'command'
-                        ? 'bg-slate-800 text-white'
-                        : 'text-slate-400 hover:text-slate-200',
-                    ]"
-                  >
-                    Comando
-                  </button>
-                  <button
-                    type="button"
-                    @click="openCodeTab = 'mapping'"
-                    :class="[
-                      'px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
-                      openCodeTab === 'mapping'
-                        ? 'bg-slate-800 text-white'
-                        : 'text-slate-400 hover:text-slate-200',
-                    ]"
-                  >
-                    Mapeo (5 Agentes)
-                  </button>
-                  <button
-                    type="button"
-                    @click="openCodeTab = 'guide'"
-                    :class="[
-                      'px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
-                      openCodeTab === 'guide'
-                        ? 'bg-slate-800 text-white'
-                        : 'text-slate-400 hover:text-slate-200',
-                    ]"
-                  >
-                    Guía y Config
-                  </button>
-                </div>
-
-                <button
-                  type="button"
-                  @click="isOpenCodePanelOpen = false"
-                  aria-label="Cerrar panel OpenCode"
-                  class="p-1.5 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
-                >
-                  <X class="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-
-            <!-- Pestaña 1: Conexión SSE + Puente -->
-            <div v-if="openCodeTab === 'connection'" class="mt-3 space-y-3">
-              <div class="grid grid-cols-1 md:grid-cols-12 gap-2.5 items-end">
-                <div class="md:col-span-3 flex flex-col gap-1">
-                  <span class="text-[11px] text-slate-400">Modo de enlace</span>
-                  <div
-                    class="flex items-center gap-1 p-0.5 rounded-md bg-slate-950 border border-slate-800"
-                  >
-                    <button
-                      type="button"
-                      @click="openCodeForm.mode = 'direct'"
-                      :class="[
-                        'flex-1 px-2 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
-                        openCodeForm.mode === 'direct'
-                          ? 'bg-slate-800 text-white'
-                          : 'text-slate-400 hover:text-slate-200',
-                      ]"
-                    >
-                      Directo :4096
-                    </button>
-                    <button
-                      type="button"
-                      @click="openCodeForm.mode = 'bridge'"
-                      :class="[
-                        'flex-1 px-2 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
-                        openCodeForm.mode === 'bridge'
-                          ? 'bg-slate-800 text-white'
-                          : 'text-slate-400 hover:text-slate-200',
-                      ]"
-                    >
-                      Puente :4097
-                    </button>
-                  </div>
-                </div>
-
-                <label class="md:col-span-4 flex flex-col gap-1 text-[11px] text-slate-400">
-                  <span>{{
-                    openCodeForm.mode === "bridge"
-                      ? "URL del Puente Local"
-                      : "URL de opencode serve"
-                  }}</span>
-                  <input
-                    v-if="openCodeForm.mode === 'direct'"
-                    v-model="openCodeForm.directUrl"
-                    type="text"
-                    placeholder="http://127.0.0.1:4096"
-                    class="px-2.5 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100 focus:outline-none focus:border-sky-500"
-                  />
-                  <input
-                    v-else
-                    v-model="openCodeForm.bridgeUrl"
-                    type="text"
-                    placeholder="http://127.0.0.1:4097"
-                    class="px-2.5 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100 focus:outline-none focus:border-sky-500"
-                  />
-                </label>
-
-                <label class="md:col-span-2 flex flex-col gap-1 text-[11px] text-slate-400">
-                  <span>Usuario (opcional)</span>
-                  <input
-                    v-model="openCodeForm.username"
-                    type="text"
-                    placeholder="opencode"
-                    class="px-2.5 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs text-slate-100 focus:outline-none focus:border-sky-500"
-                  />
-                </label>
-
-                <label class="md:col-span-2 flex flex-col gap-1 text-[11px] text-slate-400">
-                  <span>Clave (opcional)</span>
-                  <input
-                    v-model="openCodeForm.password"
-                    type="password"
-                    placeholder="••••••"
-                    class="px-2.5 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs text-slate-100 focus:outline-none focus:border-sky-500"
-                  />
-                </label>
-
-                <label class="md:col-span-1 flex flex-col gap-1 text-[11px] text-slate-400">
-                  <span>Cooldown</span>
-                  <input
-                    v-model.number="openCodeForm.idleCooldownSec"
-                    type="number"
-                    min="5"
-                    max="60"
-                    class="px-2 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs font-mono tabular-nums text-slate-100 focus:outline-none focus:border-sky-500"
-                  />
-                </label>
-              </div>
-
-              <div class="flex flex-wrap items-center justify-between gap-3">
-                <div class="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    @click="handleToggleOpenCodeConnection"
-                    :class="[
-                      'px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0',
-                      openCodeState.status === 'connected' ||
-                      openCodeState.status === 'connecting'
-                        ? 'bg-rose-600/25 hover:bg-rose-600/35 border border-rose-500/40 text-rose-200'
-                        : 'bg-sky-600 hover:bg-sky-500 text-white',
-                    ]"
-                  >
-                    <Plug class="w-3.5 h-3.5" />
-                    <span>{{
-                      openCodeState.status === "connected" ||
-                      openCodeState.status === "connecting"
-                        ? "Desconectar"
-                        : "Conectar"
-                    }}</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    @click="handleTestOpenCodeConnection"
-                    :disabled="isTestingConnection"
-                    class="px-2.5 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
-                  >
-                    {{ isTestingConnection ? "Probando..." : "Probar conexión" }}
-                  </button>
-
-                  <button
-                    type="button"
-                    @click="saveOpenCodeConfig"
-                    class="px-2.5 py-1.5 rounded-md bg-slate-800/80 hover:bg-slate-700 border border-slate-700/70 text-xs font-medium text-slate-300 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    Guardar ajuste
-                  </button>
-                </div>
-
-                <div
-                  class="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-400 font-mono tabular-nums"
-                >
-                  <span>Eventos: {{ openCodeState.eventsReceived }}</span>
-                  <span aria-hidden="true" class="text-slate-600">·</span>
-                  <span>Sesiones: {{ openCodeState.sessionsCount }}</span>
-                  <span aria-hidden="true" class="text-slate-600">·</span>
-                  <span>En vivo: {{ openCodeState.activeAgents.length }}/5</span>
-                </div>
-              </div>
-
-              <div
-                v-if="testResult || openCodeState.lastError"
-                class="rounded-md bg-slate-950/90 border border-slate-800 px-3 py-2 text-xs flex flex-wrap items-center justify-between gap-2"
-              >
-                <span
-                  v-if="testResult"
-                  :class="testResult.ok ? 'text-emerald-300' : 'text-rose-300'"
-                >
-                  {{
-                    testResult.ok
-                      ? `Servidor accesible (${testResult.latencyMs} ms · ${testResult.sessionsCount} sesiones detectadas)`
-                      : `Diagnóstico: ${testResult.error}`
-                  }}
-                </span>
-                <span v-if="openCodeState.lastError" class="text-rose-300">
-                  {{ openCodeState.lastError }}
-                </span>
-              </div>
-            </div>
-
-            <!-- Pestaña 2: Comando Bidireccional (Prompts + Sesiones + Interrupt) -->
-            <div v-else-if="openCodeTab === 'command'" class="mt-3 space-y-3">
-              <div
-                v-if="openCodeState.status !== 'connected'"
-                class="rounded-md bg-slate-950/90 border border-slate-800 px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-300"
-              >
-                <span>Conecta primero con OpenCode para enviar instrucciones y crear sesiones.</span>
-                <button
-                  type="button"
-                  @click="openCodeTab = 'connection'"
-                  class="px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white cursor-pointer whitespace-nowrap"
-                >
-                  Ir a Conexión
-                </button>
-              </div>
-
-              <form
-                v-else
-                @submit.prevent="handleSendOpenCodePrompt"
-                class="space-y-2.5"
-              >
-                <div class="grid grid-cols-1 md:grid-cols-12 gap-2 items-end">
-                  <label class="md:col-span-5 flex flex-col gap-1 text-[11px] text-slate-400">
-                    <span>Sesión OpenCode</span>
-                    <div class="flex items-center gap-1.5">
-                      <select
-                        v-model="commandForm.sessionId"
-                        class="flex-1 min-w-0 px-2.5 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100 focus:outline-none focus:border-sky-500"
-                      >
-                        <option value="">Auto (crear nueva al enviar)</option>
-                        <option
-                          v-for="sess in openCodeState.sessions"
-                          :key="sess.id"
-                          :value="sess.id"
-                        >
-                          {{
-                            sess.title
-                              ? `${sess.title.slice(0, 26)} (${sess.id.slice(0, 10)})`
-                              : sess.id
-                          }}
-                        </option>
-                      </select>
-                      <button
-                        type="button"
-                        :disabled="isCreatingSession"
-                        @click="handleCreateOpenCodeSession"
-                        class="px-2.5 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
-                      >
-                        <Plus class="w-3.5 h-3.5" />
-                        <span>{{ isCreatingSession ? "Creando..." : "Nueva sesión" }}</span>
-                      </button>
-                    </div>
-                  </label>
-
-                  <label class="md:col-span-4 flex flex-col gap-1 text-[11px] text-slate-400">
-                    <span>Agente destinatario</span>
-                    <select
-                      v-model="commandForm.agent"
-                      class="px-2.5 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs text-slate-100 focus:outline-none focus:border-sky-500"
-                    >
-                      <option
-                        v-for="ag in agentList"
-                        :key="ag.id"
-                        :value="ag.id"
-                      >
-                        {{ ag.name }} ({{ ag.id }})
-                      </option>
-                    </select>
-                  </label>
-
-                  <div class="md:col-span-3 flex items-center justify-end gap-2">
-                    <button
-                      type="button"
-                      :disabled="isInterrupting || !(commandForm.sessionId || openCodeState.activeSessionId)"
-                      @click="handleInterruptOpenCode"
-                      class="px-3 py-1.5 rounded-md bg-rose-600/20 hover:bg-rose-600/35 border border-rose-500/40 text-xs font-medium text-rose-200 flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-45"
-                    >
-                      <Square class="w-3 h-3 fill-current" />
-                      <span>{{ isInterrupting ? "Deteniendo..." : "Detener" }}</span>
-                    </button>
-                  </div>
-                </div>
-
-                <div class="flex flex-col sm:flex-row items-stretch sm:items-end gap-2">
-                  <textarea
-                    v-model="commandForm.prompt"
-                    rows="2"
-                    @keydown.ctrl.enter.prevent="handleSendOpenCodePrompt"
-                    @keydown.meta.enter.prevent="handleSendOpenCodePrompt"
-                    placeholder="Escribe una instrucción para OpenCode (Ctrl+Enter para enviar)..."
-                    class="flex-1 px-3 py-2 rounded-md bg-slate-950 border border-slate-800 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-500 resize-none"
-                  ></textarea>
-
-                  <button
-                    type="submit"
-                    :disabled="isSendingPrompt || !commandForm.prompt.trim()"
-                    class="px-4 py-2 rounded-md bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
-                  >
-                    <Send class="w-3.5 h-3.5" />
-                    <span>{{ isSendingPrompt ? "Enviando..." : "Enviar" }}</span>
-                  </button>
-                </div>
-
-                <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
-                  <span
-                    v-if="commandFeedback"
-                    :class="commandFeedback.ok ? 'text-emerald-300' : 'text-rose-300'"
-                  >
-                    {{ commandFeedback.text }}
-                  </span>
-                  <span v-else class="text-slate-400">
-                    Las subtareas y herramientas aparecerán en los escritorios 3D y en el Tablero Kanban.
-                  </span>
-                  <span class="text-[11px] font-mono text-slate-500">
-                    Rutas: {{ openCodeState.capabilities?.discoveredFrom || "v2" }}
-                  </span>
-                </div>
-              </form>
-
-              <!-- Bitácora / Consola de salida en vivo por sesión -->
-              <div
-                v-if="openCodeState.status === 'connected'"
-                class="pt-2.5 border-t border-slate-800/80 space-y-2"
-              >
-                <div class="flex flex-wrap items-center justify-between gap-2">
-                  <div class="flex items-center gap-2 text-xs text-slate-300">
-                    <Terminal class="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                    <span class="font-medium text-slate-200">Bitácora en vivo</span>
-                    <span aria-hidden="true" class="text-slate-600">·</span>
-                    <span class="font-mono text-[11px] text-slate-400 tabular-nums">
-                      {{ sessionLogEntries.length }} eventos
-                    </span>
-                    <template v-if="activeLogSessionId">
-                      <span aria-hidden="true" class="text-slate-600">·</span>
-                      <span class="font-mono text-[11px] text-slate-500 truncate max-w-[140px]">
-                        {{ activeLogSessionId.slice(0, 14) }}
-                      </span>
-                    </template>
-                  </div>
-
-                  <button
-                    type="button"
-                    :disabled="sessionLogEntries.length === 0"
-                    @click="handleClearSessionLog"
-                    class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[11px] font-medium text-slate-300 flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-40"
-                  >
-                    <Trash2 class="w-3 h-3" />
-                    <span>Limpiar</span>
-                  </button>
-                </div>
-
-                <div
-                  ref="logContainerRef"
-                  class="max-h-56 overflow-y-auto rounded-lg bg-slate-950 border border-slate-800 p-2.5 space-y-1.5"
-                >
-                  <div
-                    v-if="sessionLogEntries.length === 0"
-                    class="py-4 text-center text-xs text-slate-500"
-                  >
-                    Sin actividad en esta sesión todavía. Envía una instrucción para ver el razonamiento plegable, herramientas y respuesta final en tiempo real.
-                  </div>
-
-                  <template v-for="entry in sessionLogEntries" :key="entry.id">
-                    <!-- Prompt enviado por el usuario -->
-                    <div
-                      v-if="entry.kind === 'prompt'"
-                      class="rounded-md bg-slate-900/90 border border-slate-800 px-2.5 py-1.5 space-y-0.5"
-                    >
-                      <div class="flex items-center justify-between gap-2 text-[11px] text-slate-400">
-                        <span class="font-medium text-sky-300">
-                          Tú · @{{ entry.agentId }}
-                        </span>
-                      </div>
-                      <div class="text-xs text-slate-100 whitespace-pre-wrap select-text">
-                        {{ entry.content }}
-                      </div>
-                    </div>
-
-                    <!-- Razonamiento plegable -->
-                    <details
-                      v-else-if="entry.kind === 'reasoning'"
-                      class="rounded-md bg-slate-900/65 border border-slate-800/90"
-                    >
-                      <summary class="flex items-center justify-between gap-2 px-2.5 py-1.5 cursor-pointer text-[11px] text-sky-300 select-none">
-                        <span class="flex items-center gap-1.5 min-w-0 truncate">
-                          <span class="font-medium">Razonamiento</span>
-                          <span aria-hidden="true" class="text-slate-600">·</span>
-                          <span class="text-slate-300">
-                            {{ profileMap[entry.agentId]?.name || entry.agentId }}
-                          </span>
-                          <span aria-hidden="true" class="text-slate-600">·</span>
-                          <span :class="entry.status === 'running' ? 'text-sky-300' : 'text-slate-400'">
-                            {{ entry.status === "running" ? "Pensando..." : "Completado" }}
-                          </span>
-                        </span>
-                        <span class="font-mono text-[10px] text-slate-500 tabular-nums shrink-0">
-                          {{ entry.content.length }} chars
-                        </span>
-                      </summary>
-                      <div class="px-2.5 pb-2 pt-1.5 text-[11px] text-slate-300 whitespace-pre-wrap leading-relaxed border-t border-slate-800/70 max-h-40 overflow-y-auto select-text">
-                        {{ entry.content || "Analizando problema..." }}
-                      </div>
-                    </details>
-
-                    <!-- Línea compacta por herramienta -->
-                    <div
-                      v-else-if="entry.kind === 'tool'"
-                      class="flex items-center justify-between gap-2 px-2.5 py-1 rounded bg-slate-900/45 text-[11px] font-mono"
-                    >
-                      <div class="flex items-center gap-1.5 min-w-0 truncate">
-                        <span
-                          :class="[
-                            'shrink-0 font-bold',
-                            entry.status === 'done'
-                              ? 'text-emerald-400'
-                              : entry.status === 'error'
-                                ? 'text-rose-400'
-                                : 'text-sky-400',
-                          ]"
-                        >
-                          {{
-                            entry.status === "done"
-                              ? "✓"
-                              : entry.status === "error"
-                                ? "✕"
-                                : "…"
-                          }}
-                        </span>
-                        <span class="text-slate-200 shrink-0">{{ entry.toolName }}</span>
-                        <span
-                          v-if="entry.target"
-                          class="text-slate-400 truncate"
-                        >
-                          · {{ entry.target }}
-                        </span>
-                      </div>
-                      <span class="text-[10px] text-slate-500 shrink-0">
-                        {{ profileMap[entry.agentId]?.name || entry.agentId }}
-                      </span>
-                    </div>
-
-                    <!-- Texto en streaming / respuesta final -->
-                    <div
-                      v-else-if="entry.kind === 'text'"
-                      class="rounded-md bg-slate-900/60 border border-slate-800/80 px-2.5 py-2 space-y-1"
-                    >
-                      <div class="flex items-center justify-between gap-2 text-[11px]">
-                        <div class="flex items-center gap-1.5 text-slate-300 font-medium">
-                          <span
-                            class="w-2 h-2 rounded-xs shrink-0"
-                            :style="{
-                              backgroundColor:
-                                profileMap[entry.agentId]?.color || '#38BDF8',
-                            }"
-                          ></span>
-                          <span>{{ profileMap[entry.agentId]?.name || entry.agentId }}</span>
-                          <span aria-hidden="true" class="text-slate-600">·</span>
-                          <span :class="entry.status === 'running' ? 'text-sky-300' : 'text-emerald-300'">
-                            {{ entry.status === "running" ? "Escribiendo..." : "Respuesta" }}
-                          </span>
-                        </div>
-                      </div>
-                      <div class="text-xs text-slate-100 whitespace-pre-wrap leading-relaxed select-text">
-                        {{ entry.content }}
-                      </div>
-                    </div>
-
-                    <!-- Error de sesión -->
-                    <div
-                      v-else
-                      class="rounded-md bg-rose-950/60 border border-rose-500/35 px-2.5 py-1.5 text-xs text-rose-200 select-text"
-                    >
-                      {{ entry.content }}
-                    </div>
-                  </template>
-                </div>
-              </div>
-            </div>
-
-            <!-- Pestaña 3: Mapeo de los 5 Agentes -->
-            <div v-else-if="openCodeTab === 'mapping'" class="mt-3 space-y-2.5">
-              <div class="grid grid-cols-1 md:grid-cols-5 gap-2">
-                <div
-                  v-for="ag in agentList"
-                  :key="ag.id"
-                  class="rounded-md bg-slate-950/80 border border-slate-800 p-2.5 space-y-1.5"
-                >
-                  <div class="flex items-center justify-between gap-1.5">
-                    <div class="flex items-center gap-1.5 min-w-0">
-                      <span
-                        class="w-2.5 h-2.5 rounded-sm shrink-0"
-                        :style="{ backgroundColor: ag.color }"
-                      ></span>
-                      <span class="text-xs font-semibold text-slate-100 truncate">
-                        {{ ag.name }}
-                      </span>
-                    </div>
-                    <span
-                      :class="[
-                        'text-[10px] font-mono shrink-0',
-                        openCodeState.activeAgents.includes(ag.id)
-                          ? 'text-emerald-300'
-                          : 'text-slate-500',
-                      ]"
-                    >
-                      {{
-                        openCodeState.activeAgents.includes(ag.id)
-                          ? "En vivo"
-                          : "Autónomo"
-                      }}
-                    </span>
-                  </div>
-                  <div class="text-[11px] font-mono text-slate-500">
-                    ID: {{ ag.id }}
-                  </div>
-                  <input
-                    v-model="aliasDraft[ag.id]"
-                    type="text"
-                    placeholder="alias1, alias2"
-                    class="w-full px-2 py-1 rounded bg-slate-900 border border-slate-800 text-[11px] font-mono text-slate-200 focus:outline-none focus:border-sky-500"
-                  />
-                </div>
-              </div>
-
-              <div class="flex items-center justify-between gap-3">
-                <span class="text-xs text-slate-400">
-                  Resuelve eventos por <code class="text-slate-200">part.agent</code>, subagentes <code class="text-slate-200">task</code>, sesión hija <code class="text-slate-200">parentID</code> o alias separados por coma.
-                </span>
-                <div class="flex items-center gap-2 shrink-0">
-                  <button
-                    type="button"
-                    @click="handleSaveAliases"
-                    class="px-3 py-1.5 rounded-md bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white transition-colors cursor-pointer whitespace-nowrap"
-                  >
-                    Guardar alias
-                  </button>
-                  <button
-                    type="button"
-                    @click="handleResetAliases"
-                    class="px-2.5 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-300 transition-colors cursor-pointer whitespace-nowrap"
-                  >
-                    Restaurar
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <!-- Pestaña 3: Guía Paso a Paso y Plantilla opencode.json -->
-            <div v-else class="mt-3 grid grid-cols-1 lg:grid-cols-12 gap-3">
-              <div class="lg:col-span-6 space-y-2 text-xs text-slate-300">
-                <p class="font-semibold text-slate-100">
-                  Cómo conectar tu OpenCode paso a paso:
-                </p>
-                <ol class="space-y-1.5 list-decimal list-inside text-slate-300">
-                  <li>
-                    Copia el bloque <code class="text-sky-300">opencode.json</code> de la derecha en la raíz de tu proyecto o en <code class="text-slate-200">~/.config/opencode/opencode.json</code>.
-                  </li>
-                  <li>
-                    Inicia el servidor local de OpenCode con CORS habilitado (o ejecuta el puente si accedes desde otro dominio).
-                  </li>
-                  <li>
-                    Abre tu TUI conectado con <code class="text-sky-300">opencode attach</code> y usa <code class="text-slate-200">architect</code> para delegar en <code class="text-slate-200">@frontend</code>, <code class="text-slate-200">@backend</code>, <code class="text-slate-200">@qa</code> o <code class="text-slate-200">@systems</code>.
-                  </li>
-                  <li>
-                    Pulsa <strong>Conectar</strong> en la pestaña Conexión; cada agente activo irá a su escritorio y los demás seguirán descansando.
-                  </li>
-                </ol>
-
-                <div class="space-y-1.5 pt-1">
-                  <div class="flex items-center justify-between gap-2 rounded bg-slate-950 border border-slate-800 px-2.5 py-1.5">
-                    <code class="text-[11px] font-mono text-sky-300 truncate">
-                      {{ OPENCODE_CLI_COMMANDS.serveDirect }}
-                    </code>
-                    <button
-                      type="button"
-                      @click="copySnippet('serve', OPENCODE_CLI_COMMANDS.serveDirect)"
-                      class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-200 flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <Check v-if="copiedKey === 'serve'" class="w-3 h-3 text-emerald-400" />
-                      <Copy v-else class="w-3 h-3" />
-                      <span>{{ copiedKey === "serve" ? "Copiado" : "Copiar" }}</span>
-                    </button>
-                  </div>
-
-                  <div class="flex items-center justify-between gap-2 rounded bg-slate-950 border border-slate-800 px-2.5 py-1.5">
-                    <code class="text-[11px] font-mono text-slate-300 truncate">
-                      {{ OPENCODE_CLI_COMMANDS.runBridge }} · {{ OPENCODE_CLI_COMMANDS.attachTui }}
-                    </code>
-                    <button
-                      type="button"
-                      @click="copySnippet('bridge', OPENCODE_CLI_COMMANDS.runBridge)"
-                      class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-200 flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <Check v-if="copiedKey === 'bridge'" class="w-3 h-3 text-emerald-400" />
-                      <Copy v-else class="w-3 h-3" />
-                      <span>{{ copiedKey === "bridge" ? "Copiado" : "Puente" }}</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div class="lg:col-span-6 flex flex-col gap-1.5">
-                <div class="flex flex-wrap items-center justify-between gap-2">
-                  <span class="text-xs font-medium text-slate-300">
-                    Plantilla <code class="text-sky-300">opencode.json</code> (5 agentes)
-                  </span>
-                  <div class="flex flex-wrap items-center gap-1.5">
-                    <button
-                      type="button"
-                      @click="downloadOpenCodeReport"
-                      class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <Download class="w-3.5 h-3.5" />
-                      <span>Descargar guía (.md)</span>
-                    </button>
-                    <button
-                      type="button"
-                      @click="downloadOpenCodeJson"
-                      class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <Download class="w-3.5 h-3.5" />
-                      <span>Descargar .json</span>
-                    </button>
-                    <button
-                      type="button"
-                      @click="copySnippet('json', OPENCODE_JSON_SNIPPET)"
-                      class="px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <Check v-if="copiedKey === 'json'" class="w-3.5 h-3.5" />
-                      <Copy v-else class="w-3.5 h-3.5" />
-                      <span>{{ copiedKey === "json" ? "JSON copiado" : "Copiar JSON" }}</span>
-                    </button>
-                  </div>
-                </div>
-                <pre
-                  class="rounded-md bg-slate-950 border border-slate-800 p-2.5 text-[11px] font-mono text-slate-300 overflow-auto max-h-44 leading-relaxed select-text"
-                >{{ OPENCODE_JSON_SNIPPET }}</pre>
-              </div>
-            </div>
-          </div>
-
-          <!-- Panel Tablero de Tareas (Sprint) conectado a 3D -->
-          <div
-            v-if="isTaskBoardOpen"
-            class="px-5 py-4 border-b border-slate-800 bg-slate-900/75 max-h-[38vh] overflow-y-auto"
-          >
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <div class="flex items-center gap-2.5 text-sm font-semibold text-slate-100">
-                <ListTodo class="w-4 h-4 text-sky-400" />
-                <span>Tablero de Tareas (Sprint)</span>
-                <span aria-hidden="true" class="text-slate-600">·</span>
-                <span class="text-xs font-normal text-slate-400 tabular-nums">
-                  {{ tasks.length }} tareas
-                </span>
-              </div>
-
-              <div class="flex flex-wrap items-center gap-2">
-                <!-- Filtro rápido de origen -->
-                <div
-                  class="flex items-center gap-1 p-0.5 rounded-md bg-slate-950 border border-slate-800"
-                >
-                  <button
-                    type="button"
-                    @click="taskSourceFilter = 'all'"
-                    :class="[
-                      'px-2 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
-                      taskSourceFilter === 'all'
-                        ? 'bg-slate-800 text-white'
-                        : 'text-slate-400 hover:text-slate-200',
-                    ]"
-                  >
-                    Todas
-                  </button>
-                  <button
-                    type="button"
-                    @click="taskSourceFilter = 'opencode'"
-                    :class="[
-                      'px-2 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
-                      taskSourceFilter === 'opencode'
-                        ? 'bg-slate-800 text-sky-300'
-                        : 'text-slate-400 hover:text-slate-200',
-                    ]"
-                  >
-                    OpenCode
-                  </button>
-                  <button
-                    type="button"
-                    @click="taskSourceFilter = 'manual'"
-                    :class="[
-                      'px-2 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
-                      taskSourceFilter === 'manual'
-                        ? 'bg-slate-800 text-white'
-                        : 'text-slate-400 hover:text-slate-200',
-                    ]"
-                  >
-                    Manuales
-                  </button>
-                </div>
-
-                <button
-                  type="button"
-                  :disabled="demoTasksCount === 0"
-                  @click="handleClearDemoTasks"
-                  class="px-2.5 py-1 rounded-md bg-slate-800/80 hover:bg-slate-700 border border-slate-700/70 text-xs font-medium text-slate-300 transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-40"
-                >
-                  Limpiar demo
+                  Recorridos
                 </button>
                 <button
                   type="button"
-                  @click="taskBoardManager.clearDoneTasks()"
-                  class="px-2.5 py-1 rounded-md bg-slate-800/80 hover:bg-slate-700 border border-slate-700/70 text-xs font-medium text-slate-300 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  @click="activeInspectorTab = 'animations'"
+                  :class="[
+                    'px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
+                    activeInspectorTab === 'animations'
+                      ? 'bg-[#252A36] text-[#F3F4F6]'
+                      : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
+                  ]"
                 >
-                  Limpiar completadas
+                  Animaciones y Props
                 </button>
                 <button
                   type="button"
-                  @click="taskBoardManager.resetTasks()"
-                  class="px-2.5 py-1 rounded-md bg-slate-800/80 hover:bg-slate-700 border border-slate-700/70 text-xs font-medium text-slate-300 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  @click="activeInspectorTab = 'events'"
+                  :class="[
+                    'px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap flex items-center gap-1',
+                    activeInspectorTab === 'events'
+                      ? 'bg-[#252A36] text-[#F3F4F6]'
+                      : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
+                  ]"
                 >
-                  Restaurar demo
+                  <Radio class="w-3 h-3" />
+                  <span>Event Bus</span>
                 </button>
                 <button
                   type="button"
-                  @click="isTaskBoardOpen = false"
-                  aria-label="Cerrar tablero"
-                  class="p-1.5 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+                  @click="activeInspectorTab = 'profile'"
+                  :class="[
+                    'px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap flex items-center gap-1',
+                    activeInspectorTab === 'profile'
+                      ? 'bg-[#252A36] text-[#F3F4F6]'
+                      : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
+                  ]"
                 >
-                  <X class="w-4 h-4" />
+                  <UserCog class="w-3 h-3" />
+                  <span>Perfil</span>
                 </button>
               </div>
-            </div>
 
-            <!-- Alta rápida de tarea -->
-            <form
-              @submit.prevent="handleCreateTask"
-              class="mt-3 grid grid-cols-1 sm:grid-cols-12 gap-2"
-            >
-              <input
-                v-model="newTask.title"
-                type="text"
-                maxlength="48"
-                placeholder="Nueva tarea (ej. Optimizar sombras PBR)"
-                class="sm:col-span-4 px-2.5 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-500"
-              />
-              <input
-                v-model="newTask.file"
-                type="text"
-                maxlength="42"
-                placeholder="Archivo (ej. src/webgl/World.js)"
-                class="sm:col-span-3 px-2.5 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs font-mono text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-sky-500"
-              />
-              <select
-                v-model="newTask.assigneeId"
-                class="sm:col-span-2 px-2 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
-              >
-                <option
-                  v-for="ag in agentList"
-                  :key="ag.id"
-                  :value="ag.id"
-                >
-                  {{ ag.name }}
-                </option>
-              </select>
-              <select
-                v-model="newTask.status"
-                class="sm:col-span-2 px-2 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
-              >
-                <option
-                  v-for="col in TASK_COLUMNS"
-                  :key="col.id"
-                  :value="col.id"
-                >
-                  {{ col.label }}
-                </option>
-              </select>
               <button
-                type="submit"
-                class="sm:col-span-1 px-2.5 py-1.5 rounded-md bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white flex items-center justify-center gap-1 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                type="button"
+                @click="experience?.focusAgent(selectedSnapshot.id)"
+                class="px-2.5 py-1.5 rounded-lg bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] hover:text-[#F3F4F6] flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap"
               >
-                <Plus class="w-3.5 h-3.5" />
-                <span>Crear</span>
+                <Crosshair class="w-3.5 h-3.5" />
+                <span>Enfocar</span>
               </button>
-            </form>
 
-            <!-- Columnas Kanban -->
-            <div class="mt-3 grid grid-cols-1 md:grid-cols-5 gap-2.5">
-              <div
-                v-for="col in TASK_COLUMNS"
-                :key="col.id"
-                class="rounded-lg bg-slate-950/75 border border-slate-800/90 p-2.5 flex flex-col gap-2"
+              <button
+                type="button"
+                @click="experience?.handleStationSelect(null)"
+                aria-label="Cerrar inspector"
+                class="p-1.5 rounded-lg bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-[#9CA3AF] hover:text-[#F3F4F6] transition-colors cursor-pointer"
               >
-                <div class="flex items-center justify-between text-xs font-semibold">
-                  <span :class="col.accent">{{ col.label }}</span>
-                  <span class="font-mono text-slate-500 tabular-nums">
-                    {{ taskCountByStatus[col.id] }}
-                  </span>
-                </div>
-
-                <div class="space-y-1.5">
-                  <div
-                    v-for="task in filteredTasks.filter((t) => t.status === col.id)"
-                    :key="task.id"
-                    class="rounded-md bg-slate-900 border border-slate-800 p-2 space-y-1.5"
-                  >
-                    <div class="flex items-start justify-between gap-1.5">
-                      <p class="text-xs font-medium text-slate-100 leading-snug">
-                        {{ task.title }}
-                      </p>
-                      <button
-                        type="button"
-                        @click="handleDeleteTask(task.id)"
-                        aria-label="Eliminar tarea"
-                        class="text-slate-500 hover:text-rose-400 transition-colors cursor-pointer shrink-0"
-                      >
-                        <Trash2 class="w-3 h-3" />
-                      </button>
-                    </div>
-                    <div class="text-[11px] font-mono text-slate-400 truncate">
-                      {{ task.file }}
-                    </div>
-                    <div class="flex items-center justify-between gap-1.5 pt-0.5">
-                      <button
-                        type="button"
-                        @click="selectAgentFromDock(task.assigneeId)"
-                        class="flex items-center gap-1.5 text-[11px] text-slate-300 hover:text-white cursor-pointer truncate"
-                      >
-                        <span
-                          class="w-2 h-2 rounded-sm shrink-0"
-                          :style="{
-                            backgroundColor:
-                              profileMap[task.assigneeId]?.color || '#64748B',
-                          }"
-                        ></span>
-                        <span class="truncate">{{
-                          profileMap[task.assigneeId]?.name || task.assigneeId
-                        }}</span>
-                        <span
-                          v-if="task.source === 'opencode'"
-                          class="text-[10px] font-mono text-sky-400 shrink-0"
-                        >
-                          · OpenCode
-                        </span>
-                        <span
-                          v-else-if="task.source === 'demo'"
-                          class="text-[10px] text-slate-500 shrink-0"
-                        >
-                          · Demo
-                        </span>
-                      </button>
-
-                      <select
-                        :value="task.status"
-                        @change="handleMoveTask(task.id, $event.target.value)"
-                        aria-label="Cambiar estado de tarea"
-                        class="px-1.5 py-0.5 rounded bg-slate-950 border border-slate-800 text-[10px] text-slate-300 focus:outline-none focus:border-sky-500 cursor-pointer"
-                      >
-                        <option
-                          v-for="opt in TASK_COLUMNS"
-                          :key="opt.id"
-                          :value="opt.id"
-                        >
-                          {{ opt.label }}
-                        </option>
-                      </select>
-                    </div>
-                  </div>
-                </div>
-              </div>
+                <X class="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
 
-          <!-- Panel Inspector & Debug HUD del agente seleccionado -->
-          <div
-            v-if="selectedSnapshot"
-            class="px-5 py-4 border-b border-slate-800 bg-slate-900/55"
-          >
-            <!-- Cabecera del agente seleccionado -->
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <div class="flex items-center gap-3 min-w-0">
-                <span
-                  class="w-3 h-3 rounded-sm shrink-0"
-                  :style="{ backgroundColor: selectedSnapshot.color }"
-                ></span>
-                <div class="min-w-0">
-                  <div class="flex items-center gap-2 text-sm font-semibold text-slate-100">
-                    <span class="truncate">{{ selectedSnapshot.name }}</span>
-                    <span aria-hidden="true" class="text-slate-600">·</span>
-                    <span class="text-xs font-normal text-slate-400 truncate">{{
-                      selectedSnapshot.role
-                    }}</span>
-                  </div>
-                  <div
-                    class="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-0.5 text-xs text-slate-400 font-mono tabular-nums"
-                  >
-                    <span class="text-slate-200">{{
-                      selectedSnapshot.state
-                    }}</span>
-                    <span aria-hidden="true" class="text-slate-600">·</span>
-                    <span>Zona: {{ selectedSnapshot.zone }}</span>
-                    <span aria-hidden="true" class="text-slate-600">·</span>
-                    <span>Clip: {{ selectedSnapshot.animation }}</span>
-                    <span aria-hidden="true" class="text-slate-600">·</span>
-                    <span>Prop: {{ selectedSnapshot.prop }}</span>
-                  </div>
-                </div>
-              </div>
-
-              <div class="flex items-center gap-2 shrink-0">
-                <!-- Selector de pestaña de Debug -->
-                <div
-                  class="flex items-center gap-1 p-0.5 rounded-md bg-slate-900 border border-slate-800"
-                >
-                  <button
-                    type="button"
-                    @click="activeInspectorTab = 'routes'"
-                    :class="[
-                      'px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
-                      activeInspectorTab === 'routes'
-                        ? 'bg-slate-800 text-white'
-                        : 'text-slate-400 hover:text-slate-200',
-                    ]"
-                  >
-                    Recorridos (5 Zonas)
-                  </button>
-                  <button
-                    type="button"
-                    @click="activeInspectorTab = 'animations'"
-                    :class="[
-                      'px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
-                      activeInspectorTab === 'animations'
-                        ? 'bg-slate-800 text-white'
-                        : 'text-slate-400 hover:text-slate-200',
-                    ]"
-                  >
-                    Animaciones y Props
-                  </button>
-                  <button
-                    type="button"
-                    @click="activeInspectorTab = 'events'"
-                    :class="[
-                      'px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap flex items-center gap-1',
-                      activeInspectorTab === 'events'
-                        ? 'bg-slate-800 text-white'
-                        : 'text-slate-400 hover:text-slate-200',
-                    ]"
-                  >
-                    <Radio class="w-3 h-3" />
-                    <span>Event Bus</span>
-                  </button>
-                  <button
-                    type="button"
-                    @click="activeInspectorTab = 'profile'"
-                    :class="[
-                      'px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap flex items-center gap-1',
-                      activeInspectorTab === 'profile'
-                        ? 'bg-slate-800 text-white'
-                        : 'text-slate-400 hover:text-slate-200',
-                    ]"
-                  >
-                    <UserCog class="w-3 h-3" />
-                    <span>Perfil</span>
-                  </button>
-                </div>
-
-                <button
-                  type="button"
-                  @click="experience?.focusAgent(selectedSnapshot.id)"
-                  class="px-2.5 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
-                >
-                  <Crosshair class="w-3.5 h-3.5" />
-                  <span>Enfocar</span>
-                </button>
-
-                <button
-                  type="button"
-                  @click="experience?.handleStationSelect(null)"
-                  aria-label="Cerrar inspector"
-                  class="p-1.5 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
-                >
-                  <X class="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-
-            <!-- Disparadores manuales de prueba -->
+          <div class="max-h-44 overflow-y-auto pt-1 border-t border-white/[0.06]">
+            <!-- Tab Recorridos -->
             <div
               v-if="activeInspectorTab === 'routes'"
-              class="mt-3 flex flex-wrap items-center gap-1.5"
+              class="flex flex-wrap items-center gap-1.5 pt-1"
             >
               <button
                 v-for="trigger in ROUTE_TRIGGERS"
                 :key="trigger.checkpointId"
                 type="button"
                 @click="sendToRoute(trigger)"
-                class="px-2.5 py-1.5 rounded-md bg-slate-800/90 hover:bg-slate-700 border border-slate-700/70 text-xs font-medium text-slate-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                class="px-2.5 py-1.5 rounded-lg bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] hover:text-[#F3F4F6] transition-colors cursor-pointer whitespace-nowrap"
               >
                 {{ trigger.label }}
               </button>
               <button
                 type="button"
                 @click="sendSelectedHome"
-                class="px-2.5 py-1.5 rounded-md bg-sky-600/20 hover:bg-sky-600/30 border border-sky-500/40 text-xs font-medium text-sky-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                class="px-2.5 py-1.5 rounded-lg bg-[#1E243B] hover:bg-[#262F4D] border border-[#4F6EF7]/35 text-xs font-medium text-[#C7D2FE] transition-colors cursor-pointer whitespace-nowrap"
               >
                 Volver al Escritorio
               </button>
             </div>
 
+            <!-- Tab Animaciones y Props -->
             <div
               v-else-if="activeInspectorTab === 'animations'"
-              class="mt-3 flex flex-wrap items-center gap-1.5"
+              class="flex flex-wrap items-center gap-1.5 pt-1"
             >
               <button
                 v-for="anim in ANIMATION_TRIGGERS"
@@ -2049,39 +1293,40 @@ onBeforeUnmount(() => {
                 type="button"
                 @click="triggerAnimationPreview(anim.action)"
                 :class="[
-                  'px-2.5 py-1.5 rounded-md border text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0',
+                  'px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
                   selectedSnapshot.animation === anim.action
-                    ? 'bg-sky-600/25 border-sky-500/50 text-sky-200'
-                    : 'bg-slate-800/90 hover:bg-slate-700 border-slate-700/70 text-slate-200',
+                    ? 'bg-[#1E243B] border-[#4F6EF7]/40 text-[#E0E7FF]'
+                    : 'bg-[#181B22] hover:bg-[#252A36] border-white/[0.08] text-[#D1D5DB] hover:text-[#F3F4F6]',
                 ]"
               >
                 {{ anim.label }}
               </button>
             </div>
 
-            <div v-else-if="activeInspectorTab === 'events'" class="mt-3 space-y-2.5">
+            <!-- Tab Event Bus -->
+            <div v-else-if="activeInspectorTab === 'events'" class="space-y-2 pt-1">
               <div class="flex flex-wrap items-center gap-1.5">
                 <button
                   v-for="item in BUS_TEST_ACTIONS"
                   :key="item.label"
                   type="button"
                   @click="triggerBusTest(item)"
-                  class="px-2.5 py-1.5 rounded-md bg-slate-800/90 hover:bg-slate-700 border border-slate-700/70 text-xs font-medium text-slate-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  class="px-2.5 py-1.5 rounded-lg bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] hover:text-[#F3F4F6] transition-colors cursor-pointer whitespace-nowrap"
                 >
                   {{ item.label }}
                 </button>
               </div>
               <div
                 v-if="eventLog.length > 0"
-                class="rounded-md bg-slate-950/85 border border-slate-800 px-3 py-2 space-y-1 max-h-24 overflow-y-auto font-mono text-[11px] text-slate-400"
+                class="rounded-lg bg-[#181B22] border border-white/[0.06] px-3 py-2 space-y-1 max-h-24 overflow-y-auto text-[11px] text-[#9CA3AF] tabular-nums"
               >
                 <div
                   v-for="ev in eventLog"
                   :key="ev.id"
                   class="flex items-center justify-between gap-3 truncate"
                 >
-                  <span class="text-sky-300 shrink-0">{{ ev.type }}</span>
-                  <span class="truncate text-slate-300">
+                  <span class="text-[#93A8FA] shrink-0">{{ ev.type }}</span>
+                  <span class="truncate text-[#D1D5DB]">
                     {{
                       ev.payload.label ||
                       ev.payload.topic ||
@@ -2091,39 +1336,39 @@ onBeforeUnmount(() => {
                       ""
                     }}
                   </span>
-                  <span class="text-slate-500 shrink-0">{{ ev.source }}</span>
+                  <span class="text-[#6B7280] shrink-0">{{ ev.source }}</span>
                 </div>
               </div>
             </div>
 
-            <!-- Pestaña Perfil: personalización en vivo del agente -->
+            <!-- Tab Perfil -->
             <form
               v-else
               @submit.prevent="handleSaveProfile"
-              class="mt-3 flex flex-wrap items-end justify-between gap-3"
+              class="flex flex-wrap items-end justify-between gap-3 pt-1"
             >
-              <div class="flex flex-wrap items-end gap-2.5 flex-1 min-w-[260px]">
-                <label class="flex flex-col gap-1 text-[11px] text-slate-400">
+              <div class="flex flex-wrap items-end gap-2.5 flex-1 min-w-[240px]">
+                <label class="flex flex-col gap-1 text-[11px] text-[#9CA3AF]">
                   <span>Nombre</span>
                   <input
                     v-model="profileDraft.name"
                     type="text"
                     maxlength="20"
-                    class="w-36 px-2.5 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs text-slate-100 focus:outline-none focus:border-sky-500"
+                    class="w-36 px-2.5 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#F3F4F6] focus:outline-none focus:border-[#4F6EF7]"
                   />
                 </label>
 
-                <label class="flex flex-col gap-1 text-[11px] text-slate-400">
+                <label class="flex flex-col gap-1 text-[11px] text-[#9CA3AF]">
                   <span>Especialidad / Rol</span>
                   <input
                     v-model="profileDraft.role"
                     type="text"
                     maxlength="28"
-                    class="w-48 px-2.5 py-1.5 rounded-md bg-slate-950 border border-slate-800 text-xs text-slate-100 focus:outline-none focus:border-sky-500"
+                    class="w-44 px-2.5 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#F3F4F6] focus:outline-none focus:border-[#4F6EF7]"
                   />
                 </label>
 
-                <div class="flex flex-col gap-1 text-[11px] text-slate-400">
+                <div class="flex flex-col gap-1 text-[11px] text-[#9CA3AF]">
                   <span>Color</span>
                   <div class="flex items-center gap-1.5 h-[30px]">
                     <button
@@ -2134,10 +1379,10 @@ onBeforeUnmount(() => {
                       :aria-label="swatch.name"
                       @click="profileDraft.color = swatch.hex"
                       :class="[
-                        'w-5 h-5 rounded-sm transition-transform cursor-pointer border',
+                        'w-5 h-5 rounded-[4px] transition-transform cursor-pointer border',
                         profileDraft.color === swatch.hex
-                          ? 'scale-110 border-white'
-                          : 'border-slate-700 opacity-80 hover:opacity-100',
+                          ? 'scale-110 border-[#D1D5DB]'
+                          : 'border-white/[0.12] opacity-80 hover:opacity-100',
                       ]"
                       :style="{ backgroundColor: swatch.hex }"
                     ></button>
@@ -2148,260 +1393,1189 @@ onBeforeUnmount(() => {
               <div class="flex items-center gap-2 shrink-0">
                 <button
                   type="submit"
-                  class="px-3 py-1.5 rounded-md bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  class="px-3 py-1.5 rounded-lg bg-[#4F6EF7] hover:bg-[#5E7BF8] text-xs font-medium text-[#F8FAFC] transition-colors cursor-pointer whitespace-nowrap"
                 >
                   Aplicar cambios
                 </button>
                 <button
                   type="button"
                   @click="handleResetProfiles"
-                  class="px-2.5 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-300 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  class="px-2.5 py-1.5 rounded-lg bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] hover:text-[#F3F4F6] transition-colors cursor-pointer whitespace-nowrap"
                 >
                   Restaurar equipo
                 </button>
               </div>
             </form>
           </div>
+        </div>
+      </transition>
 
-          <!-- Fila principal de controles globales -->
+      <!-- Botón discreto de colapso (H) -->
+      <button
+        @click="isDockCollapsed = !isDockCollapsed"
+        type="button"
+        class="pointer-events-auto mb-1.5 px-2.5 py-1 rounded-lg bg-[#111318]/90 hover:bg-[#181B22] border border-white/[0.08] text-[11px] font-medium text-[#9CA3AF] hover:text-[#E5E7EB] flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+      >
+        <ChevronDown v-if="!isDockCollapsed" class="w-3.5 h-3.5" />
+        <ChevronUp v-else class="w-3.5 h-3.5" />
+        <span>{{ isDockCollapsed ? "Mostrar barra (H)" : "Ocultar (H)" }}</span>
+      </button>
+
+      <!-- Isla Inferior Compacta (5 Avatares + Pausa/Velocidad + Acciones de Escena) -->
+      <transition
+        enter-active-class="transition duration-150 ease-out"
+        enter-from-class="opacity-0 translate-y-2"
+        enter-to-class="opacity-100 translate-y-0"
+        leave-active-class="transition duration-120 ease-in"
+        leave-from-class="opacity-100 translate-y-0"
+        leave-to-class="opacity-0 translate-y-2"
+      >
+        <div
+          v-show="!isDockCollapsed"
+          class="pointer-events-auto rounded-xl bg-[#111318]/95 border border-white/[0.08] px-3 py-2 flex flex-wrap items-center justify-center gap-2"
+        >
+          <!-- Equipo (5 Avatares) -->
+          <div class="flex flex-wrap items-center gap-1.5">
+            <button
+              v-for="agent in agentList"
+              :key="agent.id"
+              type="button"
+              @click="selectAgentFromDock(agent.id)"
+              :style="getAgentAvatarStyle(agent)"
+              :class="[
+                'px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer flex items-center gap-2 whitespace-nowrap border',
+                selectedAgentId === agent.id
+                  ? 'text-[#F3F4F6]'
+                  : 'bg-[#181B22] border-white/[0.08] text-[#D1D5DB] hover:bg-[#232834] hover:text-[#F3F4F6]',
+              ]"
+            >
+              <span
+                class="w-2.5 h-2.5 rounded-[3px] shrink-0"
+                :style="{ backgroundColor: agent.color }"
+              ></span>
+              <span>{{ agent.name }}</span>
+              <span
+                v-if="openCodeState.activeAgents.includes(agent.id)"
+                class="text-[10px] font-semibold text-[#10B981] tabular-nums"
+              >
+                · vivo
+              </span>
+            </button>
+          </div>
+
+          <div class="w-px h-5 bg-white/[0.08] hidden md:block"></div>
+
+          <!-- Reproducción (Pausa / 1x–2x) -->
           <div
-            class="px-4 py-3 flex flex-wrap items-center justify-between gap-3"
+            class="flex items-center gap-0.5 p-0.5 rounded-lg bg-[#181B22] border border-white/[0.08]"
           >
-            <!-- Selector rápido de agentes -->
-            <div class="flex items-center gap-1.5 overflow-x-auto">
+            <button
+              type="button"
+              @click="toggleDirectorPause"
+              class="px-2.5 py-1 rounded-md text-xs font-medium text-[#D1D5DB] hover:bg-[#252A36] hover:text-[#F3F4F6] flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Play v-if="directorState.paused" class="w-3.5 h-3.5" />
+              <Pause v-else class="w-3.5 h-3.5" />
+              <span>{{ directorState.paused ? "Reanudar" : "Pausa" }}</span>
+            </button>
+            <button
+              type="button"
+              @click="toggleDirectorSpeed"
+              class="px-2 py-1 rounded-md text-xs font-medium tabular-nums text-[#9CA3AF] hover:bg-[#252A36] hover:text-[#F3F4F6] transition-colors cursor-pointer whitespace-nowrap"
+            >
+              {{ directorState.speedMultiplier }}x
+            </button>
+          </div>
+
+          <div class="w-px h-5 bg-white/[0.08] hidden md:block"></div>
+
+          <!-- Triggers rápidos de escena -->
+          <div class="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              @click="experience?.triggerPairChat()"
+              class="px-2.5 py-1.5 rounded-lg bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] hover:text-[#F3F4F6] flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <MessageSquare class="w-3.5 h-3.5" />
+              <span>Charla</span>
+            </button>
+
+            <button
+              type="button"
+              @click="experience?.triggerDeskReview()"
+              class="px-2.5 py-1.5 rounded-lg bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] hover:text-[#F3F4F6] flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <GitPullRequest class="w-3.5 h-3.5" />
+              <span>Revisión</span>
+            </button>
+
+            <button
+              type="button"
+              @click="experience?.triggerPingPongMatch()"
+              class="px-2.5 py-1.5 rounded-lg bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] hover:text-[#F3F4F6] flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Gamepad2 class="w-3.5 h-3.5" />
+              <span>Ping-Pong</span>
+            </button>
+
+            <button
+              type="button"
+              @click="experience?.triggerTeamMeeting()"
+              class="px-2.5 py-1.5 rounded-lg bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] hover:text-[#F3F4F6] flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Users class="w-3.5 h-3.5" />
+              <span>Reunión</span>
+            </button>
+
+            <button
+              type="button"
+              @click="toggleBubbles"
+              :class="[
+                'px-2.5 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap',
+                showBubbles
+                  ? 'bg-[#1E243B] border-[#4F6EF7]/40 text-[#C7D2FE]'
+                  : 'bg-[#181B22] hover:bg-[#252A36] border-white/[0.08] text-[#9CA3AF] hover:text-[#E5E7EB]',
+              ]"
+            >
+              <MessageSquare class="w-3.5 h-3.5" />
+              <span>Burbujas</span>
+            </button>
+
+            <div
+              class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08]"
+            >
               <button
-                v-for="agent in agentList"
-                :key="agent.id"
                 type="button"
-                @click="selectAgentFromDock(agent.id)"
+                @click="toggleAudio"
                 :class="[
-                  'px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer flex items-center gap-2 whitespace-nowrap shrink-0 border',
-                  selectedAgentId === agent.id
-                    ? 'bg-slate-800 text-white border-slate-600'
-                    : 'bg-slate-900 text-slate-300 hover:text-white hover:bg-slate-800/70 border-slate-800',
+                  'text-xs font-medium flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap',
+                  audioEnabled ? 'text-[#93A8FA]' : 'text-[#9CA3AF] hover:text-[#E5E7EB]',
                 ]"
               >
-                <span
-                  class="w-2 h-2 rounded-sm shrink-0"
-                  :style="{ backgroundColor: agent.color }"
-                ></span>
-                <span>{{ agent.name }}</span>
-                <span
-                  v-if="openCodeState.activeAgents.includes(agent.id)"
-                  class="text-[10px] font-mono text-emerald-300"
-                >
-                  · vivo
-                </span>
+                <Volume2 v-if="audioEnabled" class="w-3.5 h-3.5" />
+                <VolumeX v-else class="w-3.5 h-3.5" />
+                <span>Audio</span>
               </button>
-            </div>
-
-            <!-- Controles de Mock Director + OpenCode + Tablero + Ambiente -->
-            <div class="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
-              <!-- OpenCode CLI (prioritario) -->
-              <button
-                type="button"
-                @click="toggleOpenCodePanel"
-                :class="[
-                  'px-2.5 py-1.5 rounded-md border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0',
-                  isOpenCodePanelOpen || openCodeState.status === 'connected'
-                    ? 'bg-sky-600/20 border-sky-500/40 text-sky-200'
-                    : openCodeState.status === 'error'
-                      ? 'bg-rose-600/20 border-rose-500/40 text-rose-200'
-                      : 'bg-slate-900 border-slate-700 text-slate-100 hover:bg-slate-800',
-                ]"
-              >
-                <Terminal class="w-3.5 h-3.5 text-sky-400" />
-                <span>OpenCode</span>
-                <span
-                  v-if="openCodeState.status === 'connected'"
-                  class="font-mono text-[11px] text-emerald-300 tabular-nums"
-                >
-                  {{ openCodeState.activeAgents.length }}/5
-                </span>
-              </button>
-
-              <!-- Tablero de Tareas -->
-              <button
-                type="button"
-                @click="toggleTaskBoard"
-                :class="[
-                  'px-2.5 py-1.5 rounded-md border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0',
-                  isTaskBoardOpen
-                    ? 'bg-sky-600/20 border-sky-500/40 text-sky-200'
-                    : 'bg-slate-900 border-slate-800 text-slate-200 hover:bg-slate-800',
-                ]"
-              >
-                <ListTodo class="w-3.5 h-3.5" />
-                <span>Tablero</span>
-                <span class="font-mono text-[11px] text-slate-400 tabular-nums">
-                  {{ tasks.length }}
-                </span>
-              </button>
-
-              <!-- Mock Director -->
-              <div
-                class="flex items-center gap-1 p-0.5 rounded-md bg-slate-900 border border-slate-800"
-              >
-                <button
-                  type="button"
-                  @click="toggleDirectorPause"
-                  class="px-2.5 py-1 rounded text-xs font-medium text-slate-200 hover:bg-slate-800 flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
-                >
-                  <Play v-if="directorState.paused" class="w-3.5 h-3.5" />
-                  <Pause v-else class="w-3.5 h-3.5" />
-                  <span>{{ directorState.paused ? "Reanudar" : "Pausar" }}</span>
-                </button>
-                <button
-                  type="button"
-                  @click="toggleDirectorSpeed"
-                  class="px-2 py-1 rounded text-xs font-mono tabular-nums text-slate-300 hover:bg-slate-800 transition-colors cursor-pointer whitespace-nowrap"
-                >
-                  {{ directorState.speedMultiplier }}x
-                </button>
-              </div>
-
-              <!-- Eventos Grupales y Sociales -->
-              <button
-                type="button"
-                @click="experience?.triggerPairChat()"
-                class="px-2.5 py-1.5 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                <MessageSquare class="w-3.5 h-3.5" />
-                <span>Charla</span>
-              </button>
-
-              <button
-                type="button"
-                @click="experience?.triggerDeskReview()"
-                class="px-2.5 py-1.5 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                <GitPullRequest class="w-3.5 h-3.5" />
-                <span>Revisión</span>
-              </button>
-
-              <button
-                type="button"
-                @click="experience?.triggerPingPongMatch()"
-                class="px-2.5 py-1.5 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                <Gamepad2 class="w-3.5 h-3.5" />
-                <span>Ping-Pong</span>
-              </button>
-
-              <button
-                type="button"
-                @click="experience?.triggerTeamMeeting()"
-                class="px-2.5 py-1.5 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                <Users class="w-3.5 h-3.5" />
-                <span>Reunión</span>
-              </button>
-
-              <!-- Visibilidad Burbujas 3D -->
-              <button
-                type="button"
-                @click="toggleBubbles"
-                :class="[
-                  'px-2.5 py-1.5 rounded-md border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0',
-                  showBubbles
-                    ? 'bg-sky-600/20 border-sky-500/40 text-sky-200'
-                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200',
-                ]"
-              >
-                <MessageSquare class="w-3.5 h-3.5" />
-                <span>Burbujas</span>
-              </button>
-
-              <!-- Audio Ambiental Web Audio -->
-              <div
-                class="flex items-center gap-1.5 px-2 py-1 rounded-md bg-slate-900 border border-slate-800"
-              >
-                <button
-                  type="button"
-                  @click="toggleAudio"
-                  :class="[
-                    'text-xs font-medium flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap shrink-0',
-                    audioEnabled ? 'text-sky-300' : 'text-slate-400 hover:text-slate-200',
-                  ]"
-                >
-                  <Volume2 v-if="audioEnabled" class="w-3.5 h-3.5" />
-                  <VolumeX v-else class="w-3.5 h-3.5" />
-                  <span>Audio</span>
-                </button>
-                <input
-                  v-if="audioEnabled"
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  :value="audioVolume"
-                  @input="handleVolumeInput"
-                  aria-label="Volumen ambiental"
-                  class="w-14 accent-sky-500 cursor-pointer"
-                />
-              </div>
-
-              <!-- Iluminación -->
-              <div
-                class="flex items-center gap-1 p-0.5 rounded-md bg-slate-900 border border-slate-800"
-              >
-                <button
-                  type="button"
-                  @click="setLightingMode('day')"
-                  :class="[
-                    'px-2 py-1 rounded text-xs font-medium transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap',
-                    timeMode === 'day'
-                      ? 'bg-amber-500/20 text-amber-300'
-                      : 'text-slate-400 hover:text-slate-200',
-                  ]"
-                >
-                  <Sun class="w-3.5 h-3.5" />
-                  <span>Día</span>
-                </button>
-                <button
-                  type="button"
-                  @click="setLightingMode('night')"
-                  :class="[
-                    'px-2 py-1 rounded text-xs font-medium transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap',
-                    timeMode === 'night'
-                      ? 'bg-indigo-500/20 text-indigo-300'
-                      : 'text-slate-400 hover:text-slate-200',
-                  ]"
-                >
-                  <Moon class="w-3.5 h-3.5" />
-                  <span>Noche</span>
-                </button>
-                <button
-                  type="button"
-                  @click="setLightingMode('auto')"
-                  :class="[
-                    'px-2 py-1 rounded text-xs font-medium transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap',
-                    timeMode === 'auto'
-                      ? 'bg-sky-500/20 text-sky-300'
-                      : 'text-slate-400 hover:text-slate-200',
-                  ]"
-                >
-                  <RefreshCw class="w-3.5 h-3.5" />
-                  <span>Auto</span>
-                </button>
-              </div>
-
-              <!-- Reset Cámara -->
-              <button
-                type="button"
-                @click="
-                  experience?.handleStationSelect(null);
-                  experience?.resetCamera();
-                "
-                class="px-2.5 py-1.5 rounded-md bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs font-medium text-slate-300 hover:text-white flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
-              >
-                <RotateCcw class="w-3.5 h-3.5" />
-                <span>Vista General</span>
-              </button>
+              <input
+                v-if="audioEnabled"
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                :value="audioVolume"
+                @input="handleVolumeInput"
+                aria-label="Volumen ambiental"
+                class="w-12 accent-[#4F6EF7] cursor-pointer"
+              />
             </div>
           </div>
         </div>
       </transition>
     </section>
+
+    <!-- ZONA 4A: Drawer Lateral Derecho Superpuesto de OpenCode (mantiene escena 3D intacta) -->
+    <transition
+      enter-active-class="transition duration-200 ease-out"
+      enter-from-class="opacity-0 translate-x-6"
+      enter-to-class="opacity-100 translate-x-0"
+      leave-active-class="transition duration-150 ease-in"
+      leave-from-class="opacity-100 translate-x-0"
+      leave-to-class="opacity-0 translate-x-6"
+    >
+      <aside
+        v-if="isReady && isOpenCodePanelOpen"
+        class="fixed top-4 right-4 bottom-4 w-[min(450px,calc(100vw-2rem))] z-40 rounded-xl bg-[#111318]/97 border border-white/[0.08] flex flex-col overflow-hidden pointer-events-auto"
+      >
+        <!-- Cabecera del Drawer -->
+        <div class="px-4 py-3 border-b border-white/[0.08] bg-[#181B22] space-y-2.5 shrink-0">
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2 min-w-0">
+              <Terminal class="w-4 h-4 text-[#4F6EF7] shrink-0" />
+              <span class="text-sm font-semibold text-[#F3F4F6]">OpenCode</span>
+              <span aria-hidden="true" class="text-[#4B5563]">·</span>
+              <span
+                :class="[
+                  'text-xs font-medium truncate',
+                  openCodeState.status === 'connected'
+                    ? 'text-[#10B981]'
+                    : openCodeState.status === 'error'
+                      ? 'text-[#FB7185]'
+                      : openCodeState.status === 'connecting'
+                        ? 'text-[#D97706]'
+                        : 'text-[#9CA3AF]',
+                ]"
+              >
+                {{
+                  openCodeState.status === "connected"
+                    ? "Stream SSE activo"
+                    : openCodeState.status === "connecting"
+                      ? "Conectando..."
+                      : openCodeState.status === "error"
+                        ? "Error de enlace"
+                        : "Desconectado"
+                }}
+              </span>
+            </div>
+
+            <button
+              type="button"
+              @click="isOpenCodePanelOpen = false"
+              aria-label="Cerrar drawer OpenCode"
+              class="p-1.5 rounded-lg bg-[#1F232D] hover:bg-[#282E3D] border border-white/[0.08] text-[#9CA3AF] hover:text-[#F3F4F6] transition-colors cursor-pointer"
+            >
+              <X class="w-4 h-4" />
+            </button>
+          </div>
+
+          <!-- Pestañas del Drawer -->
+          <div
+            class="grid grid-cols-4 gap-1 p-0.5 rounded-lg bg-[#111318] border border-white/[0.08]"
+          >
+            <button
+              type="button"
+              @click="openCodeTab = 'command'"
+              :class="[
+                'px-2 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap text-center',
+                openCodeTab === 'command'
+                  ? 'bg-[#1E243B] text-[#E0E7FF]'
+                  : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
+              ]"
+            >
+              Comando
+            </button>
+            <button
+              type="button"
+              @click="openCodeTab = 'connection'"
+              :class="[
+                'px-2 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap text-center',
+                openCodeTab === 'connection'
+                  ? 'bg-[#1E243B] text-[#E0E7FF]'
+                  : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
+              ]"
+            >
+              Conexión
+            </button>
+            <button
+              type="button"
+              @click="openCodeTab = 'mapping'"
+              :class="[
+                'px-2 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap text-center',
+                openCodeTab === 'mapping'
+                  ? 'bg-[#1E243B] text-[#E0E7FF]'
+                  : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
+              ]"
+            >
+              Mapeo
+            </button>
+            <button
+              type="button"
+              @click="openCodeTab = 'guide'"
+              :class="[
+                'px-2 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap text-center',
+                openCodeTab === 'guide'
+                  ? 'bg-[#1E243B] text-[#E0E7FF]'
+                  : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
+              ]"
+            >
+              Guía
+            </button>
+          </div>
+        </div>
+
+        <!-- Banner inline de permiso pendiente si el drawer está abierto -->
+        <div
+          v-if="activePermission"
+          class="px-4 py-2.5 border-b border-[#D97706]/35 bg-[#1B1710] space-y-2 shrink-0"
+        >
+          <div class="flex items-center justify-between gap-2 text-xs">
+            <span class="font-semibold text-[#FBBF24] flex items-center gap-1.5">
+              <ShieldAlert class="w-3.5 h-3.5 text-[#D97706]" />
+              <span>Permiso CLI: {{ activePermission.toolName }}</span>
+            </span>
+            <span class="text-[11px] text-[#D1D5DB] truncate max-w-[140px]">
+              {{ activePermission.targetSummary }}
+            </span>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <button
+              type="button"
+              :disabled="replyingPermissionId === activePermission.id"
+              @click="handleReplyPermission(activePermission.id, 'once')"
+              class="px-2 py-1 rounded-md bg-[#0E9F6E] hover:bg-[#10B981] text-[11px] font-medium text-[#F8FAFC] cursor-pointer disabled:opacity-50"
+            >
+              Una vez
+            </button>
+            <button
+              type="button"
+              :disabled="replyingPermissionId === activePermission.id"
+              @click="handleReplyPermission(activePermission.id, 'always')"
+              class="px-2 py-1 rounded-md bg-[#4F6EF7] hover:bg-[#5E7BF8] text-[11px] font-medium text-[#F8FAFC] cursor-pointer disabled:opacity-50"
+            >
+              Siempre
+            </button>
+            <button
+              type="button"
+              :disabled="replyingPermissionId === activePermission.id"
+              @click="handleReplyPermission(activePermission.id, 'reject')"
+              class="px-2 py-1 rounded-md bg-[#2B141C] hover:bg-[#3A1B26] border border-[#E11D48]/35 text-[11px] font-medium text-[#FECDD3] cursor-pointer disabled:opacity-50"
+            >
+              Rechazar
+            </button>
+          </div>
+        </div>
+
+        <!-- Pestaña Comando + Bitácora Vertical Amplia -->
+        <div
+          v-if="openCodeTab === 'command'"
+          class="flex-1 min-h-0 flex flex-col overflow-hidden"
+        >
+          <div class="p-4 border-b border-white/[0.08] space-y-2.5 shrink-0">
+            <div
+              v-if="openCodeState.status !== 'connected'"
+              class="rounded-lg bg-[#181B22] border border-white/[0.08] p-3 flex flex-col gap-2.5 text-xs text-[#D1D5DB]"
+            >
+              <span>Conecta primero con OpenCode para enviar prompts y seguir la bitácora en vivo.</span>
+              <button
+                type="button"
+                @click="openCodeTab = 'connection'"
+                class="self-start px-3 py-1.5 rounded-lg bg-[#4F6EF7] hover:bg-[#5E7BF8] text-xs font-medium text-[#F8FAFC] cursor-pointer"
+              >
+                Ir a Conexión
+              </button>
+            </div>
+
+            <form
+              v-else
+              @submit.prevent="handleSendOpenCodePrompt"
+              class="space-y-2.5"
+            >
+              <div class="grid grid-cols-1 gap-2">
+                <div class="flex items-center gap-1.5">
+                  <select
+                    v-model="commandForm.sessionId"
+                    aria-label="Sesión OpenCode"
+                    class="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#F3F4F6] focus:outline-none focus:border-[#4F6EF7] tabular-nums"
+                  >
+                    <option value="">Auto (crear nueva al enviar)</option>
+                    <option
+                      v-for="sess in openCodeState.sessions"
+                      :key="sess.id"
+                      :value="sess.id"
+                    >
+                      {{
+                        sess.title
+                          ? `${sess.title.slice(0, 26)} (${sess.id.slice(0, 10)})`
+                          : sess.id
+                      }}
+                    </option>
+                  </select>
+                  <button
+                    type="button"
+                    :disabled="isCreatingSession"
+                    @click="handleCreateOpenCodeSession"
+                    class="px-2.5 py-1.5 rounded-lg bg-[#1F232D] hover:bg-[#272C39] border border-white/[0.08] text-xs font-medium text-[#E5E7EB] flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
+                  >
+                    <Plus class="w-3.5 h-3.5" />
+                    <span>{{ isCreatingSession ? "Creando..." : "Nueva" }}</span>
+                  </button>
+                </div>
+
+                <div class="flex items-center gap-1.5">
+                  <select
+                    v-model="commandForm.agent"
+                    aria-label="Agente destinatario"
+                    class="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#F3F4F6] focus:outline-none focus:border-[#4F6EF7]"
+                  >
+                    <option
+                      v-for="ag in agentList"
+                      :key="ag.id"
+                      :value="ag.id"
+                    >
+                      {{ ag.name }} (@{{ ag.id }})
+                    </option>
+                  </select>
+                  <button
+                    type="button"
+                    :disabled="isInterrupting || !(commandForm.sessionId || openCodeState.activeSessionId)"
+                    @click="handleInterruptOpenCode"
+                    class="px-2.5 py-1.5 rounded-lg bg-[#2B141C] hover:bg-[#3A1B26] border border-[#E11D48]/35 text-xs font-medium text-[#FECDD3] flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-45"
+                  >
+                    <Square class="w-3 h-3 fill-current" />
+                    <span>{{ isInterrupting ? "Deteniendo..." : "Detener" }}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="flex flex-col gap-2">
+                <textarea
+                  v-model="commandForm.prompt"
+                  rows="2"
+                  @keydown.ctrl.enter.prevent="handleSendOpenCodePrompt"
+                  @keydown.meta.enter.prevent="handleSendOpenCodePrompt"
+                  placeholder="Escribe una instrucción para OpenCode (Ctrl+Enter para enviar)..."
+                  class="w-full px-3 py-2 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#F3F4F6] placeholder:text-[#6B7280] focus:outline-none focus:border-[#4F6EF7] resize-none"
+                ></textarea>
+
+                <div class="flex items-center justify-between gap-2">
+                  <span
+                    v-if="commandFeedback"
+                    :class="[
+                      'text-[11px] truncate',
+                      commandFeedback.ok ? 'text-[#10B981]' : 'text-[#FB7185]',
+                    ]"
+                  >
+                    {{ commandFeedback.text }}
+                  </span>
+                  <span v-else class="text-[11px] text-[#6B7280] truncate tabular-nums">
+                    API {{ openCodeState.capabilities?.discoveredFrom || "v2" }}
+                  </span>
+
+                  <button
+                    type="submit"
+                    :disabled="isSendingPrompt || !commandForm.prompt.trim()"
+                    class="px-3.5 py-1.5 rounded-lg bg-[#4F6EF7] hover:bg-[#5E7BF8] text-xs font-medium text-[#F8FAFC] flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
+                  >
+                    <Send class="w-3.5 h-3.5" />
+                    <span>{{ isSendingPrompt ? "Enviando..." : "Enviar" }}</span>
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+
+          <!-- Bitácora en vivo con máxima altura vertical -->
+          <div class="flex-1 min-h-0 flex flex-col p-4 space-y-2">
+            <div class="flex items-center justify-between gap-2 shrink-0">
+              <div class="flex items-center gap-1.5 text-xs text-[#D1D5DB] min-w-0">
+                <span class="font-semibold text-[#F3F4F6]">Bitácora en vivo</span>
+                <span aria-hidden="true" class="text-[#4B5563]">·</span>
+                <span class="text-[11px] text-[#9CA3AF] tabular-nums">
+                  {{ sessionLogEntries.length }} eventos
+                </span>
+                <template v-if="activeLogSessionId">
+                  <span aria-hidden="true" class="text-[#4B5563]">·</span>
+                  <span class="text-[11px] text-[#6B7280] truncate max-w-[110px] tabular-nums">
+                    {{ activeLogSessionId.slice(0, 12) }}
+                  </span>
+                </template>
+              </div>
+
+              <button
+                type="button"
+                :disabled="sessionLogEntries.length === 0"
+                @click="handleClearSessionLog"
+                class="px-2 py-1 rounded-md bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-[11px] font-medium text-[#9CA3AF] hover:text-[#F3F4F6] flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-40"
+              >
+                <Trash2 class="w-3 h-3" />
+                <span>Limpiar</span>
+              </button>
+            </div>
+
+            <div
+              ref="logContainerRef"
+              class="flex-1 min-h-0 overflow-y-auto rounded-lg bg-[#181B22] border border-white/[0.08] p-2.5 space-y-2"
+            >
+              <div
+                v-if="sessionLogEntries.length === 0"
+                class="py-8 px-3 text-center text-xs text-[#6B7280] leading-relaxed"
+              >
+                Sin actividad en esta sesión todavía. Envía una instrucción para ver herramientas, razonamiento plegable y respuesta final en tiempo real.
+              </div>
+
+              <template v-for="entry in sessionLogEntries" :key="entry.id">
+                <!-- Prompt del usuario -->
+                <div
+                  v-if="entry.kind === 'prompt'"
+                  class="rounded-lg bg-[#1E243B]/75 border border-[#4F6EF7]/25 px-3 py-2 space-y-1"
+                >
+                  <div class="text-[11px] font-semibold text-[#93A8FA]">
+                    Tú · @{{ entry.agentId }}
+                  </div>
+                  <div class="text-xs text-[#F3F4F6] whitespace-pre-wrap select-text leading-relaxed">
+                    {{ entry.content }}
+                  </div>
+                </div>
+
+                <!-- Razonamiento plegable -->
+                <details
+                  v-else-if="entry.kind === 'reasoning'"
+                  class="rounded-lg bg-[#1F232D] border border-white/[0.06]"
+                >
+                  <summary class="flex items-center justify-between gap-2 px-3 py-1.5 cursor-pointer text-[11px] text-[#93A8FA] select-none">
+                    <span class="flex items-center gap-1.5 min-w-0 truncate">
+                      <span class="font-medium">Razonamiento</span>
+                      <span aria-hidden="true" class="text-[#4B5563]">·</span>
+                      <span class="text-[#D1D5DB]">
+                        {{ profileMap[entry.agentId]?.name || entry.agentId }}
+                      </span>
+                      <span aria-hidden="true" class="text-[#4B5563]">·</span>
+                      <span :class="entry.status === 'running' ? 'text-[#93A8FA]' : 'text-[#9CA3AF]'">
+                        {{ entry.status === "running" ? "Pensando..." : "Completado" }}
+                      </span>
+                    </span>
+                    <span class="text-[10px] text-[#6B7280] tabular-nums shrink-0">
+                      {{ entry.content.length }} chars
+                    </span>
+                  </summary>
+                  <div class="px-3 pb-2.5 pt-2 text-[11px] text-[#D1D5DB] whitespace-pre-wrap leading-relaxed border-t border-white/[0.06] max-h-48 overflow-y-auto select-text">
+                    {{ entry.content || "Analizando problema..." }}
+                  </div>
+                </details>
+
+                <!-- Línea de herramienta -->
+                <div
+                  v-else-if="entry.kind === 'tool'"
+                  class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-[#111318]/80 border border-white/[0.05] text-[11px]"
+                >
+                  <div class="flex items-center gap-1.5 min-w-0 truncate">
+                    <span
+                      :class="[
+                        'shrink-0 font-semibold',
+                        entry.status === 'done'
+                          ? 'text-[#10B981]'
+                          : entry.status === 'error'
+                            ? 'text-[#E11D48]'
+                            : 'text-[#4F6EF7]',
+                      ]"
+                    >
+                      {{
+                        entry.status === "done"
+                          ? "✓"
+                          : entry.status === "error"
+                            ? "✕"
+                            : "…"
+                      }}
+                    </span>
+                    <span class="font-medium text-[#E5E7EB] shrink-0">{{ entry.toolName }}</span>
+                    <span
+                      v-if="entry.target"
+                      class="text-[#9CA3AF] truncate tabular-nums"
+                    >
+                      · {{ entry.target }}
+                    </span>
+                  </div>
+                  <span class="text-[10px] text-[#6B7280] shrink-0">
+                    {{ profileMap[entry.agentId]?.name || entry.agentId }}
+                  </span>
+                </div>
+
+                <!-- Respuesta final / texto en vivo -->
+                <div
+                  v-else-if="entry.kind === 'text'"
+                  class="rounded-lg bg-[#1F232D] border border-white/[0.08] px-3 py-2.5 space-y-1.5"
+                >
+                  <div class="flex items-center gap-1.5 text-[11px] text-[#D1D5DB] font-medium">
+                    <span
+                      class="w-2 h-2 rounded-[2px] shrink-0"
+                      :style="{
+                        backgroundColor:
+                          profileMap[entry.agentId]?.color || '#4F6EF7',
+                      }"
+                    ></span>
+                    <span>{{ profileMap[entry.agentId]?.name || entry.agentId }}</span>
+                    <span aria-hidden="true" class="text-[#4B5563]">·</span>
+                    <span :class="entry.status === 'running' ? 'text-[#93A8FA]' : 'text-[#10B981]'">
+                      {{ entry.status === "running" ? "Escribiendo..." : "Respuesta" }}
+                    </span>
+                  </div>
+                  <div class="text-xs text-[#F3F4F6] whitespace-pre-wrap leading-relaxed select-text">
+                    {{ entry.content }}
+                  </div>
+                </div>
+
+                <!-- Error -->
+                <div
+                  v-else
+                  class="rounded-lg bg-[#2B141C] border border-[#E11D48]/35 px-3 py-2 text-xs text-[#FECDD3] select-text"
+                >
+                  {{ entry.content }}
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pestaña Conexión -->
+        <div
+          v-else-if="openCodeTab === 'connection'"
+          class="flex-1 min-h-0 overflow-y-auto p-4 space-y-3.5"
+        >
+          <div class="space-y-2.5">
+            <div class="flex flex-col gap-1">
+              <span class="text-[11px] text-[#9CA3AF]">Modo de enlace</span>
+              <div
+                class="grid grid-cols-2 gap-1 p-0.5 rounded-lg bg-[#181B22] border border-white/[0.08]"
+              >
+                <button
+                  type="button"
+                  @click="openCodeForm.mode = 'direct'"
+                  :class="[
+                    'px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer',
+                    openCodeForm.mode === 'direct'
+                      ? 'bg-[#252A36] text-[#F3F4F6]'
+                      : 'text-[#9CA3AF] hover:text-[#E5E7EB]',
+                  ]"
+                >
+                  Directo :4096
+                </button>
+                <button
+                  type="button"
+                  @click="openCodeForm.mode = 'bridge'"
+                  :class="[
+                    'px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer',
+                    openCodeForm.mode === 'bridge'
+                      ? 'bg-[#252A36] text-[#F3F4F6]'
+                      : 'text-[#9CA3AF] hover:text-[#E5E7EB]',
+                  ]"
+                >
+                  Puente :4097
+                </button>
+              </div>
+            </div>
+
+            <label class="flex flex-col gap-1 text-[11px] text-[#9CA3AF]">
+              <span>{{
+                openCodeForm.mode === "bridge"
+                  ? "URL del Puente Local"
+                  : "URL de opencode serve"
+              }}</span>
+              <input
+                v-if="openCodeForm.mode === 'direct'"
+                v-model="openCodeForm.directUrl"
+                type="text"
+                placeholder="http://127.0.0.1:4096"
+                class="px-3 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#F3F4F6] focus:outline-none focus:border-[#4F6EF7] tabular-nums"
+              />
+              <input
+                v-else
+                v-model="openCodeForm.bridgeUrl"
+                type="text"
+                placeholder="http://127.0.0.1:4097"
+                class="px-3 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#F3F4F6] focus:outline-none focus:border-[#4F6EF7] tabular-nums"
+              />
+            </label>
+
+            <div class="grid grid-cols-3 gap-2">
+              <label class="flex flex-col gap-1 text-[11px] text-[#9CA3AF]">
+                <span>Usuario</span>
+                <input
+                  v-model="openCodeForm.username"
+                  type="text"
+                  placeholder="opencode"
+                  class="px-2.5 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#F3F4F6] focus:outline-none focus:border-[#4F6EF7]"
+                />
+              </label>
+
+              <label class="flex flex-col gap-1 text-[11px] text-[#9CA3AF]">
+                <span>Clave</span>
+                <input
+                  v-model="openCodeForm.password"
+                  type="password"
+                  placeholder="••••••"
+                  class="px-2.5 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#F3F4F6] focus:outline-none focus:border-[#4F6EF7]"
+                />
+              </label>
+
+              <label class="flex flex-col gap-1 text-[11px] text-[#9CA3AF]">
+                <span>Cooldown (s)</span>
+                <input
+                  v-model.number="openCodeForm.idleCooldownSec"
+                  type="number"
+                  min="5"
+                  max="60"
+                  class="px-2.5 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs tabular-nums text-[#F3F4F6] focus:outline-none focus:border-[#4F6EF7]"
+                />
+              </label>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              @click="handleToggleOpenCodeConnection"
+              :class="[
+                'px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap',
+                openCodeState.status === 'connected' ||
+                openCodeState.status === 'connecting'
+                  ? 'bg-[#2B141C] hover:bg-[#3A1B26] border border-[#E11D48]/35 text-[#FECDD3]'
+                  : 'bg-[#4F6EF7] hover:bg-[#5E7BF8] text-[#F8FAFC]',
+              ]"
+            >
+              <Plug class="w-3.5 h-3.5" />
+              <span>{{
+                openCodeState.status === "connected" ||
+                openCodeState.status === "connecting"
+                  ? "Desconectar"
+                  : "Conectar"
+              }}</span>
+            </button>
+
+            <button
+              type="button"
+              @click="handleTestOpenCodeConnection"
+              :disabled="isTestingConnection"
+              class="px-3 py-1.5 rounded-lg bg-[#1F232D] hover:bg-[#272D3B] border border-white/[0.08] text-xs font-medium text-[#E5E7EB] transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+            >
+              {{ isTestingConnection ? "Probando..." : "Probar conexión" }}
+            </button>
+
+            <button
+              type="button"
+              @click="saveOpenCodeConfig"
+              class="px-3 py-1.5 rounded-lg bg-[#181B22] hover:bg-[#252A36] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] transition-colors cursor-pointer whitespace-nowrap"
+            >
+              Guardar ajuste
+            </button>
+          </div>
+
+          <div
+            class="rounded-lg bg-[#181B22] border border-white/[0.08] px-3 py-2 flex items-center justify-between text-xs text-[#9CA3AF] tabular-nums"
+          >
+            <span>Eventos: {{ openCodeState.eventsReceived }}</span>
+            <span>Sesiones: {{ openCodeState.sessionsCount }}</span>
+            <span>En vivo: {{ openCodeState.activeAgents.length }}/5</span>
+          </div>
+
+          <div
+            v-if="testResult || openCodeState.lastError"
+            class="rounded-lg bg-[#181B22] border border-white/[0.08] px-3 py-2.5 text-xs space-y-1"
+          >
+            <div
+              v-if="testResult"
+              :class="testResult.ok ? 'text-[#10B981]' : 'text-[#FB7185]'"
+            >
+              {{
+                testResult.ok
+                  ? `Servidor accesible (${testResult.latencyMs} ms · ${testResult.sessionsCount} sesiones detectadas)`
+                  : `Diagnóstico: ${testResult.error}`
+              }}
+            </div>
+            <div v-if="openCodeState.lastError" class="text-[#FB7185]">
+              {{ openCodeState.lastError }}
+            </div>
+          </div>
+        </div>
+
+        <!-- Pestaña Mapeo de 5 Agentes -->
+        <div
+          v-else-if="openCodeTab === 'mapping'"
+          class="flex-1 min-h-0 overflow-y-auto p-4 space-y-3"
+        >
+          <div class="space-y-2">
+            <div
+              v-for="ag in agentList"
+              :key="ag.id"
+              class="rounded-lg bg-[#181B22] border border-white/[0.08] p-2.5 space-y-1.5"
+            >
+              <div class="flex items-center justify-between gap-2">
+                <div class="flex items-center gap-2 min-w-0">
+                  <span
+                    class="w-2.5 h-2.5 rounded-[3px] shrink-0"
+                    :style="{ backgroundColor: ag.color }"
+                  ></span>
+                  <span class="text-xs font-semibold text-[#F3F4F6] truncate">
+                    {{ ag.name }}
+                  </span>
+                  <span class="text-[11px] text-[#6B7280]">({{ ag.id }})</span>
+                </div>
+                <span
+                  :class="[
+                    'text-[11px] font-medium shrink-0',
+                    openCodeState.activeAgents.includes(ag.id)
+                      ? 'text-[#10B981]'
+                      : 'text-[#6B7280]',
+                  ]"
+                >
+                  {{
+                    openCodeState.activeAgents.includes(ag.id)
+                      ? "En vivo"
+                      : "Autónomo"
+                  }}
+                </span>
+              </div>
+              <input
+                v-model="aliasDraft[ag.id]"
+                type="text"
+                placeholder="alias1, alias2"
+                class="w-full px-2.5 py-1.5 rounded-md bg-[#111318] border border-white/[0.08] text-xs text-[#E5E7EB] focus:outline-none focus:border-[#4F6EF7]"
+              />
+            </div>
+          </div>
+
+          <p class="text-[11px] text-[#9CA3AF] leading-relaxed">
+            Resuelve eventos por <span>part.agent</span>, subagentes <span>task</span>, sesión hija <span>parentID</span> o alias separados por coma.
+          </p>
+
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              @click="handleSaveAliases"
+              class="px-3.5 py-1.5 rounded-lg bg-[#4F6EF7] hover:bg-[#5E7BF8] text-xs font-medium text-[#F8FAFC] transition-colors cursor-pointer whitespace-nowrap"
+            >
+              Guardar alias
+            </button>
+            <button
+              type="button"
+              @click="handleResetAliases"
+              class="px-3 py-1.5 rounded-lg bg-[#1F232D] hover:bg-[#272D3B] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] transition-colors cursor-pointer whitespace-nowrap"
+            >
+              Restaurar
+            </button>
+          </div>
+        </div>
+
+        <!-- Pestaña Guía y Plantilla opencode.json -->
+        <div
+          v-else
+          class="flex-1 min-h-0 overflow-y-auto p-4 space-y-3.5 text-xs text-[#D1D5DB]"
+        >
+          <div class="space-y-2">
+            <p class="font-semibold text-[#F3F4F6]">
+              Cómo conectar tu OpenCode paso a paso:
+            </p>
+            <ol class="space-y-1.5 list-decimal list-inside text-[#D1D5DB] leading-relaxed">
+              <li>
+                Copia la plantilla <span class="text-[#93A8FA]">opencode.json</span> en la raíz del proyecto o en <span class="text-[#F3F4F6]">~/.config/opencode/opencode.json</span>.
+              </li>
+              <li>
+                Inicia el servidor local de OpenCode con CORS habilitado (o el puente en el puerto 4097).
+              </li>
+              <li>
+                Conecta tu TUI con <span class="text-[#93A8FA]">opencode attach</span> y delega tareas desde <span class="text-[#F3F4F6]">architect</span> hacia <span class="text-[#F3F4F6]">@frontend</span>, <span class="text-[#F3F4F6]">@backend</span>, <span class="text-[#F3F4F6]">@qa</span> o <span class="text-[#F3F4F6]">@systems</span>.
+              </li>
+              <li>
+                Pulsa <strong>Conectar</strong> en Conexión; cada agente activo irá a su escritorio tras la reunión de delegación.
+              </li>
+            </ol>
+          </div>
+
+          <div class="space-y-1.5">
+            <div class="flex items-center justify-between gap-2 rounded-lg bg-[#181B22] border border-white/[0.08] px-2.5 py-2">
+              <span class="text-[11px] text-[#93A8FA] truncate select-text">
+                {{ OPENCODE_CLI_COMMANDS.serveDirect }}
+              </span>
+              <button
+                type="button"
+                @click="copySnippet('serve', OPENCODE_CLI_COMMANDS.serveDirect)"
+                class="px-2 py-1 rounded-md bg-[#1F232D] hover:bg-[#272D3B] text-[11px] text-[#E5E7EB] flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <Check v-if="copiedKey === 'serve'" class="w-3 h-3 text-[#10B981]" />
+                <Copy v-else class="w-3 h-3" />
+                <span>{{ copiedKey === "serve" ? "Copiado" : "Copiar" }}</span>
+              </button>
+            </div>
+
+            <div class="flex items-center justify-between gap-2 rounded-lg bg-[#181B22] border border-white/[0.08] px-2.5 py-2">
+              <span class="text-[11px] text-[#D1D5DB] truncate select-text">
+                {{ OPENCODE_CLI_COMMANDS.runBridge }} · {{ OPENCODE_CLI_COMMANDS.attachTui }}
+              </span>
+              <button
+                type="button"
+                @click="copySnippet('bridge', OPENCODE_CLI_COMMANDS.runBridge)"
+                class="px-2 py-1 rounded-md bg-[#1F232D] hover:bg-[#272D3B] text-[11px] text-[#E5E7EB] flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <Check v-if="copiedKey === 'bridge'" class="w-3 h-3 text-[#10B981]" />
+                <Copy v-else class="w-3 h-3" />
+                <span>{{ copiedKey === "bridge" ? "Copiado" : "Puente" }}</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="space-y-2">
+            <div class="flex flex-wrap items-center justify-between gap-1.5">
+              <span class="font-medium text-[#E5E7EB]">Plantilla opencode.json</span>
+              <div class="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  @click="downloadOpenCodeReport"
+                  class="px-2 py-1 rounded-md bg-[#1F232D] hover:bg-[#272D3B] border border-white/[0.08] text-[11px] font-medium text-[#E5E7EB] flex items-center gap-1 cursor-pointer"
+                >
+                  <Download class="w-3 h-3" />
+                  <span>Guía .md</span>
+                </button>
+                <button
+                  type="button"
+                  @click="downloadOpenCodeJson"
+                  class="px-2 py-1 rounded-md bg-[#1F232D] hover:bg-[#272D3B] border border-white/[0.08] text-[11px] font-medium text-[#E5E7EB] flex items-center gap-1 cursor-pointer"
+                >
+                  <Download class="w-3 h-3" />
+                  <span>.json</span>
+                </button>
+                <button
+                  type="button"
+                  @click="copySnippet('json', OPENCODE_JSON_SNIPPET)"
+                  class="px-2.5 py-1 rounded-md bg-[#4F6EF7] hover:bg-[#5E7BF8] text-[11px] font-medium text-[#F8FAFC] flex items-center gap-1 cursor-pointer"
+                >
+                  <Check v-if="copiedKey === 'json'" class="w-3 h-3" />
+                  <Copy v-else class="w-3 h-3" />
+                  <span>{{ copiedKey === "json" ? "Copiado" : "Copiar JSON" }}</span>
+                </button>
+              </div>
+            </div>
+            <pre
+              class="rounded-lg bg-[#181B22] border border-white/[0.08] p-3 text-[11px] text-[#D1D5DB] overflow-auto max-h-56 leading-relaxed select-text"
+            >{{ OPENCODE_JSON_SNIPPET }}</pre>
+          </div>
+        </div>
+      </aside>
+    </transition>
+
+    <!-- ZONA 4B: Modal Amplio Centrado del Tablero Kanban -->
+    <transition
+      enter-active-class="transition duration-150 ease-out"
+      enter-from-class="opacity-0"
+      enter-to-class="opacity-100"
+      leave-active-class="transition duration-120 ease-in"
+      leave-from-class="opacity-100"
+      leave-to-class="opacity-0"
+    >
+      <div
+        v-if="isReady && isTaskBoardOpen"
+        @click.self="isTaskBoardOpen = false"
+        class="fixed inset-0 z-40 bg-[#090B0E]/75 flex items-center justify-center p-4 sm:p-6 pointer-events-auto"
+      >
+        <div
+          class="w-[min(1200px,95vw)] max-h-[88vh] rounded-xl bg-[#111318] border border-white/[0.08] flex flex-col overflow-hidden"
+        >
+          <!-- Cabecera Modal Kanban -->
+          <div
+            class="px-5 py-3.5 border-b border-white/[0.08] bg-[#181B22] flex flex-wrap items-center justify-between gap-3 shrink-0"
+          >
+            <div class="flex items-center gap-2.5 text-sm font-semibold text-[#F3F4F6]">
+              <ListTodo class="w-4 h-4 text-[#4F6EF7]" />
+              <span>Tablero de Tareas (Sprint)</span>
+              <span aria-hidden="true" class="text-[#4B5563]">·</span>
+              <span class="text-xs font-normal text-[#9CA3AF] tabular-nums">
+                {{ tasks.length }} tareas
+              </span>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2">
+              <!-- Filtro rápido de origen -->
+              <div
+                class="flex items-center gap-0.5 p-0.5 rounded-lg bg-[#111318] border border-white/[0.08]"
+              >
+                <button
+                  type="button"
+                  @click="taskSourceFilter = 'all'"
+                  :class="[
+                    'px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
+                    taskSourceFilter === 'all'
+                      ? 'bg-[#252A36] text-[#F3F4F6]'
+                      : 'text-[#9CA3AF] hover:text-[#E5E7EB]',
+                  ]"
+                >
+                  Todas
+                </button>
+                <button
+                  type="button"
+                  @click="taskSourceFilter = 'opencode'"
+                  :class="[
+                    'px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
+                    taskSourceFilter === 'opencode'
+                      ? 'bg-[#1E243B] text-[#93A8FA]'
+                      : 'text-[#9CA3AF] hover:text-[#E5E7EB]',
+                  ]"
+                >
+                  OpenCode
+                </button>
+                <button
+                  type="button"
+                  @click="taskSourceFilter = 'manual'"
+                  :class="[
+                    'px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap',
+                    taskSourceFilter === 'manual'
+                      ? 'bg-[#252A36] text-[#F3F4F6]'
+                      : 'text-[#9CA3AF] hover:text-[#E5E7EB]',
+                  ]"
+                >
+                  Manuales
+                </button>
+              </div>
+
+              <button
+                type="button"
+                :disabled="demoTasksCount === 0"
+                @click="handleClearDemoTasks"
+                class="px-2.5 py-1.5 rounded-lg bg-[#1F232D] hover:bg-[#272D3B] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] transition-colors cursor-pointer whitespace-nowrap disabled:opacity-40"
+              >
+                Limpiar demo
+              </button>
+              <button
+                type="button"
+                @click="taskBoardManager.clearDoneTasks()"
+                class="px-2.5 py-1.5 rounded-lg bg-[#1F232D] hover:bg-[#272D3B] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] transition-colors cursor-pointer whitespace-nowrap"
+              >
+                Limpiar completadas
+              </button>
+              <button
+                type="button"
+                @click="taskBoardManager.resetTasks()"
+                class="px-2.5 py-1.5 rounded-lg bg-[#1F232D] hover:bg-[#272D3B] border border-white/[0.08] text-xs font-medium text-[#D1D5DB] transition-colors cursor-pointer whitespace-nowrap"
+              >
+                Restaurar demo
+              </button>
+              <button
+                type="button"
+                @click="isTaskBoardOpen = false"
+                aria-label="Cerrar tablero"
+                class="p-1.5 rounded-lg bg-[#1F232D] hover:bg-[#272D3B] border border-white/[0.08] text-[#9CA3AF] hover:text-[#F3F4F6] transition-colors cursor-pointer"
+              >
+                <X class="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          <!-- Alta rápida de tarea -->
+          <form
+            @submit.prevent="handleCreateTask"
+            class="px-5 py-3 border-b border-white/[0.08] grid grid-cols-1 sm:grid-cols-12 gap-2 shrink-0"
+          >
+            <input
+              v-model="newTask.title"
+              type="text"
+              maxlength="48"
+              placeholder="Nueva tarea (ej. Optimizar sombras PBR)"
+              class="sm:col-span-4 px-3 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#F3F4F6] placeholder:text-[#6B7280] focus:outline-none focus:border-[#4F6EF7]"
+            />
+            <input
+              v-model="newTask.file"
+              type="text"
+              maxlength="42"
+              placeholder="Archivo (ej. src/webgl/World.js)"
+              class="sm:col-span-3 px-3 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#E5E7EB] placeholder:text-[#6B7280] focus:outline-none focus:border-[#4F6EF7]"
+            />
+            <select
+              v-model="newTask.assigneeId"
+              class="sm:col-span-2 px-2.5 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#E5E7EB] focus:outline-none focus:border-[#4F6EF7]"
+            >
+              <option
+                v-for="ag in agentList"
+                :key="ag.id"
+                :value="ag.id"
+              >
+                {{ ag.name }}
+              </option>
+            </select>
+            <select
+              v-model="newTask.status"
+              class="sm:col-span-2 px-2.5 py-1.5 rounded-lg bg-[#181B22] border border-white/[0.08] text-xs text-[#E5E7EB] focus:outline-none focus:border-[#4F6EF7]"
+            >
+              <option
+                v-for="col in TASK_COLUMNS"
+                :key="col.id"
+                :value="col.id"
+              >
+                {{ col.label }}
+              </option>
+            </select>
+            <button
+              type="submit"
+              class="sm:col-span-1 px-3 py-1.5 rounded-lg bg-[#4F6EF7] hover:bg-[#5E7BF8] text-xs font-medium text-[#F8FAFC] flex items-center justify-center gap-1 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Plus class="w-3.5 h-3.5" />
+              <span>Crear</span>
+            </button>
+          </form>
+
+          <!-- 5 Columnas Kanban -->
+          <div class="flex-1 min-h-0 overflow-y-auto p-5 grid grid-cols-1 md:grid-cols-5 gap-3">
+            <div
+              v-for="col in TASK_COLUMNS"
+              :key="col.id"
+              class="rounded-xl bg-[#181B22] border border-white/[0.08] p-3 flex flex-col gap-2.5 min-h-[280px]"
+            >
+              <div class="flex items-center justify-between text-xs font-semibold pb-1.5 border-b border-white/[0.06]">
+                <div class="flex items-center gap-2">
+                  <span
+                    class="w-2 h-2 rounded-[2px] shrink-0"
+                    :style="{ backgroundColor: col.hex }"
+                  ></span>
+                  <span :class="col.accent">{{ col.label }}</span>
+                </div>
+                <span class="text-[#9CA3AF] tabular-nums">
+                  {{ taskCountByStatus[col.id] }}
+                </span>
+              </div>
+
+              <div class="space-y-2">
+                <div
+                  v-for="task in filteredTasks.filter((t) => t.status === col.id)"
+                  :key="task.id"
+                  class="rounded-lg bg-[#1F232D] border border-white/[0.08] p-2.5 space-y-2"
+                >
+                  <div class="flex items-start justify-between gap-2">
+                    <p class="text-xs font-medium text-[#F3F4F6] leading-snug">
+                      {{ task.title }}
+                    </p>
+                    <button
+                      type="button"
+                      @click="handleDeleteTask(task.id)"
+                      aria-label="Eliminar tarea"
+                      class="text-[#6B7280] hover:text-[#FB7185] transition-colors cursor-pointer shrink-0"
+                    >
+                      <Trash2 class="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+
+                  <div class="text-[11px] text-[#9CA3AF] truncate tabular-nums">
+                    {{ task.file }}
+                  </div>
+
+                  <div class="flex items-center justify-between gap-2 pt-0.5">
+                    <button
+                      type="button"
+                      @click="
+                        selectAgentFromDock(task.assigneeId);
+                        isTaskBoardOpen = false;
+                      "
+                      class="flex items-center gap-1.5 text-[11px] text-[#D1D5DB] hover:text-[#F3F4F6] cursor-pointer truncate"
+                    >
+                      <span
+                        class="w-2 h-2 rounded-[2px] shrink-0"
+                        :style="{
+                          backgroundColor:
+                            profileMap[task.assigneeId]?.color || '#6B7280',
+                        }"
+                      ></span>
+                      <span class="truncate">{{
+                        profileMap[task.assigneeId]?.name || task.assigneeId
+                      }}</span>
+                      <span
+                        v-if="task.source === 'opencode'"
+                        class="text-[10px] font-medium text-[#93A8FA] shrink-0"
+                      >
+                        · OpenCode
+                      </span>
+                      <span
+                        v-else-if="task.source === 'demo'"
+                        class="text-[10px] text-[#6B7280] shrink-0"
+                      >
+                        · Demo
+                      </span>
+                    </button>
+
+                    <select
+                      :value="task.status"
+                      @change="handleMoveTask(task.id, $event.target.value)"
+                      aria-label="Cambiar estado de tarea"
+                      class="px-1.5 py-0.5 rounded-md bg-[#111318] border border-white/[0.08] text-[10px] text-[#D1D5DB] focus:outline-none focus:border-[#4F6EF7] cursor-pointer"
+                    >
+                      <option
+                        v-for="opt in TASK_COLUMNS"
+                        :key="opt.id"
+                        :value="opt.id"
+                      >
+                        {{ opt.label }}
+                      </option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </transition>
   </main>
 </template>
