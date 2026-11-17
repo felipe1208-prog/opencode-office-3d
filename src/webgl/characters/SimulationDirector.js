@@ -59,6 +59,15 @@ const REVIEW_CHECKPOINT_BY_HOST = {
   systems: "review-systems",
 };
 
+const MEETING_SEATS = [
+  "meeting-chair-n1",
+  "meeting-chair-s1",
+  "meeting-chair-n2",
+  "meeting-chair-s2",
+  "meeting-chair-n3",
+  "meeting-chair-s3",
+];
+
 const SAMPLE_TASKS = [
   { label: "Compilando grafo A*", file: "src/webgl/navigation/Pathfinding.ts" },
   { label: "Optimizando shaders PBR", file: "src/webgl/core/Renderer.ts" },
@@ -83,9 +92,13 @@ export class SimulationDirector {
     this.activeDelegation = null; // { hostAgentId, participants: Set }
     this.visualQueue = new VisualActionQueue({
       meetingHoldMs: 5000,
-      meetingExtendMs: 4500,
+      meetingExtendMs: 5000,
+      socialHoldMinMs: 12000,
+      socialHoldMaxMs: 15000,
+      approachRescueMs: 14000,
       deskDwellMs: 4000,
       stepDisplayMs: 950,
+      dialogueTurnMs: 2200,
     });
     this.unsubscribers = [];
     this.queueHandlers = this._getQueueHandlers();
@@ -112,6 +125,13 @@ export class SimulationDirector {
     );
   }
 
+  isAgentBusyForAmbient(agentId) {
+    return (
+      this.isAgentLiveBusy(agentId) ||
+      this.visualQueue.hasActiveBarrier(agentId)
+    );
+  }
+
   _isAgentPhysicallyAtDesk(agent) {
     if (!agent) return false;
     return (
@@ -122,56 +142,424 @@ export class SimulationDirector {
     );
   }
 
+  _sendBarrierParticipantToCheckpoint(barrier, participant) {
+    const agent = this.characterManager.getAgent(participant.agentId);
+    if (!agent) return false;
+
+    const timer = this.agentTimers.get(participant.agentId);
+    if (timer) {
+      timer.interactCooldown = 20;
+      timer.waitCooldown = 20;
+    }
+
+    const onSeated = () => {
+      this.visualQueue.markBarrierParticipantReady(
+        participant.agentId,
+        this.queueHandlers,
+      );
+    };
+
+    if (
+      barrier.kind === "desk_review" &&
+      participant.role === "host" &&
+      this._isAgentPhysicallyAtDesk(agent)
+    ) {
+      agent.setSocialContext({
+        mode: participant.socialMode,
+        phase: "APPROACHING",
+        partnerName: participant.partnerName,
+        rotY: participant.overrideRotY,
+      });
+      onSeated();
+      return true;
+    }
+
+    const initialAction =
+      barrier.kind === "desk_review" && participant.role === "host"
+        ? "typing"
+        : participant.waitingActionKey || "standingIdle";
+
+    return agent.requestAction(participant.checkpointId, {
+      overrideAction: initialAction,
+      socialMode: participant.socialMode,
+      socialPhase: "APPROACHING",
+      socialPartnerName: participant.partnerName,
+      overrideRotY: participant.overrideRotY,
+      onSeated,
+    });
+  }
+
+  _applyBarrierMutualOrientation(barrier) {
+    const list = Array.from(barrier.participants.values());
+    if (barrier.kind === "pair_chat" && list.length === 2) {
+      const a1 = this.characterManager.getAgent(list[0].agentId);
+      const a2 = this.characterManager.getAgent(list[1].agentId);
+      if (a1 && a2) {
+        a1.lookAtWorldPosition(a2.model.position);
+        a2.lookAtWorldPosition(a1.model.position);
+      }
+      return;
+    }
+
+    if (barrier.kind === "desk_review" && list.length === 2) {
+      const hostP = list.find((p) => p.role === "host") || list[0];
+      const revP = list.find((p) => p !== hostP) || list[1];
+      const hostAgent = this.characterManager.getAgent(hostP.agentId);
+      const revAgent = this.characterManager.getAgent(revP.agentId);
+      if (hostAgent && revAgent) {
+        revAgent.lookAtWorldPosition(hostAgent.model.position);
+      }
+      return;
+    }
+
+    if (barrier.kind === "delegation" || barrier.kind === "team_meeting") {
+      const hostP = list.find((p) => p.role === "host") || list[0];
+      const hostAgent = this.characterManager.getAgent(hostP?.agentId);
+      if (hostAgent) {
+        const firstListener = list.find((p) => p.agentId !== hostP.agentId);
+        const listenerAgent = firstListener
+          ? this.characterManager.getAgent(firstListener.agentId)
+          : null;
+        if (listenerAgent) {
+          hostAgent.lookAtWorldPosition(listenerAgent.model.position);
+        }
+      }
+    }
+  }
+
+  _applyBarrierTurnClips(barrier, speakerIndex = 0) {
+    const list = Array.from(barrier.participants.values());
+    if (list.length === 0) return;
+
+    const activeIdx = speakerIndex % list.length;
+
+    list.forEach((p, idx) => {
+      const agent = this.characterManager.getAgent(p.agentId);
+      if (!agent) return;
+      const isSpeaker = idx === activeIdx;
+
+      if (barrier.kind === "pair_chat") {
+        const action = isSpeaker
+          ? p.actionKey || (p.seatedRequired ? "pairChatSeated" : "pairChat")
+          : p.waitingActionKey || (p.seatedRequired ? "sittingIdle" : "standingIdle");
+        agent.applyActionProfile(action);
+        return;
+      }
+
+      if (barrier.kind === "desk_review") {
+        if (p.role === "host") {
+          agent.applyActionProfile(isSpeaker ? "sittingTalking" : "sittingIdle", {
+            customLabel: `Revisando · ${p.partnerName || barrier.topic}`,
+          });
+        } else {
+          agent.applyActionProfile(isSpeaker ? "deskReview" : "talking", {
+            customLabel: `Revisando · ${p.partnerName || barrier.topic}`,
+          });
+        }
+        return;
+      }
+
+      if (barrier.kind === "delegation" || barrier.kind === "team_meeting") {
+        if (p.role === "host") {
+          const action = isSpeaker ? "presenting" : "talking";
+          agent.applyActionProfile(action, {
+            customLabel: barrier.topic,
+          });
+        } else {
+          const action = isSpeaker ? "listening" : "sittingIdle";
+          agent.applyActionProfile(action, {
+            customLabel: barrier.topic,
+          });
+        }
+      }
+    });
+  }
+
   _getQueueHandlers() {
     return {
-      onQueueDuringMeeting: (agentId, { label }) => {
-        const agent = this.characterManager.getAgent(agentId);
-        if (agent && label) {
-          agent.taskTitle = label;
-          agent.syncBubble();
+      onQueueDuringBarrier: () => {
+        // Retener burbujas SSE y monitores estrictamente hasta SEATED_READY;
+        // la bitácora en Comando ya refleja el stream en vivo.
+      },
+
+      onBarrierParticipantWaiting: (barrier, participant) => {
+        const agent = this.characterManager.getAgent(participant.agentId);
+        if (!agent) return;
+
+        const partners = Array.from(barrier.participants.values()).filter(
+          (p) => p.agentId !== participant.agentId,
+        );
+        const firstPartnerAgent = partners[0]
+          ? this.characterManager.getAgent(partners[0].agentId)
+          : null;
+
+        agent.setSocialContext({
+          mode: participant.socialMode,
+          phase: "APPROACHING",
+          partnerName: participant.partnerName,
+          rotY: participant.overrideRotY,
+        });
+
+        if (barrier.kind === "desk_review" && participant.role === "host") {
+          agent.applyActionProfile("typing", {
+            customLabel: `Esperando revisión · ${participant.partnerName || "Compañero"}`,
+          });
+        } else {
+          const waitAction =
+            participant.waitingActionKey ||
+            (participant.seatedRequired ? "sittingIdle" : "standingIdle");
+          agent.applyActionProfile(waitAction);
+        }
+
+        if (firstPartnerAgent && !(barrier.kind === "desk_review" && participant.role === "host")) {
+          const partnerTarget =
+            firstPartnerAgent.model?.position ||
+            checkpointManager.get(partners[0].checkpointId)?.pos;
+          if (partnerTarget) {
+            agent.lookAtWorldPosition(partnerTarget);
+          }
         }
       },
-      onDispatchFromMeeting: (dispatchedList) => {
-        this.activeDelegation = null;
-        this.monitorSystem?.setMeetingState({ active: false });
 
-        for (const { agentId, step } of dispatchedList) {
+      onBarrierRevertedToApproaching: (barrier) => {
+        const hostAgent = this.characterManager.getAgent(barrier.hostAgentId);
+        if (barrier.kind === "delegation" || barrier.kind === "team_meeting") {
+          this.monitorSystem?.setMeetingState({
+            active: true,
+            topic: `Esperando equipo · ${String(barrier.topic || "").slice(0, 26)}`,
+            presenterName: hostAgent?.config.name || "Tech Lead",
+          });
+        }
+
+        for (const p of barrier.participants.values()) {
+          if (!p.ready) continue;
+          const agent = this.characterManager.getAgent(p.agentId);
+          if (!agent) continue;
+          agent.setSocialContext({
+            mode: p.socialMode,
+            phase: "APPROACHING",
+            partnerName: p.partnerName,
+            rotY: p.overrideRotY,
+          });
+          agent.applyActionProfile(
+            p.waitingActionKey || (p.seatedRequired ? "sittingIdle" : "standingIdle"),
+          );
+        }
+      },
+
+      onBarrierRescueParticipant: (barrier, participant) => {
+        const agent = this.characterManager.getAgent(participant.agentId);
+        const cp = checkpointManager.get(participant.checkpointId);
+        if (!agent || !cp) return;
+
+        const rescueAction =
+          barrier.kind === "desk_review" && participant.role === "host"
+            ? "typing"
+            : participant.waitingActionKey ||
+              (participant.seatedRequired ? "sittingIdle" : "standingIdle");
+
+        agent.snapToCheckpointAndSit(cp, {
+          overrideAction: rescueAction,
+          socialMode: participant.socialMode,
+          socialPhase: "APPROACHING",
+          socialPartnerName: participant.partnerName,
+          overrideRotY: participant.overrideRotY,
+        });
+      },
+
+      onBarrierEngaged: (barrier) => {
+        const safeTopic = String(barrier.topic || "Sincronización").slice(0, 38);
+        const hostAgent = this.characterManager.getAgent(barrier.hostAgentId);
+
+        for (const p of barrier.participants.values()) {
+          const agent = this.characterManager.getAgent(p.agentId);
+          if (!agent) continue;
+          if (barrier.kind === "delegation" || barrier.kind === "team_meeting") {
+            agent.taskTitle = safeTopic;
+          }
+          agent.setSocialContext({
+            mode: p.socialMode,
+            phase: "ENGAGED",
+            partnerName: p.partnerName,
+            rotY: p.overrideRotY,
+          });
+        }
+
+        this._applyBarrierMutualOrientation(barrier);
+        this._applyBarrierTurnClips(barrier, 0);
+
+        if (barrier.kind === "delegation" || barrier.kind === "team_meeting") {
+          this.monitorSystem?.setMeetingState({
+            active: true,
+            topic:
+              barrier.kind === "delegation"
+                ? `Delegación · ${safeTopic}`
+                : safeTopic,
+            presenterName: hostAgent?.config.name || "Tech Lead",
+          });
+        } else if (barrier.kind === "desk_review") {
+          const list = Array.from(barrier.participants.values());
+          const hostP = list.find((p) => p.role === "host") || list[0];
+          const revP = list.find((p) => p !== hostP) || list[1];
+          const revAgent = revP ? this.characterManager.getAgent(revP.agentId) : null;
+          if (hostP) {
+            this.monitorSystem?.setAgentScreenState(hostP.agentId, {
+              mode: "REVIEWING",
+              taskLabel: barrier.topic,
+              partnerName: revAgent?.config.name || revP?.partnerName || "Compañero",
+            });
+          }
+        }
+      },
+
+      onBarrierDialogueTurn: (barrier, speakerIndex) => {
+        this._applyBarrierTurnClips(barrier, speakerIndex);
+      },
+
+      onBarrierDispersing: (barrier, dispatchedList) => {
+        if (barrier.kind === "delegation") {
+          this.activeDelegation = null;
+        }
+        if (barrier.kind === "delegation" || barrier.kind === "team_meeting") {
+          this.monitorSystem?.setMeetingState({ active: false });
+        }
+
+        for (const { agentId, participant, hasLiveWork, step } of dispatchedList) {
           const agent = this.characterManager.getAgent(agentId);
           if (!agent) continue;
 
-          const screenMode = step.phase === "thinking" ? "THINKING" : "WORKING";
-          agent.returnHome({
-            pendingLiveTask: {
-              status: "started",
-              phase: step.phase,
-              label: step.label,
-              accentColor: step.phase === "thinking" ? "#4F6EF7" : null,
-              onSeated: () => {
-                const applied = this.visualQueue.markDeskSeated(agentId);
-                const resolved = applied || step;
-                const finalLabel =
-                  resolved.burstCount > 1
-                    ? `${resolved.label} (×${resolved.burstCount})`
-                    : resolved.label;
-                const finalMode =
-                  resolved.phase === "thinking" ? "THINKING" : "WORKING";
-                agent.state = finalMode;
-                agent.taskTitle = finalLabel;
-                agent.currentActionLabel = finalLabel;
-                agent.taskAccentColor =
-                  finalMode === "THINKING" ? "#4F6EF7" : null;
-                agent.syncBubble();
-                agent.notifyStateChange();
-                this.monitorSystem?.setAgentScreenState(agentId, {
-                  mode: finalMode,
-                  taskLabel: finalLabel || agent.currentActionLabel,
-                  taskFile: resolved.file,
-                });
+          if (hasLiveWork && step) {
+            agent.returnHome({
+              pendingLiveTask: {
+                status: "started",
+                phase: step.phase,
+                label: step.label,
+                accentColor: step.phase === "thinking" ? "#4F6EF7" : null,
+                onSeated: () => {
+                  const applied = this.visualQueue.markDeskSeated(agentId);
+                  if (!applied) return;
+                  const finalLabel =
+                    applied.burstCount > 1
+                      ? `${applied.label} (×${applied.burstCount})`
+                      : applied.label;
+                  const finalMode =
+                    applied.phase === "thinking" ? "THINKING" : "WORKING";
+                  agent.state = finalMode;
+                  agent.taskTitle = finalLabel;
+                  agent.currentActionLabel = finalLabel;
+                  agent.taskAccentColor =
+                    finalMode === "THINKING" ? "#4F6EF7" : null;
+                  agent.syncBubble();
+                  agent.notifyStateChange();
+                  this.monitorSystem?.setAgentScreenState(agentId, {
+                    mode: finalMode,
+                    taskLabel: finalLabel || agent.currentActionLabel,
+                    taskFile: applied.file,
+                  });
+                },
               },
-            },
-          });
+            });
+          } else {
+            const timer = this.agentTimers.get(agentId);
+            if (timer) {
+              timer.workCooldown = 12 + Math.random() * 8;
+              timer.interactCooldown = 0;
+              timer.waitCooldown = 0;
+            }
+
+            if (
+              barrier.kind === "desk_review" &&
+              participant.role === "host" &&
+              this._isAgentPhysicallyAtDesk(agent)
+            ) {
+              agent.clearSocialContext();
+              agent.applyActionProfile("typing");
+              this.monitorSystem?.setAgentScreenState(agentId, {
+                mode: "WORKING",
+                taskLabel: "Tecleando código",
+                partnerName: null,
+              });
+            } else {
+              agent.returnHome();
+            }
+          }
         }
       },
+
+      onBarrierCancelled: (barrier, { returnHome = true, excludeAgentIds = new Set() } = {}) => {
+        if (barrier.kind === "delegation") {
+          this.activeDelegation = null;
+        }
+        if (barrier.kind === "delegation" || barrier.kind === "team_meeting") {
+          this.monitorSystem?.setMeetingState({ active: false });
+        }
+
+        for (const agentId of barrier.participants.keys()) {
+          if (excludeAgentIds.has(agentId)) continue;
+          const agent = this.characterManager.getAgent(agentId);
+          if (!agent) continue;
+          agent.clearSocialContext();
+
+          const timer = this.agentTimers.get(agentId);
+          if (timer) {
+            timer.interactCooldown = 0;
+            timer.waitCooldown = 0;
+            timer.workCooldown = 10 + Math.random() * 6;
+          }
+
+          if (!returnHome) continue;
+
+          const entry = this.visualQueue.getAgentState(agentId);
+          const hasLive = Boolean(
+            entry &&
+              (entry.activeLiveSession ||
+                entry.pendingBursts.length > 0 ||
+                entry.pendingCompletion),
+          );
+
+          if (hasLive) {
+            agent.returnHome({
+              pendingLiveTask: {
+                status: "started",
+                phase: "working",
+                label: entry.pendingBursts[0]?.label || "Ejecutando subtarea",
+                onSeated: () => {
+                  const applied = this.visualQueue.markDeskSeated(agentId);
+                  if (!applied) return;
+                  const finalLabel =
+                    applied.burstCount > 1
+                      ? `${applied.label} (×${applied.burstCount})`
+                      : applied.label;
+                  const finalMode =
+                    applied.phase === "thinking" ? "THINKING" : "WORKING";
+                  agent.state = finalMode;
+                  agent.taskTitle = finalLabel;
+                  agent.currentActionLabel = finalLabel;
+                  agent.taskAccentColor =
+                    finalMode === "THINKING" ? "#4F6EF7" : null;
+                  agent.syncBubble();
+                  agent.notifyStateChange();
+                  this.monitorSystem?.setAgentScreenState(agentId, {
+                    mode: finalMode,
+                    taskLabel: finalLabel || agent.currentActionLabel,
+                    taskFile: applied.file,
+                  });
+                },
+              },
+            });
+          } else if (this._isAgentPhysicallyAtDesk(agent)) {
+            agent.applyActionProfile("typing");
+            this.monitorSystem?.setAgentScreenState(agentId, {
+              mode: "WORKING",
+              taskLabel: "Tecleando código",
+              partnerName: null,
+            });
+          } else {
+            agent.returnHome();
+          }
+        }
+      },
+
       onStartWalkToDesk: (agentId, { phase = "working", label, file }) => {
         const agent = this.characterManager.getAgent(agentId);
         if (!agent) return;
@@ -184,13 +572,13 @@ export class SimulationDirector {
             accentColor: phase === "thinking" ? "#4F6EF7" : null,
             onSeated: () => {
               const applied = this.visualQueue.markDeskSeated(agentId);
-              const resolved = applied || { phase, label, file, burstCount: 1 };
+              if (!applied) return;
               const finalLabel =
-                resolved.burstCount > 1
-                  ? `${resolved.label} (×${resolved.burstCount})`
-                  : resolved.label;
+                applied.burstCount > 1
+                  ? `${applied.label} (×${applied.burstCount})`
+                  : applied.label;
               const finalMode =
-                resolved.phase === "thinking" ? "THINKING" : "WORKING";
+                applied.phase === "thinking" ? "THINKING" : "WORKING";
               agent.state = finalMode;
               agent.taskTitle = finalLabel;
               agent.currentActionLabel = finalLabel;
@@ -201,12 +589,13 @@ export class SimulationDirector {
               this.monitorSystem?.setAgentScreenState(agentId, {
                 mode: finalMode,
                 taskLabel: finalLabel || agent.currentActionLabel,
-                taskFile: resolved.file,
+                taskFile: applied.file,
               });
             },
           },
         });
       },
+
       onApplyDeskStep: (agentId, step) => {
         const agent = this.characterManager.getAgent(agentId);
         if (!agent) return;
@@ -228,6 +617,7 @@ export class SimulationDirector {
           },
         });
       },
+
       onApplyCompletion: (agentId, completion) => {
         const agent = this.characterManager.getAgent(agentId);
         if (!agent) return;
@@ -253,39 +643,16 @@ export class SimulationDirector {
   }
 
   _clearDelegationHuddle({ returnRemainingHome = false } = {}) {
-    if (!this.activeDelegation && !this.visualQueue.meeting) return;
-    const remaining = Array.from(
-      this.activeDelegation?.participants ||
-        this.visualQueue.meeting?.participants ||
-        [],
-    );
-    this.activeDelegation = null;
-    this.visualQueue.meeting = null;
-    this.monitorSystem?.setMeetingState({ active: false });
-
-    if (returnRemainingHome) {
-      for (const agentId of remaining) {
-        const agent = this.characterManager.getAgent(agentId);
-        if (!agent) continue;
-        const cp = agent.targetCheckpointId || agent.currentCheckpointId || "";
-        if (String(cp).startsWith("meeting-")) {
-          agent.returnHome({
-            pendingLiveTask: {
-              status: "started",
-              phase: "working",
-              label: agent.taskTitle || "Ejecutando subtarea",
-              onSeated: () => {
-                this.visualQueue.markDeskSeated(agentId);
-                this.monitorSystem?.setAgentScreenState(agentId, {
-                  mode: "WORKING",
-                  taskLabel: agent.taskTitle || "Ejecutando subtarea",
-                });
-              },
-            },
-          });
-        }
-      }
+    if (this.visualQueue.getBarrier("delegation_meeting")) {
+      this.visualQueue.cancelBarrier(
+        "delegation_meeting",
+        { returnHome: returnRemainingHome, reason: "clear_delegation" },
+        this.queueHandlers,
+      );
+      return;
     }
+    this.activeDelegation = null;
+    this.monitorSystem?.setMeetingState({ active: false });
   }
 
   _executeDelegationHuddle({
@@ -305,61 +672,67 @@ export class SimulationDirector {
       return false;
     }
 
-    const seats = [
-      "meeting-chair-n1",
-      "meeting-chair-s1",
-      "meeting-chair-n2",
-      "meeting-chair-s2",
-      "meeting-chair-n3",
-      "meeting-chair-s3",
-    ];
+    const existingDelegation = this.visualQueue.getBarrier("delegation_meeting");
+    const usedSeats = new Set();
+    if (existingDelegation) {
+      for (const p of existingDelegation.participants.values()) {
+        if (p.checkpointId) usedSeats.add(p.checkpointId);
+      }
+    }
 
-    const delegation = this.visualQueue.startDelegation({
-      hostAgentId: host.config.id,
-      subagentId: subagent.config.id,
-      topic,
-    });
+    const existingSubSeat = existingDelegation?.participants.get(subagent.config.id)?.checkpointId;
+    const subSeat =
+      existingSubSeat ||
+      MEETING_SEATS.find(
+        (s) => !usedSeats.has(s) && checkpointManager.isAvailable(s),
+      ) ||
+      MEETING_SEATS.find((s) => !usedSeats.has(s)) ||
+      MEETING_SEATS[0];
+
+    const delegation = this.visualQueue.startDelegation(
+      {
+        hostAgentId: host.config.id,
+        subagentId: subagent.config.id,
+        topic,
+        hostCheckpointId: "meeting-presenter",
+        subagentCheckpointId: subSeat,
+      },
+      this.queueHandlers,
+    );
     if (!delegation) return false;
 
+    const barrier = this.visualQueue.getBarrier("delegation_meeting");
     if (!this.activeDelegation) {
       this.activeDelegation = {
         hostAgentId: host.config.id,
-        participants: new Set([host.config.id]),
+        participants: new Set(delegation.participants),
       };
     } else {
-      this.activeDelegation.participants.add(host.config.id);
+      for (const id of delegation.participants) {
+        this.activeDelegation.participants.add(id);
+      }
     }
 
     this.liveOwnership.set(host.config.id, { active: true, idleCooldown: 0 });
     this.liveOwnership.set(subagent.config.id, { active: true, idleCooldown: 0 });
 
-    const hostCp = host.targetCheckpointId || host.currentCheckpointId;
-    if (hostCp !== "meeting-presenter") {
-      this.sendAgentTo(host.config.id, "meeting-presenter", "presenting", {
-        onSeated: () => this.visualQueue.markMeetingSeated(host.config.id),
-      });
-    } else if (!host.isTransitioningSeat && host.state !== "TRAVELING") {
-      this.visualQueue.markMeetingSeated(host.config.id);
-    }
-
-    const subCp = subagent.targetCheckpointId || subagent.currentCheckpointId || "";
-    if (!String(subCp).startsWith("meeting-chair-")) {
-      const freeSeat =
-        seats.find((s) => checkpointManager.isAvailable(s)) || seats[0];
-      this.sendAgentTo(subagent.config.id, freeSeat, "listening", {
-        onSeated: () => this.visualQueue.markMeetingSeated(subagent.config.id),
-      });
-    } else if (!subagent.isTransitioningSeat && subagent.state !== "TRAVELING") {
-      this.visualQueue.markMeetingSeated(subagent.config.id);
-    }
-    this.activeDelegation.participants.add(subagent.config.id);
-
     const safeTopic = String(topic || `Delegando @${subagent.config.id}`).slice(0, 38);
-    this.monitorSystem?.setMeetingState({
-      active: true,
-      topic: `Delegación · ${safeTopic}`,
-      presenterName: host.config.name,
-    });
+    if (barrier?.phase === "APPROACHING") {
+      this.monitorSystem?.setMeetingState({
+        active: true,
+        topic: `Esperando equipo · ${safeTopic}`,
+        presenterName: host.config.name,
+      });
+    }
+
+    if (barrier) {
+      for (const id of delegation.newlyAdded || []) {
+        const participant = barrier.participants.get(id);
+        if (participant) {
+          this._sendBarrierParticipantToCheckpoint(barrier, participant);
+        }
+      }
+    }
 
     return true;
   }
@@ -436,7 +809,8 @@ export class SimulationDirector {
   clearAllLiveClaims() {
     this.liveOwnership.clear();
     this.visualQueue.reset();
-    this._clearDelegationHuddle({ returnRemainingHome: false });
+    this.activeDelegation = null;
+    this.monitorSystem?.setMeetingState({ active: false });
   }
 
   bindEventBus() {
@@ -461,6 +835,10 @@ export class SimulationDirector {
           } else {
             this.releaseAgentFromLiveTask(payload.agentId, payload);
           }
+          return;
+        }
+
+        if (this.visualQueue.hasActiveBarrier(payload.agentId)) {
           return;
         }
 
@@ -529,9 +907,26 @@ export class SimulationDirector {
     }
   }
 
-  sendAgentTo(agentId, checkpointId, overrideAction = null, { onSeated = null } = {}) {
+  sendAgentTo(
+    agentId,
+    checkpointId,
+    overrideAction = null,
+    { onSeated = null, internalBarrierMove = false } = {},
+  ) {
     const agent = this.characterManager.getAgent(agentId);
     if (!agent) return false;
+
+    if (!internalBarrierMove && this.visualQueue.hasActiveBarrier(agentId)) {
+      this.visualQueue.cancelBarrierForAgent(
+        agentId,
+        {
+          returnHome: true,
+          reason: "manual_redirect",
+          excludeAgentIds: [agentId],
+        },
+        this.queueHandlers,
+      );
+    }
 
     const timer = this.agentTimers.get(agentId);
     if (timer) {
@@ -549,6 +944,18 @@ export class SimulationDirector {
     const agent = this.characterManager.getAgent(agentId);
     if (!agent) return;
 
+    if (this.visualQueue.hasActiveBarrier(agentId)) {
+      this.visualQueue.cancelBarrierForAgent(
+        agentId,
+        {
+          returnHome: true,
+          reason: "forced_animation",
+          excludeAgentIds: [agentId],
+        },
+        this.queueHandlers,
+      );
+    }
+
     const timer = this.agentTimers.get(agentId);
     if (timer) {
       timer.interactCooldown = 8;
@@ -561,7 +968,7 @@ export class SimulationDirector {
   triggerPingPongMatch() {
     const candidates = this.characterManager.characters.filter(
       (a) =>
-        !this.isAgentLiveBusy(a.config.id) &&
+        !this.isAgentBusyForAmbient(a.config.id) &&
         (a.state === "WORKING" || a.state === "IDLE"),
     );
     if (candidates.length < 2) return false;
@@ -593,49 +1000,86 @@ export class SimulationDirector {
   }
 
   _executeTeamMeeting({ presenterId = "architect", topic } = {}) {
-    const seats = [
-      "meeting-chair-n1",
-      "meeting-chair-s1",
-      "meeting-chair-n2",
-      "meeting-chair-s2",
-      "meeting-chair-n3",
-      "meeting-chair-s3",
+    const availableAgents = this.characterManager.characters.filter(
+      (a) => !this.isAgentLiveBusy(a.config.id),
+    );
+    if (availableAgents.length < 2) return false;
+
+    const presenter =
+      availableAgents.find((a) => a.config.id === presenterId) ||
+      availableAgents[0];
+    const safeTopic = topic || "Sprint Sync · Oficina Virtual 3D";
+
+    const participants = [
+      {
+        agentId: presenter.config.id,
+        role: "host",
+        checkpointId: "meeting-presenter",
+        actionKey: "presenting",
+        waitingActionKey: "standingIdle",
+        socialMode: "MEETING",
+        partnerName: "Equipo",
+        seatedRequired: false,
+      },
     ];
 
-    const agents = [...this.characterManager.characters];
-    const presenter =
-      agents.find((a) => a.config.id === presenterId) || agents[0];
-
-    if (presenter) {
-      this.sendAgentTo(presenter.config.id, "meeting-presenter", "presenting");
-    }
-
     let seatIndex = 0;
-    for (const agent of agents) {
-      if (presenter && agent.config.id === presenter.config.id) continue;
-      if (seatIndex >= seats.length) break;
-      const seatId = seats[seatIndex++];
-      this.sendAgentTo(agent.config.id, seatId, "listening");
+    for (const agent of availableAgents) {
+      if (agent.config.id === presenter.config.id) continue;
+      if (seatIndex >= MEETING_SEATS.length) break;
+      const seatId = MEETING_SEATS[seatIndex++];
+      participants.push({
+        agentId: agent.config.id,
+        role: "participant",
+        checkpointId: seatId,
+        actionKey: "listening",
+        waitingActionKey: "sittingIdle",
+        socialMode: "MEETING",
+        partnerName: presenter.config.name.split(" ")[0],
+        seatedRequired: true,
+      });
     }
+
+    const res = this.visualQueue.startBarrier(
+      {
+        id: "team_meeting",
+        kind: "team_meeting",
+        topic: safeTopic,
+        hostAgentId: presenter.config.id,
+        allowPreempt: true,
+        participants,
+      },
+      this.queueHandlers,
+    );
+    if (!res) return false;
 
     this.monitorSystem?.setMeetingState({
       active: true,
-      topic: topic || "Sprint Sync · Oficina Virtual 3D",
-      presenterName: presenter?.config.name || "Tech Lead",
+      topic: `Esperando equipo · ${safeTopic}`,
+      presenterName: presenter.config.name,
     });
+
+    for (const p of res.barrier.participants.values()) {
+      this._sendBarrierParticipantToCheckpoint(res.barrier, p);
+    }
     return true;
   }
 
   triggerPairChat(agentAId = null, agentBId = null, preferredVenue = null) {
     const pool = this.characterManager.characters.filter(
       (a) =>
-        !this.isAgentLiveBusy(a.config.id) &&
+        !this.isAgentBusyForAmbient(a.config.id) &&
         (a.state === "WORKING" || a.state === "IDLE"),
     );
     const first =
-      (agentAId && this.characterManager.getAgent(agentAId)) || pool[0];
+      (agentAId &&
+        !this.isAgentBusyForAmbient(agentAId) &&
+        this.characterManager.getAgent(agentAId)) ||
+      pool[0];
     const second =
-      (agentBId && this.characterManager.getAgent(agentBId)) ||
+      (agentBId &&
+        !this.isAgentBusyForAmbient(agentBId) &&
+        this.characterManager.getAgent(agentBId)) ||
       pool.find((a) => a.config.id !== first?.config.id);
 
     if (!first || !second || first.config.id === second.config.id) return false;
@@ -667,7 +1111,15 @@ export class SimulationDirector {
     if (agentIds.length < 2) return false;
     const a1 = this.characterManager.getAgent(agentIds[0]);
     const a2 = this.characterManager.getAgent(agentIds[1]);
-    if (!a1 || !a2) return false;
+    if (!a1 || !a2 || a1.config.id === a2.config.id) return false;
+
+    // Exclusión mutua estricta: nunca reclamar avatares en otra barrera o tarea live
+    if (
+      this.isAgentBusyForAmbient(a1.config.id) ||
+      this.isAgentBusyForAmbient(a2.config.id)
+    ) {
+      return false;
+    }
 
     const resolvedSpots =
       spots ||
@@ -680,38 +1132,65 @@ export class SimulationDirector {
 
     if (!resolvedSpots) return false;
 
-    const duration = 12 + Math.random() * 5;
-    const t1 = this.agentTimers.get(a1.config.id);
-    const t2 = this.agentTimers.get(a2.config.id);
-    if (t1) t1.interactCooldown = duration;
-    if (t2) t2.interactCooldown = duration;
+    const a1First = a1.config.name.split(" ")[0];
+    const a2First = a2.config.name.split(" ")[0];
+    const p1Seated = resolvedSpots[0].action === "pairChatSeated";
+    const p2Seated = resolvedSpots[1].action === "pairChatSeated";
 
-    a1.requestAction(resolvedSpots[0].checkpointId, {
-      overrideAction: resolvedSpots[0].action,
-      socialMode: "PAIR_CHAT",
-      socialPartnerName: a2.config.name.split(" ")[0],
-      overrideRotY: resolvedSpots[0].rotY,
-    });
-    a2.requestAction(resolvedSpots[1].checkpointId, {
-      overrideAction: resolvedSpots[1].action,
-      socialMode: "PAIR_CHAT",
-      socialPartnerName: a1.config.name.split(" ")[0],
-      overrideRotY: resolvedSpots[1].rotY,
-    });
+    const res = this.visualQueue.startBarrier(
+      {
+        kind: "pair_chat",
+        topic: `Charla · ${a1First} & ${a2First}`,
+        hostAgentId: a1.config.id,
+        allowPreempt: false,
+        participants: [
+          {
+            agentId: a1.config.id,
+            role: "host",
+            checkpointId: resolvedSpots[0].checkpointId,
+            actionKey: resolvedSpots[0].action,
+            waitingActionKey: p1Seated ? "sittingIdle" : "standingIdle",
+            socialMode: "PAIR_CHAT",
+            partnerName: a2First,
+            overrideRotY: resolvedSpots[0].rotY,
+            seatedRequired: p1Seated,
+          },
+          {
+            agentId: a2.config.id,
+            role: "participant",
+            checkpointId: resolvedSpots[1].checkpointId,
+            actionKey: resolvedSpots[1].action,
+            waitingActionKey: p2Seated ? "sittingIdle" : "standingIdle",
+            socialMode: "PAIR_CHAT",
+            partnerName: a1First,
+            overrideRotY: resolvedSpots[1].rotY,
+            seatedRequired: p2Seated,
+          },
+        ],
+      },
+      this.queueHandlers,
+    );
+    if (!res) return false;
+
+    for (const p of res.barrier.participants.values()) {
+      this._sendBarrierParticipantToCheckpoint(res.barrier, p);
+    }
     return true;
   }
 
   triggerDeskReview(hostAgentId = null, reviewerAgentId = null, topic = "Code Review") {
     const workingAtHome = this.characterManager.characters.filter(
       (a) =>
-        !this.isAgentLiveBusy(a.config.id) &&
+        !this.isAgentBusyForAmbient(a.config.id) &&
         a.state === "WORKING" &&
         a.currentCheckpointId === a.homeCheckpointId &&
         checkpointManager.isAvailable(REVIEW_CHECKPOINT_BY_HOST[a.config.id]),
     );
 
     const host =
-      (hostAgentId && this.characterManager.getAgent(hostAgentId)) ||
+      (hostAgentId &&
+        !this.isAgentBusyForAmbient(hostAgentId) &&
+        this.characterManager.getAgent(hostAgentId)) ||
       workingAtHome[0];
     if (!host) return false;
 
@@ -721,11 +1200,13 @@ export class SimulationDirector {
     const reviewerCandidates = this.characterManager.characters.filter(
       (a) =>
         a.config.id !== host.config.id &&
-        !this.isAgentLiveBusy(a.config.id) &&
+        !this.isAgentBusyForAmbient(a.config.id) &&
         (a.state === "WORKING" || a.state === "IDLE"),
     );
     const reviewer =
-      (reviewerAgentId && this.characterManager.getAgent(reviewerAgentId)) ||
+      (reviewerAgentId &&
+        !this.isAgentBusyForAmbient(reviewerAgentId) &&
+        this.characterManager.getAgent(reviewerAgentId)) ||
       reviewerCandidates[
         Math.floor(Math.random() * reviewerCandidates.length)
       ];
@@ -747,44 +1228,62 @@ export class SimulationDirector {
     const host = this.characterManager.getAgent(hostAgentId);
     const reviewer = this.characterManager.getAgent(reviewerAgentId);
     const reviewCpId = REVIEW_CHECKPOINT_BY_HOST[hostAgentId];
-    if (!host || !reviewer || !reviewCpId) return false;
-
-    if (host.currentCheckpointId !== host.homeCheckpointId) {
-      host.returnHome();
+    if (!host || !reviewer || !reviewCpId || host.config.id === reviewer.config.id) {
+      return false;
     }
 
-    const duration = 13 + Math.random() * 4;
-    const tHost = this.agentTimers.get(host.config.id);
-    const tRev = this.agentTimers.get(reviewer.config.id);
-    if (tHost) tHost.workCooldown = duration + 4;
-    if (tRev) tRev.interactCooldown = duration;
+    if (
+      this.isAgentBusyForAmbient(host.config.id) ||
+      this.isAgentBusyForAmbient(reviewer.config.id)
+    ) {
+      return false;
+    }
 
-    host.setSocialContext({
-      mode: "DESK_REVIEW",
-      partnerName: reviewer.config.name.split(" ")[0],
-    });
-    host.applyActionProfile("sittingTalking", {
-      customLabel: `Revisión · ${topic}`,
-    });
+    const hostFirst = host.config.name.split(" ")[0];
+    const reviewerFirst = reviewer.config.name.split(" ")[0];
 
-    this.monitorSystem?.setAgentScreenState(host.config.id, {
-      mode: "REVIEWING",
-      taskLabel: topic,
-      partnerName: reviewer.config.name,
-    });
+    const res = this.visualQueue.startBarrier(
+      {
+        kind: "desk_review",
+        topic,
+        hostAgentId: host.config.id,
+        allowPreempt: false,
+        participants: [
+          {
+            agentId: host.config.id,
+            role: "host",
+            checkpointId: host.homeCheckpointId,
+            actionKey: "sittingTalking",
+            waitingActionKey: "typing",
+            socialMode: "DESK_REVIEW",
+            partnerName: reviewerFirst,
+            seatedRequired: true,
+          },
+          {
+            agentId: reviewer.config.id,
+            role: "participant",
+            checkpointId: reviewCpId,
+            actionKey: "deskReview",
+            waitingActionKey: "standingIdle",
+            socialMode: "DESK_REVIEW",
+            partnerName: hostFirst,
+            seatedRequired: false,
+          },
+        ],
+      },
+      this.queueHandlers,
+    );
+    if (!res) return false;
 
-    reviewer.requestAction(reviewCpId, {
-      overrideAction: "deskReview",
-      socialMode: "DESK_REVIEW",
-      socialPartnerName: host.config.name.split(" ")[0],
-    });
-
+    for (const p of res.barrier.participants.values()) {
+      this._sendBarrierParticipantToCheckpoint(res.barrier, p);
+    }
     return true;
   }
 
   returnAllHome() {
     this.visualQueue.reset();
-    this._clearDelegationHuddle({ returnRemainingHome: false });
+    this.activeDelegation = null;
     this.monitorSystem?.setMeetingState({ active: false });
     for (const agent of this.characterManager.characters) {
       const timer = this.agentTimers.get(agent.config.id);
@@ -808,14 +1307,18 @@ export class SimulationDirector {
       const timer = this.agentTimers.get(agentId);
       if (!timer) continue;
 
+      // Exclusión mutua estricta: los temporizadores independientes nunca
+      // interrumpen una barrera APPROACHING / ENGAGED ni la cola activa.
+      if (this.visualQueue.hasActiveBarrier(agentId)) {
+        continue;
+      }
+
       const live = this.liveOwnership.get(agentId);
       if (live) {
         if (live.active) {
-          // Agente bajo ejecución activa de OpenCode: suspender pausas autónomas
           continue;
         }
         if (live.idleCooldown > 0) {
-          // Margen de enfriamiento tras session.idle para prompts encadenados
           live.idleCooldown -= delta;
           if (live.idleCooldown > 0) continue;
 
@@ -827,7 +1330,6 @@ export class SimulationDirector {
       if (agent.state === "WORKING") {
         timer.workCooldown -= scaledDelta;
         if (timer.workCooldown <= 0) {
-          // Si estaba en revisión colaborativa, devolver escritorio a estado normal
           if (agent.socialMode === "DESK_REVIEW") {
             agent.clearSocialContext();
             agent.applyActionProfile("typing");
@@ -842,7 +1344,6 @@ export class SimulationDirector {
 
           const roll = Math.random();
           if (roll < 0.22) {
-            // Micro-reacción o tarea simulada vía Event Bus
             const isSuccess = Math.random() < 0.65;
             const sample =
               SAMPLE_TASKS[Math.floor(Math.random() * SAMPLE_TASKS.length)];

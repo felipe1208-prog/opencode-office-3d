@@ -35,9 +35,11 @@ export class AgentCharacter {
     this.currentActionLabel = "Tecleando código";
     this.taskTitle = null;
     this.taskAccentColor = null;
-    this.socialMode = null; // null | "PAIR_CHAT" | "DESK_REVIEW"
+    this.socialMode = null; // null | "PAIR_CHAT" | "DESK_REVIEW" | "MEETING"
+    this.socialPhase = null; // null | "APPROACHING" | "ENGAGED"
     this.socialPartnerName = null;
     this.overrideRotY = null;
+    this.desiredRotY = null;
     this.pendingLiveArrival = null;
     this.pendingStationOnSeated = null;
     this.isTransitioningSeat = false;
@@ -151,16 +153,36 @@ export class AgentCharacter {
     let color = this.taskAccentColor || this.config.color;
 
     if (this.socialMode === "PAIR_CHAT" && this.socialPartnerName) {
-      text =
-        this.state === "TRAVELING"
-          ? `Yendo con ${this.socialPartnerName}`
-          : `Charla · ${this.socialPartnerName}`;
+      if (this.state === "TRAVELING") {
+        text = `Yendo con ${this.socialPartnerName}`;
+      } else if (this.socialPhase === "APPROACHING") {
+        text = `Esperando a ${this.socialPartnerName}`;
+      } else {
+        text = `Charla · ${this.socialPartnerName}`;
+      }
     } else if (this.socialMode === "DESK_REVIEW" && this.socialPartnerName) {
-      text =
-        this.state === "TRAVELING"
-          ? `Revisión · ${this.socialPartnerName}`
-          : `Revisando · ${this.socialPartnerName}`;
+      if (this.state === "TRAVELING") {
+        text = `Revisión · ${this.socialPartnerName}`;
+      } else if (this.socialPhase === "APPROACHING") {
+        text = `Esperando revisión · ${this.socialPartnerName}`;
+      } else {
+        text = `Revisando · ${this.socialPartnerName}`;
+      }
       color = "#38BDF8";
+    } else if (this.socialMode === "MEETING") {
+      if (this.state === "TRAVELING") {
+        text = "Yendo a reunión";
+      } else if (this.socialPhase === "APPROACHING") {
+        text = this.socialPartnerName
+          ? `Esperando · ${this.socialPartnerName}`
+          : "Esperando en sala";
+      } else {
+        text =
+          this.taskTitle ||
+          (this.socialPartnerName
+            ? `Reunión · ${this.socialPartnerName}`
+            : "En reunión");
+      }
     } else if (
       this.taskTitle &&
       (this.state === "WORKING" || this.state === "THINKING")
@@ -171,8 +193,14 @@ export class AgentCharacter {
     this.bubble.setStatus(text, color);
   }
 
-  setSocialContext({ mode = null, partnerName = null, rotY = null } = {}) {
+  setSocialContext({
+    mode = null,
+    partnerName = null,
+    rotY = null,
+    phase = null,
+  } = {}) {
     this.socialMode = mode;
+    this.socialPhase = phase;
     this.socialPartnerName = partnerName;
     this.overrideRotY = rotY;
     this.syncBubble();
@@ -181,8 +209,22 @@ export class AgentCharacter {
 
   clearSocialContext() {
     this.socialMode = null;
+    this.socialPhase = null;
     this.socialPartnerName = null;
     this.overrideRotY = null;
+    this.desiredRotY = null;
+  }
+
+  lookAtWorldPosition(targetPos, { immediate = false } = {}) {
+    if (!targetPos || !this.model) return;
+    const dx = targetPos.x - this.model.position.x;
+    const dz = targetPos.z - this.model.position.z;
+    if (dx * dx + dz * dz < 0.0001) return;
+    const yaw = Math.atan2(dx, dz);
+    this.desiredRotY = yaw;
+    if (immediate) {
+      this.model.rotation.y = yaw;
+    }
   }
 
   applyTaskFeedback({
@@ -269,6 +311,7 @@ export class AgentCharacter {
     {
       overrideAction = null,
       socialMode = null,
+      socialPhase = null,
       socialPartnerName = null,
       overrideRotY = null,
       onSeated = null,
@@ -282,8 +325,18 @@ export class AgentCharacter {
       !this.isTransitioningSeat &&
       this.state !== "TRAVELING"
     ) {
+      if (socialMode !== null) this.socialMode = socialMode;
+      if (socialPhase !== null) this.socialPhase = socialPhase;
+      if (socialPartnerName !== null) this.socialPartnerName = socialPartnerName;
+      if (overrideRotY !== null) {
+        this.overrideRotY = overrideRotY;
+        this.model.rotation.y = overrideRotY;
+      }
       if (overrideAction && this.currentActionKey !== overrideAction) {
         this.applyActionProfile(overrideAction);
+      } else {
+        this.syncBubble();
+        this.notifyStateChange();
       }
       onSeated?.(this);
       return true;
@@ -293,7 +346,12 @@ export class AgentCharacter {
       this.state === "TRAVELING" &&
       this.targetCheckpointId === checkpointId
     ) {
+      if (socialMode !== null) this.socialMode = socialMode;
+      if (socialPhase !== null) this.socialPhase = socialPhase;
+      if (socialPartnerName !== null) this.socialPartnerName = socialPartnerName;
+      if (overrideRotY !== null) this.overrideRotY = overrideRotY;
       this.pendingStationOnSeated = onSeated || this.pendingStationOnSeated;
+      this.syncBubble();
       return true;
     }
 
@@ -304,6 +362,7 @@ export class AgentCharacter {
     this.taskAccentColor = null;
     if (socialMode) {
       this.socialMode = socialMode;
+      this.socialPhase = socialPhase;
       this.socialPartnerName = socialPartnerName;
     }
     this.overrideRotY = overrideRotY;
@@ -345,6 +404,7 @@ export class AgentCharacter {
 
   beginTravel(onReadyToWalk) {
     this.state = "TRAVELING";
+    this.desiredRotY = null;
     this.currentActionLabel = "Desplazándose por oficina";
     this.locomotion.setPath([]);
     this.propSockets.detachAll();
@@ -387,6 +447,7 @@ export class AgentCharacter {
   arriveAtStation(cp, overrideAction = null) {
     this.currentCheckpointId = cp.id;
     this.targetCheckpointId = null;
+    this.desiredRotY = null;
     this.model.position.set(cp.pos.x, this.model.position.y, cp.pos.z);
     this.model.rotation.y =
       this.overrideRotY !== null ? this.overrideRotY : cp.rotY;
@@ -505,13 +566,75 @@ export class AgentCharacter {
     this.returnHome();
   }
 
+  snapToCheckpointAndSit(
+    cp,
+    {
+      overrideAction = null,
+      socialMode = null,
+      socialPhase = null,
+      socialPartnerName = null,
+      overrideRotY = null,
+      onSeated = null,
+    } = {},
+  ) {
+    if (!cp) return false;
+    this.clearTimers();
+    this.locomotion.setPath([]);
+    this.propSockets.detachAll();
+
+    if (this.currentCheckpointId && this.currentCheckpointId !== cp.id) {
+      checkpointManager.release(this.currentCheckpointId, this.config.id);
+    }
+    if (this.targetCheckpointId && this.targetCheckpointId !== cp.id) {
+      checkpointManager.release(this.targetCheckpointId, this.config.id);
+    }
+    if (this.waitingSeatId) {
+      checkpointManager.release(this.waitingSeatId, this.config.id);
+      this.waitingSeatId = null;
+    }
+    checkpointManager.removeAgentFromAllQueues(this.config.id);
+    checkpointManager.reserve(cp.id, this.config.id);
+
+    this.currentCheckpointId = cp.id;
+    this.targetCheckpointId = null;
+    this.pendingStationOnSeated = null;
+    this.desiredRotY = null;
+    if (socialMode !== null) this.socialMode = socialMode;
+    if (socialPhase !== null) this.socialPhase = socialPhase;
+    if (socialPartnerName !== null) this.socialPartnerName = socialPartnerName;
+    if (overrideRotY !== null) this.overrideRotY = overrideRotY;
+
+    this.model.position.set(cp.pos.x, cp.pos.y, cp.pos.z);
+    this.targetY = cp.pos.y;
+    this.model.rotation.y =
+      this.overrideRotY !== null ? this.overrideRotY : cp.rotY;
+
+    const isSeatedStation =
+      cp.type === CHECKPOINT_TYPES.WORKSTATION ||
+      cp.type === CHECKPOINT_TYPES.WAITING_SEAT ||
+      cp.type === CHECKPOINT_TYPES.MEETING_SEAT;
+
+    this.isSeated = isSeatedStation;
+    this.isTransitioningSeat = false;
+    this.state =
+      isSeatedStation && cp.id === this.homeCheckpointId
+        ? "WORKING"
+        : "INTERACTING";
+
+    const chosenAction =
+      overrideAction || (isSeatedStation ? "sittingIdle" : "standingIdle");
+    this.applyActionProfile(chosenAction);
+    onSeated?.(this);
+    return true;
+  }
+
   returnHome({ pendingLiveTask = null } = {}) {
     if (!this.homeCheckpointId) return;
     const home = checkpointManager.get(this.homeCheckpointId);
     if (!home) return;
 
     // Si ya está caminando hacia su escritorio o terminando standToSit en casa,
-    // actualizar únicamente el estado diferido sin reiniciar la ruta A*.
+    // actualizar únicamente el callback diferido sin exponer todavía la nueva tarea en pantalla.
     const alreadyGoingHome =
       (this.state === "TRAVELING" && this.targetCheckpointId === this.homeCheckpointId) ||
       (this.currentCheckpointId === this.homeCheckpointId && this.isTransitioningSeat);
@@ -519,15 +642,6 @@ export class AgentCharacter {
     if (alreadyGoingHome) {
       if (pendingLiveTask) {
         this.pendingLiveArrival = pendingLiveTask;
-        this.taskAccentColor = pendingLiveTask.accentColor || null;
-        if (pendingLiveTask.label) {
-          this.taskTitle = pendingLiveTask.label;
-          if (this.state === "TRAVELING") {
-            this.currentActionLabel = `Regresando · ${pendingLiveTask.label}`;
-          }
-        }
-        this.syncBubble();
-        this.notifyStateChange();
       }
       return;
     }
@@ -535,7 +649,7 @@ export class AgentCharacter {
     this.clearTimers();
     this.clearSocialContext();
     this.pendingStationOnSeated = null;
-    this.taskAccentColor = pendingLiveTask?.accentColor || null;
+    this.taskAccentColor = null;
 
     // Blindaje 3: liberar de inmediato cualquier reserva previa (en viaje, espera o estación)
     if (this.targetCheckpointId && this.targetCheckpointId !== this.homeCheckpointId) {
@@ -556,6 +670,7 @@ export class AgentCharacter {
       this.pendingLiveArrival = null;
       this.state = pendingLiveTask?.phase === "thinking" ? "THINKING" : "WORKING";
       this.taskTitle = pendingLiveTask?.label || this.taskTitle;
+      this.taskAccentColor = pendingLiveTask?.accentColor || null;
       const customLabel =
         pendingLiveTask?.label ||
         (pendingLiveTask?.phase === "thinking" ? "Pensando..." : "Tecleando código");
@@ -571,6 +686,9 @@ export class AgentCharacter {
     }
 
     this.pendingLiveArrival = pendingLiveTask;
+    if (pendingLiveTask) {
+      this.taskTitle = null;
+    }
     checkpointManager.reserve(this.homeCheckpointId, this.config.id);
     this.targetCheckpointId = this.homeCheckpointId;
 
@@ -579,8 +697,8 @@ export class AgentCharacter {
         this.arriveAtStation(home, "typing");
       });
     });
-    if (pendingLiveTask?.label) {
-      this.currentActionLabel = `Regresando · ${pendingLiveTask.label}`;
+    if (pendingLiveTask) {
+      this.currentActionLabel = "Volviendo al puesto";
       this.syncBubble();
       this.notifyStateChange();
     }
@@ -664,6 +782,7 @@ export class AgentCharacter {
       actionLabel: this.currentActionLabel,
       taskTitle: this.taskTitle,
       socialMode: this.socialMode,
+      socialPhase: this.socialPhase,
       socialPartnerName: this.socialPartnerName,
       prop: this.propSockets.getActivePropLabel(),
       propKey: this.propSockets.activePropKey,
@@ -671,13 +790,19 @@ export class AgentCharacter {
       checkpointId:
         this.currentCheckpointId || this.targetCheckpointId || "corridor",
       isSeated: this.isSeated,
+      isTransitioningSeat: this.isTransitioningSeat,
+      isPhysicallyAtDesk:
+        this.currentCheckpointId === this.homeCheckpointId &&
+        this.isSeated &&
+        !this.isTransitioningSeat &&
+        this.state !== "TRAVELING",
     };
   }
 
   notifyStateChange() {
     if (!this.onUpdate) return;
     const snap = this.getSnapshot();
-    const signature = `${snap.state}|${snap.animation}|${snap.actionLabel}|${snap.taskTitle || ""}|${snap.socialMode || ""}|${snap.socialPartnerName || ""}|${snap.propKey || ""}|${snap.zone}|${snap.checkpointId}|${snap.isSeated ? 1 : 0}|${snap.name}|${snap.role}|${snap.color}`;
+    const signature = `${snap.state}|${snap.animation}|${snap.actionLabel}|${snap.taskTitle || ""}|${snap.socialMode || ""}|${snap.socialPhase || ""}|${snap.socialPartnerName || ""}|${snap.propKey || ""}|${snap.zone}|${snap.checkpointId}|${snap.isSeated ? 1 : 0}|${snap.isPhysicallyAtDesk ? 1 : 0}|${snap.name}|${snap.role}|${snap.color}`;
     if (signature === this._lastEmittedSignature) {
       return;
     }
@@ -702,6 +827,15 @@ export class AgentCharacter {
     if (this.state === "TRAVELING") {
       this.locomotion.updateProximity(allCharacters, this.config.id);
       this.locomotion.update(delta);
+    } else if (this.desiredRotY !== null) {
+      let diff = this.desiredRotY - this.model.rotation.y;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      if (Math.abs(diff) > 0.004) {
+        this.model.rotation.y += diff * Math.min(delta * 9.0, 1);
+      } else {
+        this.model.rotation.y = this.desiredRotY;
+      }
     }
   }
 

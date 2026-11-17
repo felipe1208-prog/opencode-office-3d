@@ -411,19 +411,32 @@ export class MonitorScreenSystem {
 
   syncFromAgentSnapshots(snapshots = {}) {
     for (const snap of Object.values(snapshots)) {
+      const notSeatedAtOwnDesk =
+        snap.isPhysicallyAtDesk === false ||
+        snap.isTransitioningSeat === true ||
+        snap.checkpointId !== AGENT_STATIONS[snap.id]?.checkpointId;
+
       let mode = "WORKING";
-      if (snap.animation === "sittingCheer") mode = "SUCCESS";
-      else if (snap.animation === "sittingDisbelief") mode = "ERROR";
-      else if (snap.socialMode === "DESK_REVIEW") mode = "REVIEWING";
-      else if (snap.checkpointId !== AGENT_STATIONS[snap.id]?.checkpointId) {
+      let taskLabel = snap.taskTitle || snap.actionLabel;
+      if (notSeatedAtOwnDesk) {
         mode = "AWAY";
+        taskLabel = snap.actionLabel || "Fuera del escritorio";
+      } else if (snap.animation === "sittingCheer") {
+        mode = "SUCCESS";
+      } else if (snap.animation === "sittingDisbelief") {
+        mode = "ERROR";
+      } else if (
+        snap.socialMode === "DESK_REVIEW" &&
+        snap.socialPhase === "ENGAGED"
+      ) {
+        mode = "REVIEWING";
       } else if (snap.state === "THINKING") {
         mode = "THINKING";
       }
 
       this.setAgentScreenState(snap.id, {
         mode,
-        taskLabel: snap.taskTitle || snap.actionLabel,
+        taskLabel,
         partnerName: snap.socialPartnerName || null,
       });
     }
