@@ -184,6 +184,16 @@ export class MeetingRoom {
       { x: 1.35, z: -5.45 },
       { x: -2.0, z: -6.0 },
     ];
+    const fallbackGlassGeo = new THREE.CylinderGeometry(0.035, 0.03, 0.1, 16);
+    const fallbackGlassMat = new THREE.MeshPhysicalMaterial({
+      color: "#E8F3FA",
+      transmission: 0,
+      roughness: 0.05,
+      clearcoat: 1.0,
+      transparent: true,
+      opacity: 0.35,
+      depthWrite: false,
+    });
     glassPositions.forEach((pos) => {
       const g = this.place(
         "waterGlass",
@@ -191,15 +201,7 @@ export class MeetingRoom {
         { maxDim: 0.1 },
       );
       if (!g) {
-        const geo = new THREE.CylinderGeometry(0.035, 0.03, 0.1, 16);
-        const mat = new THREE.MeshPhysicalMaterial({
-          color: "#E8F3FA",
-          transmission: 0.9,
-          roughness: 0.05,
-          transparent: true,
-          opacity: 0.35,
-        });
-        const glass = new THREE.Mesh(geo, mat);
+        const glass = new THREE.Mesh(fallbackGlassGeo, fallbackGlassMat);
         glass.position.set(pos.x, tableY + 0.05, pos.z);
         this.group.add(glass);
       }
@@ -213,20 +215,16 @@ export class MeetingRoom {
       color: "#F1F5F9",
       roughness: 0.9,
     });
+    const folderGeo = new THREE.BoxGeometry(0.24, 0.006, 0.32);
+    const paperGeo = new THREE.BoxGeometry(0.2, 0.002, 0.28);
 
     const addFolder = (x, z, rot) => {
-      const f = new THREE.Mesh(
-        new THREE.BoxGeometry(0.24, 0.006, 0.32),
-        folderMat,
-      );
+      const f = new THREE.Mesh(folderGeo, folderMat);
       f.position.set(x, tableY + 0.003, z);
       f.rotation.y = rot;
       f.castShadow = true;
 
-      const p = new THREE.Mesh(
-        new THREE.BoxGeometry(0.2, 0.002, 0.28),
-        paperMat,
-      );
+      const p = new THREE.Mesh(paperGeo, paperMat);
       p.position.set(x, tableY + 0.007, z);
       p.rotation.y = rot;
       this.group.add(f, p);

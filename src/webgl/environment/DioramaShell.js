@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { DIORAMA_CONFIG } from "../../config/officeLayout.js";
+import { mergeStaticGroupByMaterial } from "../utils/SceneOptimizer.js";
 
 export class DioramaShell {
   constructor(scene) {
@@ -9,6 +10,10 @@ export class DioramaShell {
 
     this.initMaterials();
     this.buildWalls();
+    mergeStaticGroupByMaterial(this.group, {
+      namePrefix: "diorama-shell",
+      staticShadow: true,
+    });
     this.scene.add(this.group);
   }
 

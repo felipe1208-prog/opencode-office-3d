@@ -6,6 +6,10 @@ import { World } from "./world/World.js";
 import { RaycasterHandler } from "./interaction/Raycaster.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { officeEventBus, OFFICE_EVENTS } from "../events/OfficeEventBus.js";
+import {
+  DYNAMIC_SHADOW_LAYER,
+  STATIC_SHADOW_LAYER,
+} from "./utils/SceneOptimizer.js";
 
 let instance = null;
 
@@ -15,6 +19,54 @@ const DAY_SUN = new THREE.Color("#FFEED4");
 const NIGHT_SUN = new THREE.Color("#93C5FD");
 const _bgColor = new THREE.Color();
 const _sunColor = new THREE.Color();
+const _corner = new THREE.Vector3();
+
+const OFFICE_SHADOW_MIN = new THREE.Vector3(-12.4, -0.4, -9.6);
+const OFFICE_SHADOW_MAX = new THREE.Vector3(12.4, 4.0, 9.4);
+
+function fitDirectionalShadowFrustum(light, boundsMin, boundsMax, padding = 0.6) {
+  light.updateMatrixWorld(true);
+  light.target.updateMatrixWorld(true);
+  const shadowCam = light.shadow.camera;
+  shadowCam.position.copy(light.position);
+  shadowCam.lookAt(light.target.position);
+  shadowCam.updateMatrixWorld(true);
+  shadowCam.matrixWorldInverse.copy(shadowCam.matrixWorld).invert();
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let minZ = Infinity;
+  let maxZ = -Infinity;
+
+  for (let ix = 0; ix <= 1; ix++) {
+    const x = ix === 0 ? boundsMin.x : boundsMax.x;
+    for (let iy = 0; iy <= 1; iy++) {
+      const y = iy === 0 ? boundsMin.y : boundsMax.y;
+      for (let iz = 0; iz <= 1; iz++) {
+        const z = iz === 0 ? boundsMin.z : boundsMax.z;
+        _corner.set(x, y, z).applyMatrix4(shadowCam.matrixWorldInverse);
+        if (_corner.x < minX) minX = _corner.x;
+        if (_corner.x > maxX) maxX = _corner.x;
+        if (_corner.y < minY) minY = _corner.y;
+        if (_corner.y > maxY) maxY = _corner.y;
+        // En espacio cámara Three.js mira hacia -Z
+        const depth = -_corner.z;
+        if (depth < minZ) minZ = depth;
+        if (depth > maxZ) maxZ = depth;
+      }
+    }
+  }
+
+  shadowCam.left = minX - padding;
+  shadowCam.right = maxX + padding;
+  shadowCam.bottom = minY - padding;
+  shadowCam.top = maxY + padding;
+  shadowCam.near = Math.max(1.0, minZ - padding * 2);
+  shadowCam.far = maxZ + padding * 3;
+  shadowCam.updateProjectionMatrix();
+}
 
 export class Experience {
   constructor(canvas = null, resources = null, callbacksOrOnSelect = null, legacyOnStatus = null) {
@@ -44,6 +96,9 @@ export class Experience {
     this.sizes = new Sizes(this.canvas.parentElement);
     this.camera = new Camera(this);
     this.renderer = new Renderer(this);
+    if (this.camera?.controls) {
+      this.camera.controls.enableDamping = !this.renderer.isSoftwareGl;
+    }
 
     this.initEnvironmentMap();
 
@@ -51,6 +106,9 @@ export class Experience {
     this.targetDayNight = 0.0;
     this.isAutoCycle = false;
     this.autoClock = 0;
+    this.lightingAppliedOnce = false;
+    this.isPageHidden = typeof document !== "undefined" ? Boolean(document.hidden) : false;
+    this.isDestroyed = false;
 
     this.initLighting();
     this.world = new World(this, {
@@ -61,6 +119,9 @@ export class Experience {
         if (this.onDirectorChange) this.onDirectorChange(directorState);
       },
     });
+
+    this.invalidateStaticShadows();
+    this.updateLighting(0);
 
     this.raycaster = new RaycasterHandler(this, (agentId) => {
       this.handleStationSelect(agentId, { focusCamera: Boolean(agentId) });
@@ -88,7 +149,33 @@ export class Experience {
 
     this.clock = new THREE.Clock();
     this.tick = this.tick.bind(this);
-    this.animationFrameId = requestAnimationFrame(this.tick);
+    this.onVisibilityChange = () => {
+      if (this.isDestroyed) return;
+      if (document.hidden) {
+        this.isPageHidden = true;
+        if (this.animationFrameId) {
+          cancelAnimationFrame(this.animationFrameId);
+          this.animationFrameId = null;
+        }
+      } else if (this.isPageHidden) {
+        this.isPageHidden = false;
+        this.clock.getDelta();
+        if (!this.animationFrameId) {
+          this.animationFrameId = requestAnimationFrame(this.tick);
+        }
+      }
+    };
+    document.addEventListener("visibilitychange", this.onVisibilityChange);
+
+    if (!this.isPageHidden) {
+      this.animationFrameId = requestAnimationFrame(this.tick);
+    }
+  }
+
+  invalidateStaticShadows() {
+    if (this.staticSunLight?.shadow) {
+      this.staticSunLight.shadow.needsUpdate = true;
+    }
   }
 
   handleStationSelect(agentId, { focusCamera = true } = {}) {
@@ -185,20 +272,34 @@ export class Experience {
   setDayNightFactor(factor, auto = false) {
     this.targetDayNight = THREE.MathUtils.clamp(factor, 0.0, 1.0);
     this.isAutoCycle = auto;
+    this.lightingAppliedOnce = false;
   }
 
   updateLighting(delta) {
     if (this.isAutoCycle) {
       this.autoClock += delta * 0.08;
       this.targetDayNight = (Math.sin(this.autoClock - Math.PI / 2) + 1) * 0.5 * 0.85;
+    } else if (
+      this.lightingAppliedOnce &&
+      Math.abs(this.dayNightCycle - this.targetDayNight) < 0.0005
+    ) {
+      return;
     }
 
-    this.dayNightCycle = THREE.MathUtils.damp(
-      this.dayNightCycle,
-      this.targetDayNight,
-      4.0,
-      delta,
-    );
+    if (delta > 0) {
+      this.dayNightCycle = THREE.MathUtils.damp(
+        this.dayNightCycle,
+        this.targetDayNight,
+        4.0,
+        delta,
+      );
+    } else {
+      this.dayNightCycle = this.targetDayNight;
+    }
+
+    if (!this.isAutoCycle && Math.abs(this.dayNightCycle - this.targetDayNight) < 0.0005) {
+      this.dayNightCycle = this.targetDayNight;
+    }
 
     const t = this.dayNightCycle;
     _bgColor.copy(DAY_BG).lerp(NIGHT_BG, t);
@@ -216,11 +317,16 @@ export class Experience {
     }
 
     _sunColor.copy(DAY_SUN).lerp(NIGHT_SUN, t);
-    this.sunLight.color.copy(_sunColor);
-    this.sunLight.intensity = THREE.MathUtils.lerp(1.85, 0.52, t);
+    const totalSunIntensity = THREE.MathUtils.lerp(1.85, 0.52, t);
+    this.staticSunLight.color.copy(_sunColor);
+    this.staticSunLight.intensity = totalSunIntensity * 0.65;
+    this.dynamicSunLight.color.copy(_sunColor);
+    this.dynamicSunLight.intensity = totalSunIntensity * 0.35;
+
     this.ambientLight.intensity = THREE.MathUtils.lerp(0.95, 0.28, t);
     this.hemiLight.intensity = THREE.MathUtils.lerp(0.55, 0.2, t);
     this.world?.setDayNightFactor(t);
+    this.lightingAppliedOnce = true;
   }
 
   initEnvironmentMap() {
@@ -241,38 +347,83 @@ export class Experience {
     this.hemiLight = new THREE.HemisphereLight("#FFFDF9", "#7A4B24", 0.55);
     this.scene.add(this.hemiLight);
 
-    this.sunLight = new THREE.DirectionalLight("#FFEED4", 1.85);
-    this.sunLight.position.set(-18, 25, -16);
-    this.sunLight.target.position.set(0, 0, 0);
-    this.scene.add(this.sunLight.target);
-    this.sunLight.castShadow = true;
+    const sunTarget = new THREE.Object3D();
+    sunTarget.position.set(0, 0, 0);
+    this.scene.add(sunTarget);
 
-    this.sunLight.shadow.mapSize.width = 2048;
-    this.sunLight.shadow.mapSize.height = 2048;
-    this.sunLight.shadow.camera.near = 0.5;
-    this.sunLight.shadow.camera.far = 65;
+    // 1. Sol estático cacheado (2048x2048, autoUpdate=false, capa STATIC_SHADOW_LAYER)
+    this.staticSunLight = new THREE.DirectionalLight("#FFEED4", 1.85 * 0.65);
+    this.staticSunLight.position.set(-18, 25, -16);
+    this.staticSunLight.target = sunTarget;
+    this.staticSunLight.castShadow = true;
+    this.staticSunLight.shadow.mapSize.width = 2048;
+    this.staticSunLight.shadow.mapSize.height = 2048;
+    this.staticSunLight.shadow.autoUpdate = false;
+    this.staticSunLight.shadow.needsUpdate = true;
+    this.staticSunLight.shadow.camera.layers.set(STATIC_SHADOW_LAYER);
+    this.staticSunLight.shadow.bias = -0.0005;
+    this.staticSunLight.shadow.normalBias = 0.025;
+    this.scene.add(this.staticSunLight);
+    fitDirectionalShadowFrustum(
+      this.staticSunLight,
+      OFFICE_SHADOW_MIN,
+      OFFICE_SHADOW_MAX,
+      0.7,
+    );
 
-    const d = 18;
-    this.sunLight.shadow.camera.left = -d;
-    this.sunLight.shadow.camera.right = d;
-    this.sunLight.shadow.camera.top = d;
-    this.sunLight.shadow.camera.bottom = -d;
-    this.sunLight.shadow.bias = -0.0005;
-    this.sunLight.shadow.normalBias = 0.025;
-    this.scene.add(this.sunLight);
+    // 2. Sol dinámico en tiempo real SOLO para avatares y props de mano (1024x1024, DYNAMIC_SHADOW_LAYER)
+    this.dynamicSunLight = new THREE.DirectionalLight("#FFEED4", 1.85 * 0.35);
+    this.dynamicSunLight.position.set(-18, 25, -16);
+    this.dynamicSunLight.target = sunTarget;
+    this.dynamicSunLight.castShadow = true;
+    this.dynamicSunLight.shadow.mapSize.width = 1024;
+    this.dynamicSunLight.shadow.mapSize.height = 1024;
+    this.dynamicSunLight.shadow.autoUpdate = true;
+    this.dynamicSunLight.shadow.camera.layers.set(DYNAMIC_SHADOW_LAYER);
+    this.dynamicSunLight.shadow.bias = -0.0005;
+    this.dynamicSunLight.shadow.normalBias = 0.025;
+    this.scene.add(this.dynamicSunLight);
+    fitDirectionalShadowFrustum(
+      this.dynamicSunLight,
+      OFFICE_SHADOW_MIN,
+      OFFICE_SHADOW_MAX,
+      0.7,
+    );
+
+    // Alias de compatibilidad para cualquier referencia externa
+    this.sunLight = this.staticSunLight;
   }
 
   tick() {
+    if (this.isPageHidden || this.isDestroyed) {
+      this.animationFrameId = null;
+      return;
+    }
+
     const delta = Math.min(this.clock.getDelta(), 0.1);
     this.updateLighting(delta);
     if (this.world) this.world.update(delta);
     this.camera.update(delta);
     this.renderer.update();
-    this.animationFrameId = requestAnimationFrame(this.tick);
+
+    if (this.renderer.isSoftwareGl) {
+      this.renderer.afterDraw(() => {
+        if (!this.isPageHidden && !this.isDestroyed) {
+          this.animationFrameId = requestAnimationFrame(this.tick);
+        }
+      });
+    } else {
+      this.animationFrameId = requestAnimationFrame(this.tick);
+    }
   }
 
   destroy() {
-    cancelAnimationFrame(this.animationFrameId);
+    this.isDestroyed = true;
+    if (this.animationFrameId) {
+      cancelAnimationFrame(this.animationFrameId);
+      this.animationFrameId = null;
+    }
+    document.removeEventListener("visibilitychange", this.onVisibilityChange);
     this.unsubLightingBus?.();
     this.raycaster?.destroy();
     this.world?.destroy();

@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { DIORAMA_CONFIG } from "../../config/officeLayout.js";
-import { fitModel } from "../utils/modelUtils.js";
+import { mergeStaticGroupByMaterial } from "../utils/SceneOptimizer.js";
 
 export class GlassPartitions {
   constructor(scene, resources) {
@@ -14,6 +14,10 @@ export class GlassPartitions {
     this.buildMeetingRoom();
     this.buildPlanterBoxes();
 
+    mergeStaticGroupByMaterial(this.group, {
+      namePrefix: "glass-partitions",
+      staticShadow: true,
+    });
     this.scene.add(this.group);
   }
 
@@ -25,15 +29,19 @@ export class GlassPartitions {
       metalness: 0.82,
     });
 
-    // Cristal físico de alta pureza y transmisión lumínica
+    // Vidrio arquitectónico de alta reflectividad sin pase de refracción/transmission extra
     this.glassMat = new THREE.MeshPhysicalMaterial({
       color: "#E8F3FA",
       transparent: true,
-      opacity: 0.22,
-      transmission: 0.88,
-      roughness: 0.04,
-      metalness: 0.05,
-      ior: 1.5,
+      opacity: 0.28,
+      transmission: 0,
+      roughness: 0.05,
+      metalness: 0.08,
+      clearcoat: 1.0,
+      clearcoatRoughness: 0.04,
+      reflectivity: 0.9,
+      envMapIntensity: 1.25,
+      depthWrite: false,
       side: THREE.DoubleSide,
     });
 

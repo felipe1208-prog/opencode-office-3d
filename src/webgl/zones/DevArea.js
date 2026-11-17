@@ -15,6 +15,9 @@ export class DevArea {
 
     this.group = new THREE.Group();
     this.group.name = "zone-dev-area";
+    this._unitBoxGeo = new THREE.BoxGeometry(1, 1, 1);
+    this._unitCylGeo = new THREE.CylinderGeometry(1, 1, 1, 8);
+    this._unitPlaneGeo = new THREE.PlaneGeometry(1, 1);
 
     // 1. Pod 1: Bancada Oeste (4 puestos)
     this.buildWorkbenchPod({
@@ -124,32 +127,19 @@ export class DevArea {
         : [centerX - totalW / 2 + 0.05, centerX + totalW / 2 - 0.05];
 
     legPositionsX.forEach((lx) => {
-      const legN = new THREE.Mesh(
-        new THREE.BoxGeometry(0.05, tableH - tableTopThickness, 0.05),
-        legMat,
-      );
-      legN.position.set(
-        lx,
-        (tableH - tableTopThickness) / 2,
-        centerZ - totalD / 2 + 0.06,
-      );
+      const legH = tableH - tableTopThickness;
+      const legN = new THREE.Mesh(this._unitBoxGeo, legMat);
+      legN.scale.set(0.05, legH, 0.05);
+      legN.position.set(lx, legH / 2, centerZ - totalD / 2 + 0.06);
       legN.castShadow = true;
 
-      const legS = new THREE.Mesh(
-        new THREE.BoxGeometry(0.05, tableH - tableTopThickness, 0.05),
-        legMat,
-      );
-      legS.position.set(
-        lx,
-        (tableH - tableTopThickness) / 2,
-        centerZ + totalD / 2 - 0.06,
-      );
+      const legS = new THREE.Mesh(this._unitBoxGeo, legMat);
+      legS.scale.set(0.05, legH, 0.05);
+      legS.position.set(lx, legH / 2, centerZ + totalD / 2 - 0.06);
       legS.castShadow = true;
 
-      const foot = new THREE.Mesh(
-        new THREE.BoxGeometry(0.05, 0.03, totalD - 0.08),
-        legMat,
-      );
+      const foot = new THREE.Mesh(this._unitBoxGeo, legMat);
+      foot.scale.set(0.05, 0.03, totalD - 0.08);
       foot.position.set(lx, 0.015, centerZ);
       foot.castShadow = true;
 
@@ -217,7 +207,7 @@ export class DevArea {
       const noteW = 0.055 + (i % 3) * 0.01;
       const noteH = 0.055 + (i % 2) * 0.015;
 
-      const noteGeo = new THREE.PlaneGeometry(noteW, noteH);
+      const noteGeo = this._unitPlaneGeo;
       const noteMat = new THREE.MeshStandardMaterial({
         color: colors[i % colors.length],
         roughness: 0.8,
@@ -225,6 +215,7 @@ export class DevArea {
       });
 
       const note = new THREE.Mesh(noteGeo, noteMat);
+      note.scale.set(noteW, noteH, 1);
       const zPos = centerZ + (isNorthSide ? -0.0135 : 0.0135);
 
       note.position.set(centerX + xOffset, dividerCenterY + yOffset, zPos);
@@ -577,10 +568,8 @@ export class DevArea {
       color: colorHex,
       roughness: 0.85,
     });
-    const pad = new THREE.Mesh(
-      new THREE.BoxGeometry(0.075, 0.012, 0.075),
-      padMat,
-    );
+    const pad = new THREE.Mesh(this._unitBoxGeo, padMat);
+    pad.scale.set(0.075, 0.012, 0.075);
     pad.position.set(x, y + 0.006, z);
     pad.castShadow = true;
     this.group.add(pad);
@@ -609,10 +598,8 @@ export class DevArea {
         color: penColors[i],
         roughness: 0.4,
       });
-      const pen = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.004, 0.004, 0.11, 8),
-        penMat,
-      );
+      const pen = new THREE.Mesh(this._unitCylGeo, penMat);
+      pen.scale.set(0.004, 0.11, 0.004);
       pen.position.set(
         (Math.random() - 0.5) * 0.03,
         0.07,
@@ -680,10 +667,8 @@ export class DevArea {
       roughness: 0.3,
       metalness: 0.85,
     });
-    const pcCase = new THREE.Mesh(
-      new THREE.BoxGeometry(0.18, 0.42, 0.42),
-      pcMat,
-    );
+    const pcCase = new THREE.Mesh(this._unitBoxGeo, pcMat);
+    pcCase.scale.set(0.18, 0.42, 0.42);
     pcCase.position.set(pcX, 0.21, pcZ);
     pcCase.castShadow = true;
     this.group.add(pcCase);
@@ -693,10 +678,8 @@ export class DevArea {
       color: "#181A22",
       roughness: 0.6,
     });
-    const cableSpine = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.016, 0.016, 0.32, 8),
-      spineMat,
-    );
+    const cableSpine = new THREE.Mesh(this._unitCylGeo, spineMat);
+    cableSpine.scale.set(0.016, 0.32, 0.016);
     cableSpine.position.set(pcX + (isNorth ? -0.06 : 0.06), 0.58, pcZ);
     cableSpine.castShadow = true;
     this.group.add(cableSpine);

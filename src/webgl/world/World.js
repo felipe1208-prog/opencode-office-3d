@@ -13,12 +13,14 @@ import { CharacterManager } from "../characters/CharacterManager.js";
 import { SimulationDirector } from "../characters/SimulationDirector.js";
 import { MonitorScreenSystem } from "./MonitorScreenSystem.js";
 import { NightLightingRig } from "./NightLightingRig.js";
+import { MaterialPool, batchStaticZones } from "../utils/SceneOptimizer.js";
 
 export class World {
   constructor(experience, { onAgentUpdate = null, onDirectorChange = null } = {}) {
     this.experience = experience;
     this.scene = this.experience.scene;
     this.resources = this.experience.resources;
+    this.materialPool = new MaterialPool();
 
     // 0. Sistemas diegéticos y de iluminación nocturna (disponibles antes de construir zonas)
     this.monitorSystem = new MonitorScreenSystem();
@@ -43,6 +45,21 @@ export class World {
     this.pingPong = new PingPongArea(this.experience);
     this.lounge = new LoungeArea(this.experience);
 
+    // 2.5 Batching automático (InstancedMesh para repetidos + mergeGeometries por material)
+    this.staticBatchResult = batchStaticZones(
+      this.scene,
+      [
+        this.carpets.group,
+        this.supervisor.group,
+        this.meeting.group,
+        this.devArea.group,
+        this.coffeeArea.group,
+        this.pingPong.group,
+        this.lounge.group,
+      ],
+      { materialPool: this.materialPool },
+    );
+
     // 3. Personajes, Sockets, Burbujas y Mock Director conectado al Event Bus
     this.characters = new CharacterManager(this.experience, (agentId, snap) => {
       this.monitorSystem.syncFromAgentSnapshots({ [agentId]: snap });
@@ -63,7 +80,6 @@ export class World {
     if (this.supervisor) this.supervisor.update(delta);
     if (this.director) this.director.update(delta);
     if (this.characters) this.characters.update(delta);
-    if (this.monitorSystem) this.monitorSystem.update(delta);
   }
 
   destroy() {
@@ -71,5 +87,6 @@ export class World {
     this.characters?.destroy();
     this.monitorSystem?.dispose();
     this.nightRig?.dispose();
+    this.materialPool?.dispose();
   }
 }

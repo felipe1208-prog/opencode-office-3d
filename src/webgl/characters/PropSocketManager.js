@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { PROP_DEFS } from "./agents.config.js";
 import { fitModel } from "../utils/modelUtils.js";
+import { DYNAMIC_SHADOW_LAYER } from "../utils/SceneOptimizer.js";
 
 export class PropSocketManager {
   constructor(model, resources) {
@@ -77,6 +78,7 @@ export class PropSocketManager {
             if (c.isMesh) {
               c.castShadow = true;
               c.receiveShadow = true;
+              c.layers.enable(DYNAMIC_SHADOW_LAYER);
             }
           });
           propNode = fitModel(clone, { maxDim: def.maxDim || 0.1 });
@@ -85,6 +87,13 @@ export class PropSocketManager {
 
       if (!propNode) {
         propNode = this.createProceduralProp(def.procedural || key);
+        if (propNode) {
+          propNode.traverse((c) => {
+            if (c.isMesh && c.castShadow) {
+              c.layers.enable(DYNAMIC_SHADOW_LAYER);
+            }
+          });
+        }
       }
 
       if (propNode) {

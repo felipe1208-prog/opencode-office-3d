@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { fitModel } from "../utils/modelUtils.js";
+import { configureTexture } from "../utils/SceneOptimizer.js";
 
 export class SupervisorOffice {
   constructor(experience) {
@@ -15,6 +16,7 @@ export class SupervisorOffice {
 
     this.group = new THREE.Group();
     this.group.name = "zone-supervisor";
+    this._unitBoxGeo = new THREE.BoxGeometry(1, 1, 1);
 
     // 1. Mobiliario e infraestructura existente (Intacto)
     this.initExecutiveDesk();
@@ -237,10 +239,8 @@ export class SupervisorOffice {
         metalness: 0.05,
       });
 
-      const book = new THREE.Mesh(
-        new THREE.BoxGeometry(bookW, bookH, bookD),
-        mat,
-      );
+      const book = new THREE.Mesh(this._unitBoxGeo, mat);
+      book.scale.set(bookW, bookH, bookD);
       book.position.set(curX + bookW / 2, bookH / 2, 0);
       book.castShadow = true;
 
@@ -366,8 +366,8 @@ export class SupervisorOffice {
     pole.castShadow = true;
     this.group.add(pole);
 
-    // Configuración CCTV
-    this.cctvRenderTarget = new THREE.WebGLRenderTarget(1024, 576, {
+    // Configuración CCTV optimizada (384x216 @ 4 FPS sin recalcular sombras)
+    this.cctvRenderTarget = new THREE.WebGLRenderTarget(384, 216, {
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
       format: THREE.RGBAFormat,
@@ -412,18 +412,22 @@ export class SupervisorOffice {
       map: this.cctvRenderTarget.texture,
     });
     this.screenMesh = new THREE.Mesh(screenGeo, screenMat);
-    // Centrada en X e Y del TV, y colocada 6mm por delante de su superficie frontal
     this.screenMesh.position.set(tvCenter.x, tvCenter.y, tvBox.min.z - 0.006);
     this.screenMesh.rotation.y = Math.PI;
+    this.screenMesh.userData.noBatch = true;
     this.group.add(this.screenMesh);
 
-    // Interfaz OSD (HUD) superpuesta sobre la pantalla
+    // Interfaz OSD (HUD) superpuesta sobre la pantalla (512x256 PO2)
     this.hudCanvas = document.createElement("canvas");
-    this.hudCanvas.width = 1024;
-    this.hudCanvas.height = 576;
+    this.hudCanvas.width = 512;
+    this.hudCanvas.height = 256;
     this.hudCtx = this.hudCanvas.getContext("2d");
 
-    this.hudTexture = new THREE.CanvasTexture(this.hudCanvas);
+    this.hudTexture = configureTexture(new THREE.CanvasTexture(this.hudCanvas), {
+      isColor: true,
+      mipmaps: false,
+      anisotropy: 2,
+    });
     const hudMat = new THREE.MeshBasicMaterial({
       map: this.hudTexture,
       transparent: true,
@@ -433,6 +437,7 @@ export class SupervisorOffice {
     this.hudMesh = new THREE.Mesh(screenGeo, hudMat);
     this.hudMesh.position.set(tvCenter.x, tvCenter.y, tvBox.min.z - 0.009);
     this.hudMesh.rotation.y = Math.PI;
+    this.hudMesh.userData.noBatch = true;
     this.group.add(this.hudMesh);
 
     this.updateHUD();
@@ -444,7 +449,9 @@ export class SupervisorOffice {
     const h = 576;
     const feed = this.cctvFeeds[this.currentCamIndex];
 
-    ctx.clearRect(0, 0, w, h);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, this.hudCanvas.width, this.hudCanvas.height);
+    ctx.setTransform(this.hudCanvas.width / w, 0, 0, this.hudCanvas.height / h, 0, 0);
 
     ctx.strokeStyle = "rgba(255, 255, 255, 0.45)";
     ctx.lineWidth = 3;
@@ -510,20 +517,26 @@ export class SupervisorOffice {
   update(delta) {
     if (!this.cctvRenderTarget) return;
 
+    let camSwitched = false;
     this.cctvTimer += delta;
     if (this.cctvTimer >= this.cctvCycleInterval) {
       this.cctvTimer = 0;
       this.currentCamIndex = (this.currentCamIndex + 1) % this.cctvFeeds.length;
+      camSwitched = true;
     }
 
     this.hudClockTimer = (this.hudClockTimer || 0) + delta;
-    if (this.hudClockTimer >= 0.3) {
+    if (camSwitched || this.hudClockTimer >= 1.0) {
       this.hudClockTimer = 0;
       this.updateHUD();
     }
 
+    if (this.experience?.renderer?.isSoftwareGl) {
+      return;
+    }
+
     this.renderThrottleTimer += delta;
-    if (this.renderThrottleTimer >= 0.033) {
+    if (camSwitched || this.renderThrottleTimer >= 0.25) {
       this.renderThrottleTimer = 0;
       this.renderCCTVFeed();
     }
@@ -542,10 +555,16 @@ export class SupervisorOffice {
     this.screenMesh.visible = false;
     this.hudMesh.visible = false;
 
+    const prevAutoUpdate = renderer.shadowMap.autoUpdate;
+    renderer.shadowMap.autoUpdate = false;
     const currentRT = renderer.getRenderTarget();
-    renderer.setRenderTarget(this.cctvRenderTarget);
-    renderer.render(scene, this.cctvCamera);
-    renderer.setRenderTarget(currentRT);
+    try {
+      renderer.setRenderTarget(this.cctvRenderTarget);
+      renderer.render(scene, this.cctvCamera);
+    } finally {
+      renderer.setRenderTarget(currentRT);
+      renderer.shadowMap.autoUpdate = prevAutoUpdate;
+    }
 
     this.screenMesh.visible = true;
     this.hudMesh.visible = true;

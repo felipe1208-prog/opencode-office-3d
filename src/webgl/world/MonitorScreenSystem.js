@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { AGENT_STATIONS } from "../../config/officeLayout.js";
+import { configureTexture } from "../utils/SceneOptimizer.js";
 
 const CHECKPOINT_TO_AGENT = Object.values(AGENT_STATIONS).reduce((acc, st) => {
   acc[st.checkpointId] = st;
@@ -31,7 +32,7 @@ const ROLE_SNIPPETS = {
       "requestAnimationFrame(renderLoop);",
     ],
     metricTitle: "WEBGL PIPELINE",
-    metricSub: "60 FPS · sRGB · DPR 1.5",
+    metricSub: "60 FPS · sRGB · DPR 2x",
   },
   qa: {
     file: "tests/nav-integrity.spec.ts",
@@ -70,18 +71,19 @@ const ROLE_SNIPPETS = {
       "// Daemon standby ready",
     ],
     metricTitle: "CLI DAEMON HOOK",
-    metricSub: "Adapter ready · Mock fallback ON",
+    metricSub: "Adapter ready · Live SSE",
   },
 };
 
 export class MonitorScreenSystem {
   constructor() {
-    this.stationScreens = new Map(); // stationKey -> { agentConfig, mode, taskLabel, taskFile, canvas, ctx, texture, materials: [], dirty, clockTimer }
+    this.stationScreens = new Map();
     this.standbyTexture = null;
+    this.standbyMaterial = null;
     this.standbyMaterials = [];
     this.meetingScreen = null;
     this.loungeScreen = null;
-    this.nightFactor = 0.0;
+    this.nightFactor = -1;
     this.tickCounter = 0;
   }
 
@@ -89,8 +91,9 @@ export class MonitorScreenSystem {
     if (this.standbyTexture) return this.standbyTexture;
     const canvas = document.createElement("canvas");
     canvas.width = 512;
-    canvas.height = 320;
+    canvas.height = 256;
     const ctx = canvas.getContext("2d");
+    ctx.setTransform(512 / 512, 0, 0, 256 / 320, 0, 0);
 
     const grad = ctx.createLinearGradient(0, 0, 512, 320);
     grad.addColorStop(0, "#090E1A");
@@ -109,11 +112,30 @@ export class MonitorScreenSystem {
     ctx.font = "15px monospace";
     ctx.fillText("OFICINA VIRTUAL 3D · LISTO", 136, 184);
 
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.anisotropy = 4;
+    const tex = configureTexture(new THREE.CanvasTexture(canvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+    });
     this.standbyTexture = tex;
     return tex;
+  }
+
+  _getStandbyMaterial() {
+    if (this.standbyMaterial) return this.standbyMaterial;
+    const tex = this._getStandbyTexture();
+    const mat = new THREE.MeshStandardMaterial({
+      map: tex,
+      emissive: new THREE.Color("#FFFFFF"),
+      emissiveMap: tex,
+      emissiveIntensity: 0.14,
+      roughness: 0.16,
+      metalness: 0.08,
+    });
+    mat.userData = { keepMaterialInstance: true };
+    this.standbyMaterial = mat;
+    this.standbyMaterials = [mat];
+    return mat;
   }
 
   _ensureStationEntry(stationKey) {
@@ -124,21 +146,25 @@ export class MonitorScreenSystem {
     const agentConfig = CHECKPOINT_TO_AGENT[stationKey] || null;
     const canvas = document.createElement("canvas");
     canvas.width = 512;
-    canvas.height = 320;
+    canvas.height = 256;
     const ctx = canvas.getContext("2d");
 
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    texture.anisotropy = 4;
+    const texture = configureTexture(new THREE.CanvasTexture(canvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+    });
 
     const rightCanvas = document.createElement("canvas");
     rightCanvas.width = 512;
-    rightCanvas.height = 320;
+    rightCanvas.height = 256;
     const rightCtx = rightCanvas.getContext("2d");
 
-    const rightTexture = new THREE.CanvasTexture(rightCanvas);
-    rightTexture.colorSpace = THREE.SRGBColorSpace;
-    rightTexture.anisotropy = 4;
+    const rightTexture = configureTexture(new THREE.CanvasTexture(rightCanvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+    });
 
     const entry = {
       stationKey,
@@ -157,7 +183,7 @@ export class MonitorScreenSystem {
       rightTexture,
       materials: [],
       dirty: true,
-      redrawTimer: Math.random() * 0.8,
+      lastRenderKey: null,
     };
 
     this.stationScreens.set(stationKey, entry);
@@ -205,24 +231,24 @@ export class MonitorScreenSystem {
     );
 
     const isAssigned = Boolean(CHECKPOINT_TO_AGENT[stationKey]);
-    let tex;
     let entry = null;
+    let mat;
 
     if (isAssigned) {
       entry = this._ensureStationEntry(stationKey);
-      tex = screenIndex === 0 ? entry.texture : entry.rightTexture;
+      const tex = screenIndex === 0 ? entry.texture : entry.rightTexture;
+      mat = new THREE.MeshStandardMaterial({
+        map: tex,
+        emissive: new THREE.Color("#FFFFFF"),
+        emissiveMap: tex,
+        emissiveIntensity: 0.3,
+        roughness: 0.16,
+        metalness: 0.08,
+      });
+      entry.materials.push(mat);
     } else {
-      tex = this._getStandbyTexture();
+      mat = this._getStandbyMaterial();
     }
-
-    const mat = new THREE.MeshStandardMaterial({
-      map: tex,
-      emissive: new THREE.Color("#FFFFFF"),
-      emissiveMap: tex,
-      emissiveIntensity: isAssigned ? 0.3 : 0.14,
-      roughness: 0.16,
-      metalness: 0.08,
-    });
 
     const plane = new THREE.Mesh(new THREE.PlaneGeometry(planeW, planeH), mat);
     plane.name = `monitor-screen-${stationKey}-${screenIndex}`;
@@ -238,14 +264,13 @@ export class MonitorScreenSystem {
     plane.castShadow = false;
     plane.receiveShadow = false;
 
-    monitorWrapper.add(plane);
-
-    if (entry) {
-      entry.materials.push(mat);
+    if (isAssigned) {
+      plane.userData.noBatch = true;
     } else {
-      this.standbyMaterials.push(mat);
+      plane.userData.keepMaterialInstance = true;
     }
 
+    monitorWrapper.add(plane);
     return plane;
   }
 
@@ -253,12 +278,14 @@ export class MonitorScreenSystem {
     if (!screenMesh) return;
     const canvas = document.createElement("canvas");
     canvas.width = 1024;
-    canvas.height = 576;
+    canvas.height = 512;
     const ctx = canvas.getContext("2d");
 
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    texture.anisotropy = 4;
+    const texture = configureTexture(new THREE.CanvasTexture(canvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+    });
 
     const mat = new THREE.MeshStandardMaterial({
       map: texture,
@@ -270,6 +297,7 @@ export class MonitorScreenSystem {
     });
 
     screenMesh.material = mat;
+    screenMesh.userData.noBatch = true;
     this.meetingScreen = {
       mesh: screenMesh,
       material: mat,
@@ -279,7 +307,7 @@ export class MonitorScreenSystem {
       mode: "STANDBY", // STANDBY | MEETING
       topic: "Sprint Sync · Oficina Virtual 3D",
       presenterName: "Tech Lead",
-      redrawTimer: 0,
+      lastRenderKey: null,
     };
 
     this._redrawMeetingTV();
@@ -305,13 +333,15 @@ export class MonitorScreenSystem {
     tvWrapper.updateMatrixWorld(true);
 
     const canvas = document.createElement("canvas");
-    canvas.width = 768;
-    canvas.height = 432;
+    canvas.width = 512;
+    canvas.height = 256;
     const ctx = canvas.getContext("2d");
 
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    texture.anisotropy = 4;
+    const texture = configureTexture(new THREE.CanvasTexture(canvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+    });
 
     const mat = new THREE.MeshStandardMaterial({
       map: texture,
@@ -328,6 +358,7 @@ export class MonitorScreenSystem {
     );
     plane.position.set(center.x, center.y + size.y * 0.02, box.max.z + 0.004);
     plane.name = "lounge-tv-screen";
+    plane.userData.noBatch = true;
     tvWrapper.add(plane);
 
     this.loungeScreen = {
@@ -337,7 +368,7 @@ export class MonitorScreenSystem {
       ctx,
       texture,
       activeViewers: 0,
-      redrawTimer: 0,
+      lastRenderKey: null,
     };
 
     this._redrawLoungeTV();
@@ -399,6 +430,7 @@ export class MonitorScreenSystem {
   }
 
   setDayNightFactor(factor) {
+    if (Math.abs(factor - this.nightFactor) < 0.0005) return;
     this.nightFactor = factor;
     const activeGlow = THREE.MathUtils.lerp(0.28, 0.96, factor);
     const standbyGlow = THREE.MathUtils.lerp(0.12, 0.36, factor);
@@ -429,7 +461,24 @@ export class MonitorScreenSystem {
   }
 
   _redrawStation(entry) {
+    const renderKey = `${entry.mode}|${entry.taskLabel || ""}|${entry.taskFile || ""}|${entry.partnerName || ""}|${entry.agentConfig?.name || ""}|${entry.agentConfig?.color || ""}`;
+    if (renderKey === entry.lastRenderKey) {
+      entry.dirty = false;
+      return false;
+    }
+    entry.lastRenderKey = renderKey;
+    this.tickCounter++;
+
     const { ctx, rightCtx, mode, agentConfig } = entry;
+    ctx.setTransform(entry.canvas.width / 512, 0, 0, entry.canvas.height / 320, 0, 0);
+    rightCtx.setTransform(
+      entry.rightCanvas.width / 512,
+      0,
+      0,
+      entry.rightCanvas.height / 320,
+      0,
+      0,
+    );
     const accent = agentConfig?.color || "#38BDF8";
     const snippet = ROLE_SNIPPETS[agentConfig?.id] || ROLE_SNIPPETS.frontend;
     const pulseStep = this.tickCounter % 6;
@@ -638,11 +687,26 @@ export class MonitorScreenSystem {
     entry.texture.needsUpdate = true;
     entry.rightTexture.needsUpdate = true;
     entry.dirty = false;
+    return true;
   }
 
   _redrawMeetingTV() {
-    if (!this.meetingScreen) return;
-    const { ctx, texture, mode, topic, presenterName } = this.meetingScreen;
+    if (!this.meetingScreen) return false;
+    const { ctx, texture, mode, topic, presenterName, canvas } = this.meetingScreen;
+
+    let profileSig = "";
+    for (const entry of this.stationScreens.values()) {
+      if (entry.agentConfig) {
+        profileSig += `${entry.agentConfig.id}:${entry.agentConfig.name}:${entry.agentConfig.color};`;
+      }
+    }
+    const renderKey = `${mode}|${topic}|${presenterName}|${profileSig}`;
+    if (renderKey === this.meetingScreen.lastRenderKey) {
+      return false;
+    }
+    this.meetingScreen.lastRenderKey = renderKey;
+
+    ctx.setTransform(canvas.width / 1024, 0, 0, canvas.height / 576, 0, 0);
 
     ctx.fillStyle = "#0B1220";
     ctx.fillRect(0, 0, 1024, 576);
@@ -663,7 +727,7 @@ export class MonitorScreenSystem {
     ctx.fillStyle = "#94A3B8";
     ctx.font = "20px monospace";
     ctx.fillText(
-      new Date().toLocaleTimeString("es-ES", { hour12: false }),
+      mode === "MEETING" ? "LIVE SYNC" : "STANDBY",
       880,
       44,
     );
@@ -755,11 +819,19 @@ export class MonitorScreenSystem {
     }
 
     texture.needsUpdate = true;
+    return true;
   }
 
   _redrawLoungeTV() {
-    if (!this.loungeScreen) return;
-    const { ctx, texture } = this.loungeScreen;
+    if (!this.loungeScreen) return false;
+    const renderKey = `${this.loungeScreen.activeViewers}`;
+    if (renderKey === this.loungeScreen.lastRenderKey) {
+      return false;
+    }
+    this.loungeScreen.lastRenderKey = renderKey;
+
+    const { ctx, texture, canvas } = this.loungeScreen;
+    ctx.setTransform(canvas.width / 768, 0, 0, canvas.height / 432, 0, 0);
 
     const grad = ctx.createLinearGradient(0, 0, 768, 432);
     grad.addColorStop(0, "#0F172A");
@@ -769,7 +841,7 @@ export class MonitorScreenSystem {
 
     // Visualizador ambiental suave
     for (let i = 0; i < 24; i++) {
-      const h = 36 + Math.abs(Math.sin(i * 0.45 + this.tickCounter * 0.6)) * 140;
+      const h = 36 + Math.abs(Math.sin(i * 0.45 + 0.6)) * 140;
       ctx.fillStyle = i % 2 === 0 ? "rgba(56, 189, 248, 0.55)" : "rgba(167, 139, 250, 0.55)";
       ctx.fillRect(64 + i * 27, 290 - h, 16, h);
     }
@@ -782,37 +854,11 @@ export class MonitorScreenSystem {
     ctx.fillText("LO-FI TELEMETRY STREAM · PAUSA ACTIVA", 64, 102);
 
     texture.needsUpdate = true;
+    return true;
   }
 
-  update(delta) {
-    let ticked = false;
-    for (const entry of this.stationScreens.values()) {
-      entry.redrawTimer += delta;
-      if (entry.redrawTimer >= 0.9) {
-        entry.redrawTimer = 0;
-        if (!ticked) {
-          this.tickCounter++;
-          ticked = true;
-        }
-        this._redrawStation(entry);
-      }
-    }
-
-    if (this.loungeScreen) {
-      this.loungeScreen.redrawTimer += delta;
-      if (this.loungeScreen.redrawTimer >= 0.8) {
-        this.loungeScreen.redrawTimer = 0;
-        this._redrawLoungeTV();
-      }
-    }
-
-    if (this.meetingScreen && this.meetingScreen.mode === "MEETING") {
-      this.meetingScreen.redrawTimer += delta;
-      if (this.meetingScreen.redrawTimer >= 1.0) {
-        this.meetingScreen.redrawTimer = 0;
-        this._redrawMeetingTV();
-      }
-    }
+  update() {
+    // Las texturas dinámicas se actualizan bajo demanda (dirty-flagging por cambio de estado o evento)
   }
 
   dispose() {

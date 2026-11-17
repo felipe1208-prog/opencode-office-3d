@@ -31,7 +31,8 @@ export class RaycasterHandler {
 
   bindEvents() {
     this.onPointerDown = (e) => {
-      this.pointerStartPos = { x: e.clientX, y: e.clientY };
+      this.pointerStartPos.x = e.clientX;
+      this.pointerStartPos.y = e.clientY;
       this.isDragging = false;
     };
 

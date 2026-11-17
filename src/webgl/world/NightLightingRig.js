@@ -18,6 +18,7 @@ export class NightLightingRig {
     this.zoneLights = [];
     this.emissiveShades = [];
     this.windowGlassMat = null;
+    this.lastFactor = -1;
 
     this.initInteriorLights();
     this.scene.add(this.group);
@@ -89,6 +90,7 @@ export class NightLightingRig {
       light.name = cfg.name;
       light.position.set(cfg.pos[0], cfg.pos[1], cfg.pos[2]);
       light.castShadow = false;
+      light.visible = false;
       this.group.add(light);
       this.zoneLights.push({ light, maxIntensity: cfg.maxIntensity });
     }
@@ -102,19 +104,31 @@ export class NightLightingRig {
     if (!mat) return;
     mat.emissive = _lampEmissive.clone();
     mat.emissiveIntensity = 0;
+    mat.userData = mat.userData || {};
+    mat.userData.keepMaterialInstance = true;
     this.emissiveShades.push(mat);
   }
 
   update(dayNightCycle) {
+    if (Math.abs(dayNightCycle - this.lastFactor) < 0.0005) {
+      return;
+    }
+    this.lastFactor = dayNightCycle;
+
     // Curva suave: las luces interiores empiezan a encenderse a partir de twilight (0.2)
     const nightWeight = THREE.MathUtils.smoothstep(dayNightCycle, 0.15, 0.82);
+    const lightsActive = nightWeight > 0.002;
 
-    for (const item of this.zoneLights) {
-      item.light.intensity = item.maxIntensity * nightWeight;
+    for (let i = 0; i < this.zoneLights.length; i++) {
+      const item = this.zoneLights[i];
+      item.light.visible = lightsActive;
+      if (lightsActive) {
+        item.light.intensity = item.maxIntensity * nightWeight;
+      }
     }
 
-    for (const mat of this.emissiveShades) {
-      mat.emissiveIntensity = 1.25 * nightWeight;
+    for (let i = 0; i < this.emissiveShades.length; i++) {
+      this.emissiveShades[i].emissiveIntensity = 1.25 * nightWeight;
     }
 
     if (this.windowGlassMat) {

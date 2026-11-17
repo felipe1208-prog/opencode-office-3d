@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { configureTexture } from "../utils/SceneOptimizer.js";
 
 const SEATED_LOCAL_Y = 1.44;
 const STANDING_LOCAL_Y = 1.56;
@@ -11,13 +12,15 @@ export class AgentStatusBubble {
     this.targetY = SEATED_LOCAL_Y;
 
     this.canvas = document.createElement("canvas");
-    this.canvas.width = 420;
-    this.canvas.height = 104;
+    this.canvas.width = 512;
+    this.canvas.height = 128;
     this.ctx = this.canvas.getContext("2d");
 
-    this.texture = new THREE.CanvasTexture(this.canvas);
-    this.texture.colorSpace = THREE.SRGBColorSpace;
-    this.texture.anisotropy = 4;
+    this.texture = configureTexture(new THREE.CanvasTexture(this.canvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+    });
 
     this.material = new THREE.SpriteMaterial({
       map: this.texture,
@@ -62,9 +65,13 @@ export class AgentStatusBubble {
     this.lastText = key;
 
     const ctx = this.ctx;
-    const w = this.canvas.width;
-    const h = this.canvas.height;
-    ctx.clearRect(0, 0, w, h);
+    const cw = this.canvas.width;
+    const ch = this.canvas.height;
+    const w = 420;
+    const h = 104;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.setTransform(cw / w, 0, 0, ch / h, 0, 0);
 
     // Fondo compacto con esquinas suaves
     const x = 10;

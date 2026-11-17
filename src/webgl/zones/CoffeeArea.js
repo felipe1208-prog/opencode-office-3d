@@ -238,6 +238,13 @@ export class CoffeeArea {
 
     // Botellas de sirope gourmet
     const syrupColors = ["#B45309", "#78350F", "#D97706"];
+    const bottleGeo = new THREE.CylinderGeometry(0.024, 0.024, 0.18, 16);
+    const spoutGeo = new THREE.CylinderGeometry(0.005, 0.008, 0.05, 8);
+    const spoutMat = new THREE.MeshStandardMaterial({
+      color: "#CBD5E1",
+      metalness: 0.9,
+      roughness: 0.2,
+    });
     syrupColors.forEach((col, i) => {
       const bGroup = new THREE.Group();
       bGroup.position.set(cX - 0.16, tableY, 6.72 + i * 0.07);
@@ -248,22 +255,11 @@ export class CoffeeArea {
         transparent: true,
         opacity: 0.85,
       });
-      const bottle = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.024, 0.024, 0.18, 16),
-        bMat,
-      );
+      const bottle = new THREE.Mesh(bottleGeo, bMat);
       bottle.position.y = 0.09;
       bottle.castShadow = true;
 
-      const spoutMat = new THREE.MeshStandardMaterial({
-        color: "#CBD5E1",
-        metalness: 0.9,
-        roughness: 0.2,
-      });
-      const spout = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.005, 0.008, 0.05, 8),
-        spoutMat,
-      );
+      const spout = new THREE.Mesh(spoutGeo, spoutMat);
       spout.position.y = 0.2;
       spout.castShadow = true;
 
@@ -394,9 +390,13 @@ export class CoffeeArea {
           jarGroup.position.set(sX, yPos + sThick / 2, itemZ);
 
           const glassMat = new THREE.MeshPhysicalMaterial({
-            color: "#FFFFFF",
-            transmission: 0.88,
-            roughness: 0.1,
+            color: "#E8F3FA",
+            transparent: true,
+            opacity: 0.34,
+            transmission: 0,
+            roughness: 0.06,
+            clearcoat: 1.0,
+            depthWrite: false,
           });
           const jar = new THREE.Mesh(
             new THREE.CylinderGeometry(0.045, 0.045, 0.12, 16),
@@ -482,10 +482,12 @@ export class CoffeeArea {
 
       const jugMat = new THREE.MeshPhysicalMaterial({
         color: "#0284C7",
-        transmission: 0.75,
-        roughness: 0.1,
+        transmission: 0,
+        roughness: 0.08,
+        clearcoat: 1.0,
         transparent: true,
-        opacity: 0.85,
+        opacity: 0.72,
+        depthWrite: false,
       });
       const jug = new THREE.Mesh(
         new THREE.CylinderGeometry(0.14, 0.14, 0.38, 16),
@@ -592,18 +594,24 @@ export class CoffeeArea {
     const stoolX = 0.78;
     const seatH = 0.75;
 
+    const legMat = new THREE.MeshStandardMaterial({
+      color: "#14161C",
+      roughness: 0.4,
+      metalness: 0.85,
+    });
+    const legGeo = new THREE.CylinderGeometry(0.014, 0.016, seatH, 8);
+    const ringGeo = new THREE.TorusGeometry(0.16, 0.01, 8, 16);
+    const seatMat = new THREE.MeshStandardMaterial({
+      color: "#6A3D1E",
+      roughness: 0.45,
+    });
+    const seatGeo = new THREE.CylinderGeometry(0.18, 0.17, 0.045, 24);
+
     stoolZPositions.forEach((zPos, i) => {
       const stoolGroup = new THREE.Group();
       const rotY = -Math.PI / 2 + (i % 2 === 0 ? 0.08 : -0.08);
       stoolGroup.position.set(stoolX, 0, zPos);
       stoolGroup.rotation.y = rotY;
-
-      const legMat = new THREE.MeshStandardMaterial({
-        color: "#14161C",
-        roughness: 0.4,
-        metalness: 0.85,
-      });
-      const legGeo = new THREE.CylinderGeometry(0.014, 0.016, seatH, 8);
 
       const legOffsets = [
         { x: -0.14, z: -0.14 },
@@ -618,20 +626,12 @@ export class CoffeeArea {
         stoolGroup.add(leg);
       });
 
-      const ringGeo = new THREE.TorusGeometry(0.16, 0.01, 8, 16);
       const ring = new THREE.Mesh(ringGeo, legMat);
       ring.rotation.x = Math.PI / 2;
       ring.position.y = 0.24;
       stoolGroup.add(ring);
 
-      const seatMat = new THREE.MeshStandardMaterial({
-        color: "#6A3D1E",
-        roughness: 0.45,
-      });
-      const seat = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.18, 0.17, 0.045, 24),
-        seatMat,
-      );
+      const seat = new THREE.Mesh(seatGeo, seatMat);
       seat.position.y = seatH + 0.022;
       seat.castShadow = true;
       stoolGroup.add(seat);
@@ -667,9 +667,13 @@ export class CoffeeArea {
     const glass = new THREE.Mesh(
       new THREE.CylinderGeometry(0.06, 0.07, 0.16, 16),
       new THREE.MeshPhysicalMaterial({
-        color: "#FFFFFF",
-        transmission: 0.9,
-        roughness: 0.1,
+        color: "#E8F3FA",
+        transmission: 0,
+        roughness: 0.06,
+        clearcoat: 1.0,
+        transparent: true,
+        opacity: 0.34,
+        depthWrite: false,
       }),
     );
     glass.position.set(0.05, 0.12, 0);
@@ -698,11 +702,13 @@ export class CoffeeArea {
       metalness: 0.6,
     });
     const glassMat = new THREE.MeshPhysicalMaterial({
-      color: "#FFFFFF",
-      transmission: 0.85,
-      roughness: 0.1,
+      color: "#E8F3FA",
+      transmission: 0,
+      roughness: 0.06,
+      clearcoat: 1.0,
       transparent: true,
-      opacity: 0.8,
+      opacity: 0.45,
+      depthWrite: false,
     });
     const beanMat = new THREE.MeshStandardMaterial({
       color: "#3A2012",

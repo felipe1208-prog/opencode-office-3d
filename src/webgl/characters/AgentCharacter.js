@@ -675,9 +675,14 @@ export class AgentCharacter {
   }
 
   notifyStateChange() {
-    if (this.onUpdate) {
-      this.onUpdate(this.config.id, this.getSnapshot());
+    if (!this.onUpdate) return;
+    const snap = this.getSnapshot();
+    const signature = `${snap.state}|${snap.animation}|${snap.actionLabel}|${snap.taskTitle || ""}|${snap.socialMode || ""}|${snap.socialPartnerName || ""}|${snap.propKey || ""}|${snap.zone}|${snap.checkpointId}|${snap.isSeated ? 1 : 0}|${snap.name}|${snap.role}|${snap.color}`;
+    if (signature === this._lastEmittedSignature) {
+      return;
     }
+    this._lastEmittedSignature = signature;
+    this.onUpdate(this.config.id, snap);
   }
 
   update(delta, allCharacters = []) {

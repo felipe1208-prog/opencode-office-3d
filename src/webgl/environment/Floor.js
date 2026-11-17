@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { DIORAMA_CONFIG } from "../../config/officeLayout.js";
+import { configureTexture } from "../utils/SceneOptimizer.js";
 
 export class Floor {
   constructor(scene) {
@@ -50,9 +51,13 @@ export class Floor {
       ctx.stroke();
     }
 
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.wrapS = THREE.RepeatWrapping;
-    texture.wrapT = THREE.RepeatWrapping;
+    const texture = configureTexture(new THREE.CanvasTexture(canvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+      wrapS: THREE.RepeatWrapping,
+      wrapT: THREE.RepeatWrapping,
+    });
     // Escala métrica real: tablas de 1.0 m x 11 cm
     texture.repeat.set(0.25, 0.25);
     return texture;

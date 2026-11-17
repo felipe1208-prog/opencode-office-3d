@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { DYNAMIC_SHADOW_LAYER } from "../utils/SceneOptimizer.js";
 
 export const AGENT_RAYCAST_LAYER = 1;
 
@@ -30,6 +31,7 @@ export class CharacterModel {
       if (child.isMesh) {
         child.castShadow = true;
         child.receiveShadow = true;
+        child.layers.enable(DYNAMIC_SHADOW_LAYER);
         child.frustumCulled = false;
         child.userData.agentId = config.id;
         avatarMeshes.push(child);

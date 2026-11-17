@@ -88,6 +88,7 @@ export class SimulationDirector {
       stepDisplayMs: 950,
     });
     this.unsubscribers = [];
+    this.queueHandlers = this._getQueueHandlers();
 
     this.initTimers();
     this.bindEventBus();
@@ -396,7 +397,7 @@ export class SimulationDirector {
         file,
         isPhysicallyAtDesk: this._isAgentPhysicallyAtDesk(agent),
       },
-      this._getQueueHandlers(),
+      this.queueHandlers,
     );
     return true;
   }
@@ -427,7 +428,7 @@ export class SimulationDirector {
         urgent: isUrgent,
         isPhysicallyAtDesk: this._isAgentPhysicallyAtDesk(agent),
       },
-      this._getQueueHandlers(),
+      this.queueHandlers,
     );
     return true;
   }
@@ -800,7 +801,7 @@ export class SimulationDirector {
     if (this.paused) return;
 
     const scaledDelta = delta * this.speedMultiplier;
-    this.visualQueue.tick(scaledDelta * 1000, this._getQueueHandlers());
+    this.visualQueue.tick(scaledDelta * 1000, this.queueHandlers);
 
     for (const agent of this.characterManager.characters) {
       const agentId = agent.config.id;

@@ -14,8 +14,10 @@ export class Camera {
     this.canvas = experience.canvas;
 
     this.followAgentRef = null;
-    this.transitionTarget = null;
-    this.transitionCamPos = null;
+    this.transitionTarget = new THREE.Vector3();
+    this.transitionCamPos = new THREE.Vector3();
+    this.hasTransitionTarget = false;
+    this.hasTransitionCamPos = false;
     this.isTransitioning = false;
 
     this.setInstance();
@@ -35,7 +37,7 @@ export class Camera {
 
   setControls() {
     this.controls = new OrbitControls(this.instance, this.canvas);
-    this.controls.enableDamping = true;
+    this.controls.enableDamping = !this.experience.renderer?.isSoftwareGl;
     this.controls.dampingFactor = 0.06;
     this.controls.target.copy(DEFAULT_TARGET);
 
@@ -56,7 +58,8 @@ export class Camera {
     this.followAgentRef = agent;
 
     const pos = agent.model.position;
-    this.transitionTarget = new THREE.Vector3(pos.x, pos.y + 0.9, pos.z);
+    this.transitionTarget.set(pos.x, pos.y + 0.9, pos.z);
+    this.hasTransitionTarget = true;
 
     _offsetDir.subVectors(this.instance.position, this.controls.target);
     if (_offsetDir.lengthSq() < 0.01) {
@@ -66,18 +69,21 @@ export class Camera {
 
     const currentDist = this.instance.position.distanceTo(this.controls.target);
     const targetDist = Math.min(currentDist, desiredDistance);
-    this.transitionCamPos = _desiredCamPos
+    _desiredCamPos
       .copy(this.transitionTarget)
-      .addScaledVector(_offsetDir, Math.max(targetDist, 8.5))
-      .clone();
+      .addScaledVector(_offsetDir, Math.max(targetDist, 8.5));
+    this.transitionCamPos.copy(_desiredCamPos);
+    this.hasTransitionCamPos = true;
 
     this.isTransitioning = true;
   }
 
   resetView() {
     this.followAgentRef = null;
-    this.transitionTarget = DEFAULT_TARGET.clone();
-    this.transitionCamPos = DEFAULT_CAM_POS.clone();
+    this.transitionTarget.copy(DEFAULT_TARGET);
+    this.transitionCamPos.copy(DEFAULT_CAM_POS);
+    this.hasTransitionTarget = true;
+    this.hasTransitionCamPos = true;
     this.isTransitioning = true;
   }
 
@@ -109,7 +115,7 @@ export class Camera {
         5.5,
         dt,
       );
-    } else if (this.isTransitioning && this.transitionTarget) {
+    } else if (this.isTransitioning && this.hasTransitionTarget) {
       this.controls.target.x = THREE.MathUtils.damp(
         this.controls.target.x,
         this.transitionTarget.x,
@@ -130,7 +136,7 @@ export class Camera {
       );
     }
 
-    if (this.isTransitioning && this.transitionCamPos) {
+    if (this.isTransitioning && this.hasTransitionCamPos) {
       this.instance.position.x = THREE.MathUtils.damp(
         this.instance.position.x,
         this.transitionCamPos.x,

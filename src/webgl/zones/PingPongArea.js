@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { fitModel } from "../utils/modelUtils.js";
+import { configureTexture } from "../utils/SceneOptimizer.js";
 
 export class PingPongArea {
   constructor(experience) {
@@ -161,18 +162,15 @@ export class PingPongArea {
       { x: tW * 0.42, z: tL * 0.4 },
     ];
 
+    const legGeo = new THREE.CylinderGeometry(0.02, 0.02, tH - topThickness, 12);
+    const wheelGeo = new THREE.CylinderGeometry(0.025, 0.025, 0.02, 12);
+
     legPositions.forEach((lp) => {
-      const leg = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.02, 0.02, tH - topThickness, 12),
-        frameMat,
-      );
+      const leg = new THREE.Mesh(legGeo, frameMat);
       leg.position.set(lp.x, (tH - topThickness) / 2, lp.z);
       leg.castShadow = true;
 
-      const wheel = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.025, 0.025, 0.02, 12),
-        postMat,
-      );
+      const wheel = new THREE.Mesh(wheelGeo, postMat);
       wheel.position.set(lp.x, 0.025, lp.z);
       wheel.castShadow = true;
 
@@ -248,8 +246,9 @@ export class PingPongArea {
 
     const canvas = document.createElement("canvas");
     canvas.width = 512;
-    canvas.height = 340;
+    canvas.height = 256;
     const ctx = canvas.getContext("2d");
+    ctx.setTransform(1, 0, 0, 256 / 340, 0, 0);
     ctx.fillStyle = "#FFFFFF";
     ctx.fillRect(0, 0, 512, 340);
 
@@ -283,7 +282,11 @@ export class PingPongArea {
     ctx.font = "bold 18px Arial";
     ctx.fillText("FINAL", 380, 160);
 
-    const tex = new THREE.CanvasTexture(canvas);
+    const tex = configureTexture(new THREE.CanvasTexture(canvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+    });
     const boardSurface = new THREE.Mesh(
       new THREE.PlaneGeometry(1.52, 1.02),
       new THREE.MeshStandardMaterial({ map: tex, roughness: 0.35 }),
@@ -385,11 +388,13 @@ export class PingPongArea {
       roughness: 0.45,
     });
     const glassMat = new THREE.MeshPhysicalMaterial({
-      color: "#FFFFFF",
-      transmission: 0.9,
-      roughness: 0.1,
+      color: "#E8F3FA",
+      transmission: 0,
+      roughness: 0.06,
+      clearcoat: 1.0,
       transparent: true,
-      opacity: 0.85,
+      opacity: 0.34,
+      depthWrite: false,
     });
     const goldMat = new THREE.MeshStandardMaterial({
       color: "#F59E0B",
@@ -416,23 +421,19 @@ export class PingPongArea {
     );
     glassDoor.position.set(0, 0.9, 0.21);
     trophyCase.add(glassDoor);
+
+    const cupBaseGeo = new THREE.CylinderGeometry(0.04, 0.05, 0.04, 16);
+    const cupStemGeo = new THREE.CylinderGeometry(0.012, 0.012, 0.08, 12);
+    const cupBowlGeo = new THREE.CylinderGeometry(0.05, 0.025, 0.1, 16);
+
     [0.45, 0.95, 1.4].forEach((shelfY, sIdx) => {
       [-0.32, 0, 0.32].forEach((tx, tIdx) => {
         const mat = (sIdx + tIdx) % 2 === 0 ? goldMat : silverMat;
-        const cupBase = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.04, 0.05, 0.04, 16),
-          caseMat,
-        );
+        const cupBase = new THREE.Mesh(cupBaseGeo, caseMat);
         cupBase.position.set(tx, shelfY + 0.02, 0.05);
-        const cupStem = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.012, 0.012, 0.08, 12),
-          mat,
-        );
+        const cupStem = new THREE.Mesh(cupStemGeo, mat);
         cupStem.position.set(tx, shelfY + 0.08, 0.05);
-        const cupBowl = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.05, 0.025, 0.1, 16),
-          mat,
-        );
+        const cupBowl = new THREE.Mesh(cupBowlGeo, mat);
         cupBowl.position.set(tx, shelfY + 0.15, 0.05);
         trophyCase.add(cupBase, cupStem, cupBowl);
       });
@@ -539,9 +540,13 @@ export class PingPongArea {
         ctx.fillRect(x, y, 2, 4);
       }
     }
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.wrapT = THREE.RepeatWrapping;
+    const tex = configureTexture(new THREE.CanvasTexture(canvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+      wrapS: THREE.RepeatWrapping,
+      wrapT: THREE.RepeatWrapping,
+    });
     tex.repeat.set(3, 4);
 
     const rugMesh = new THREE.Mesh(
@@ -824,11 +829,13 @@ export class PingPongArea {
     const glass = new THREE.Mesh(
       new THREE.BoxGeometry(w * 0.62, h * 0.55, 0.02),
       new THREE.MeshPhysicalMaterial({
-        color: "#FFFFFF",
-        transmission: 0.9,
-        roughness: 0.1,
+        color: "#E8F3FA",
+        transmission: 0,
+        roughness: 0.06,
+        clearcoat: 1.0,
         transparent: true,
-        opacity: 0.85,
+        opacity: 0.34,
+        depthWrite: false,
       }),
     );
     glass.position.set(-w * 0.14, h * 0.58, -d / 2 - 0.01);
@@ -838,13 +845,17 @@ export class PingPongArea {
       type === "drinks"
         ? ["#DC2626", "#2563EB", "#16A34A", "#F59E0B"]
         : ["#F97316", "#EAB308", "#84CC16", "#EC4899"];
+    const itemGeo =
+      type === "drinks"
+        ? new THREE.CylinderGeometry(0.028, 0.028, 0.09, 12)
+        : new THREE.BoxGeometry(0.06, 0.08, 0.03);
     for (let shelf = 0; shelf < 3; shelf++) {
       const sy = h * 0.38 + shelf * 0.22;
       for (let c = 0; c < 4; c++) {
         const item =
           type === "drinks"
             ? new THREE.Mesh(
-                new THREE.CylinderGeometry(0.028, 0.028, 0.09, 12),
+                itemGeo,
                 new THREE.MeshStandardMaterial({
                   color: colors[(shelf + c) % colors.length],
                   roughness: 0.3,
@@ -852,7 +863,7 @@ export class PingPongArea {
                 }),
               )
             : new THREE.Mesh(
-                new THREE.BoxGeometry(0.06, 0.08, 0.03),
+                itemGeo,
                 new THREE.MeshStandardMaterial({
                   color: colors[(shelf + c) % colors.length],
                   roughness: 0.6,

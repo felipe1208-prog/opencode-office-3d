@@ -62,6 +62,42 @@ export class Renderer {
     this.canvas.addEventListener("webglcontextrestored", this.onContextRestored);
   }
 
+  get maxAnisotropy() {
+    return this.instance?.capabilities?.getMaxAnisotropy?.() || 4;
+  }
+
+  afterDraw(callback) {
+    if (!this.isSoftwareGl) {
+      callback();
+      return;
+    }
+
+    try {
+      const gl = this.instance?.getContext?.();
+      if (gl && typeof gl.fenceSync === "function") {
+        const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (sync) {
+          gl.flush();
+          const poll = () => {
+            if (this.contextLost) return;
+            const status = gl.clientWaitSync(sync, 0, 0);
+            if (status === gl.WAIT_FAILED || status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) {
+              gl.deleteSync(sync);
+              callback();
+            } else {
+              setTimeout(poll, 0);
+            }
+          };
+          setTimeout(poll, 0);
+          return;
+        }
+      }
+    } catch {
+      // Fallback directo si fenceSync no está disponible
+    }
+    callback();
+  }
+
   resize() {
     this.instance.setSize(this.sizes.width, this.sizes.height);
     this.instance.setPixelRatio(

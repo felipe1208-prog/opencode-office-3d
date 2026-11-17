@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { fitModel } from "../utils/modelUtils.js";
+import { configureTexture } from "../utils/SceneOptimizer.js";
 
 export class LoungeArea {
   constructor(experience) {
@@ -62,9 +63,13 @@ export class LoungeArea {
         wCtx.fillRect(0, y + (Math.random() - 0.5) * 3, 512, 2);
       }
     }
-    const woodTex = new THREE.CanvasTexture(woodCanvas);
-    woodTex.wrapS = THREE.RepeatWrapping;
-    woodTex.wrapT = THREE.RepeatWrapping;
+    const woodTex = configureTexture(new THREE.CanvasTexture(woodCanvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+      wrapS: THREE.RepeatWrapping,
+      wrapT: THREE.RepeatWrapping,
+    });
 
     // 2. Tejido Textil de Alfombra / Tapicería (Fabric Weave)
     const rugCanvas = document.createElement("canvas");
@@ -83,9 +88,13 @@ export class LoungeArea {
         rCtx.fillRect(x, y, 3, 3);
       }
     }
-    const rugTex = new THREE.CanvasTexture(rugCanvas);
-    rugTex.wrapS = THREE.RepeatWrapping;
-    rugTex.wrapT = THREE.RepeatWrapping;
+    const rugTex = configureTexture(new THREE.CanvasTexture(rugCanvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+      wrapS: THREE.RepeatWrapping,
+      wrapT: THREE.RepeatWrapping,
+    });
     rugTex.repeat.set(8, 6);
 
     // 3. Malla Acústica de Altavoces (Speaker Grille Micro-Mesh)
@@ -103,9 +112,13 @@ export class LoungeArea {
         sCtx.fill();
       }
     }
-    const speakerTex = new THREE.CanvasTexture(spkCanvas);
-    speakerTex.wrapS = THREE.RepeatWrapping;
-    speakerTex.wrapT = THREE.RepeatWrapping;
+    const speakerTex = configureTexture(new THREE.CanvasTexture(spkCanvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+      wrapS: THREE.RepeatWrapping,
+      wrapT: THREE.RepeatWrapping,
+    });
     speakerTex.repeat.set(4, 8);
 
     // 4. Hojas Atigradas de Sansevieria (Snake Plant Leaf)
@@ -131,7 +144,11 @@ export class LoungeArea {
     lCtx.fillStyle = "#FBBF24";
     lCtx.fillRect(0, 0, 8, 512);
     lCtx.fillRect(120, 0, 8, 512);
-    const leafTex = new THREE.CanvasTexture(leafCanvas);
+    const leafTex = configureTexture(new THREE.CanvasTexture(leafCanvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+    });
 
     // 5. Pantalla de Lámpara de Lino (Linen Lampshade)
     const linenCanvas = document.createElement("canvas");
@@ -145,15 +162,20 @@ export class LoungeArea {
       lnCtx.fillRect(i, 0, 1, 256);
       lnCtx.fillRect(0, i, 256, 1);
     }
-    const linenTex = new THREE.CanvasTexture(linenCanvas);
-    linenTex.wrapS = THREE.RepeatWrapping;
-    linenTex.wrapT = THREE.RepeatWrapping;
+    const linenTex = configureTexture(new THREE.CanvasTexture(linenCanvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+      wrapS: THREE.RepeatWrapping,
+      wrapT: THREE.RepeatWrapping,
+    });
 
-    // 6. Portada de Revista Técnica (Magazine Graphic)
+    // 6. Portada de Revista Técnica (Magazine Graphic) - PO2 256x256
     const magCanvas = document.createElement("canvas");
     magCanvas.width = 256;
-    magCanvas.height = 340;
+    magCanvas.height = 256;
     const mCtx = magCanvas.getContext("2d");
+    mCtx.setTransform(1, 0, 0, 256 / 340, 0, 0);
     mCtx.fillStyle = "#0F172A";
     mCtx.fillRect(0, 0, 256, 340);
     mCtx.fillStyle = "#38BDF8";
@@ -167,7 +189,11 @@ export class LoungeArea {
     mCtx.fillRect(20, 225, 140, 4);
     mCtx.fillRect(20, 240, 180, 4);
     mCtx.fillRect(20, 255, 110, 4);
-    const magTex = new THREE.CanvasTexture(magCanvas);
+    const magTex = configureTexture(new THREE.CanvasTexture(magCanvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+    });
 
     return { woodTex, rugTex, speakerTex, leafTex, linenTex, magTex };
   }
@@ -584,6 +610,8 @@ export class LoungeArea {
       tableShadeMat,
     );
     lampShade.position.y = 0.78;
+    lampShade.userData.noBatch = true;
+    lampShade.userData.keepMaterialInstance = true;
     stSW.add(lampBase, lampStem, lampShade);
     this.group.add(stSW);
 
@@ -639,6 +667,8 @@ export class LoungeArea {
       arcShadeMat,
     );
     aShade.position.y = 1.85;
+    aShade.userData.noBatch = true;
+    aShade.userData.keepMaterialInstance = true;
     arcLamp.add(aBase, aPole, aShade);
     this.group.add(arcLamp);
   }
