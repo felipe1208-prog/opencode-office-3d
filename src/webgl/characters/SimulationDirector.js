@@ -880,6 +880,24 @@ export class SimulationDirector {
       checkpointManager.releaseAllByAgent(agent.config.id, {
         exceptCheckpointId: keepCp,
       });
+      if (
+        agent.taskAccentColor === "#E11D48" ||
+        /esperando|fallo|permiso/i.test(String(agent.currentActionLabel || "")) ||
+        agent.pendingLiveTask
+      ) {
+        agent.applyTaskFeedback({
+          status: "passed",
+          label: "Disponible",
+          onSeated: () => {
+            agent.taskAccentColor = null;
+            this.monitorSystem?.setAgentScreenState(agent.config.id, {
+              mode: "WORKING",
+              taskLabel: "En espera",
+              taskFile: null,
+            });
+          },
+        });
+      }
     }
   }
 

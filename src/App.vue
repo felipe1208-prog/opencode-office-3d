@@ -400,18 +400,18 @@ function initQuestionDraft(item, prevId = null) {
   const questions = Array.isArray(item.questions) ? item.questions : [];
   const existing = questionDrafts[item.id];
   if (!Array.isArray(existing) || existing.length !== questions.length) {
-    const prevDraft = prevId ? questionDrafts[prevId] : null;
-    if (Array.isArray(prevDraft) && prevDraft.length === questions.length) {
-      questionDrafts[item.id] = prevDraft.map((slot) => ({
-        selected: Array.isArray(slot?.selected) ? [...slot.selected] : [],
-        custom: String(slot?.custom || ""),
-      }));
-    } else {
-      questionDrafts[item.id] = questions.map(() => ({
-        selected: [],
-        custom: "",
-      }));
-    }
+    const sourceDraft = Array.isArray(existing)
+      ? existing
+      : prevId && Array.isArray(questionDrafts[prevId])
+        ? questionDrafts[prevId]
+        : null;
+    questionDrafts[item.id] = questions.map((_, idx) => {
+      const prevSlot = sourceDraft?.[idx];
+      return {
+        selected: Array.isArray(prevSlot?.selected) ? [...prevSlot.selected] : [],
+        custom: String(prevSlot?.custom || ""),
+      };
+    });
   }
   return questionDrafts[item.id];
 }
@@ -678,6 +678,8 @@ function toggleOpenCodePanel() {
 }
 
 function handleSessionSelectChange() {
+  questionError.value = null;
+  replyingQuestionId.value = null;
   const sid = commandForm.sessionId || "";
   if (!sid) {
     openCodeBridge.setActiveSession(null);
@@ -802,6 +804,8 @@ async function handleCreateOpenCodeSession() {
   if (isCreatingSession.value) return;
   isCreatingSession.value = true;
   commandFeedback.value = null;
+  questionError.value = null;
+  replyingQuestionId.value = null;
   try {
     const session = await openCodeBridge.createSession({
       agent: commandForm.agent,
@@ -856,6 +860,8 @@ async function handleInterruptOpenCode() {
   if (isInterrupting.value) return;
   isInterrupting.value = true;
   commandFeedback.value = null;
+  questionError.value = null;
+  replyingQuestionId.value = null;
   const res = await openCodeBridge.interruptSession(
     commandForm.sessionId || openCodeState.value.activeSessionId,
   );
@@ -982,18 +988,28 @@ async function handleQuickQuestionOption(item, optLabel) {
   }
 }
 
+function handleDismissQuestion(item) {
+  if (!item?.id) return;
+  openCodeBridge.dismissQuestion(item.id);
+  delete questionDrafts[item.id];
+  questionError.value = null;
+  if (replyingQuestionId.value === item.id) {
+    replyingQuestionId.value = null;
+  }
+  ambientAudio.playSoftTick();
+}
+
 async function handleRejectQuestion(item) {
   if (!item?.id || replyingQuestionId.value) return;
   replyingQuestionId.value = item.id;
   questionError.value = null;
   const res = await openCodeBridge.replyQuestion(item.id, [], { reject: true });
   replyingQuestionId.value = null;
-  if (res.ok) {
-    delete questionDrafts[item.id];
-    ambientAudio.playSoftTick();
-  } else {
-    questionError.value = res.error || "No se pudo omitir la pregunta";
+  if (!res.ok) {
+    openCodeBridge.dismissQuestion(item.id);
   }
+  delete questionDrafts[item.id];
+  ambientAudio.playSoftTick();
 }
 
 async function handleReplyPermission(requestId, response) {
@@ -1309,6 +1325,15 @@ onBeforeUnmount(() => {
               <span>{{ profileMap[activeQuestion.agentId]?.name || activeQuestion.agentId }}</span>
               <span aria-hidden="true" class="text-[#4B5563]">·</span>
               <span>1 de {{ openCodeState.pendingQuestions.length }}</span>
+              <button
+                type="button"
+                @click="handleDismissQuestion(activeQuestion)"
+                title="Descartar pregunta"
+                aria-label="Descartar pregunta"
+                class="p-0.5 ml-0.5 rounded text-[#9CA3AF] hover:text-[#F3F4F6] hover:bg-[#1F232D] transition-colors cursor-pointer"
+              >
+                <X class="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
 
@@ -1998,10 +2023,21 @@ onBeforeUnmount(() => {
               <MessageSquare class="w-3.5 h-3.5 text-[#4F6EF7]" />
               <span>Pregunta pendiente</span>
             </span>
-            <span class="text-[11px] text-[#9CA3AF] tabular-nums">
-              {{ profileMap[activeQuestion.agentId]?.name || activeQuestion.agentId }} · 1 de
-              {{ openCodeState.pendingQuestions.length }}
-            </span>
+            <div class="flex items-center gap-1.5 text-[11px] text-[#9CA3AF] tabular-nums">
+              <span>
+                {{ profileMap[activeQuestion.agentId]?.name || activeQuestion.agentId }} · 1 de
+                {{ openCodeState.pendingQuestions.length }}
+              </span>
+              <button
+                type="button"
+                @click="handleDismissQuestion(activeQuestion)"
+                title="Descartar pregunta"
+                aria-label="Descartar pregunta"
+                class="p-0.5 rounded text-[#9CA3AF] hover:text-[#F3F4F6] hover:bg-[#1F232D] transition-colors cursor-pointer"
+              >
+                <X class="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
 
           <div

@@ -156,6 +156,8 @@ export class OpenCodeBridgeClient {
     this.pendingPermissions = new Map();
     this.pendingQuestions = new Map();
     this.questionCallIdMap = new Map();
+    this.questionSyncInFlight = new Map();
+    this.questionSyncLastAt = new Map();
     this.liveTaskMeta = new Map(); // externalKey -> { title, file }
     this.capabilities = null;
     this.capabilitiesCache = new Map();
@@ -280,7 +282,16 @@ export class OpenCodeBridgeClient {
   }
 
   setActiveSession(sessionId = null) {
-    this.activeSessionId = sessionId || null;
+    const nextSid = sessionId || null;
+    if (this.activeSessionId !== nextSid) {
+      this._purgePendingQuestions({
+        exceptSessionId: nextSid || "__none__",
+        reason: "session_switched",
+        kanbanLabel: "Sesión cambiada",
+        taskLabel: "Sesión cambiada",
+      });
+    }
+    this.activeSessionId = nextSid;
     this._emitConnectionState();
   }
 
@@ -983,36 +994,165 @@ export class OpenCodeBridgeClient {
     this._emitConnectionState();
   }
 
+  _parseJsonSafe(val) {
+    if (!val) return null;
+    if (typeof val === "object") return val;
+    if (typeof val !== "string") return null;
+    const trimmed = val.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  }
+
+  _extractToolInputPayload(source = {}) {
+    if (!source || typeof source !== "object") return {};
+    const merged = {};
+    const candidates = [
+      this._parseJsonSafe(source.raw),
+      this._parseJsonSafe(source.state?.raw),
+      this._parseJsonSafe(source.arguments),
+      this._parseJsonSafe(source.state?.arguments),
+      this._parseJsonSafe(source.params),
+      this._parseJsonSafe(source.args),
+      this._parseJsonSafe(source.state?.args),
+      this._parseJsonSafe(source.input),
+      this._parseJsonSafe(source.state?.input),
+    ];
+    for (const obj of candidates) {
+      if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+        Object.assign(merged, obj);
+      }
+    }
+    if (typeof merged.questions === "string") {
+      const parsedQ = this._parseJsonSafe(merged.questions);
+      if (Array.isArray(parsedQ)) merged.questions = parsedQ;
+    }
+    if (typeof merged.options === "string") {
+      const parsedO = this._parseJsonSafe(merged.options);
+      if (Array.isArray(parsedO)) merged.options = parsedO;
+    }
+    if (typeof merged.choices === "string") {
+      const parsedC = this._parseJsonSafe(merged.choices);
+      if (Array.isArray(parsedC)) merged.choices = parsedC;
+    }
+    return merged;
+  }
+
+  _hasRealQuestionContent(questions = []) {
+    if (!Array.isArray(questions) || questions.length === 0) return false;
+    return questions.some(
+      (q) =>
+        (q?.options && q.options.length > 0) ||
+        (q?.question &&
+          q.question !== "El agente necesita tu respuesta para continuar."),
+    );
+  }
+
+  _markQuestionToolEntryDone(sessionId, callKey = null) {
+    if (!sessionId) return;
+    const list = this.sessionLogsById.get(sessionId);
+    if (!Array.isArray(list) || list.length === 0) return;
+    let changed = false;
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const entry = list[i];
+      if (
+        entry?.kind === "tool" &&
+        entry.toolName === "question" &&
+        entry.status === "running" &&
+        (!callKey || !entry.callKey || entry.callKey === callKey)
+      ) {
+        entry.status = "done";
+        entry.timestamp = Date.now();
+        changed = true;
+        if (callKey && entry.callKey === callKey) break;
+      }
+    }
+    if (changed) {
+      this._emitSessionLog(sessionId);
+    }
+  }
+
   _normalizeQuestionList(raw = {}) {
-    const unwrapped =
-      raw?.input && typeof raw.input === "object" && Array.isArray(raw.input.questions)
-        ? raw.input
-        : raw?.info && typeof raw.info === "object" && Array.isArray(raw.info.questions)
-          ? raw.info
-          : raw;
-    const sourceList = Array.isArray(unwrapped.questions) && unwrapped.questions.length > 0
-      ? unwrapped.questions
-      : Array.isArray(unwrapped.fields) && unwrapped.fields.length > 0
-        ? unwrapped.fields
-        : [unwrapped];
+    const rawObj = this._parseJsonSafe(raw) || raw || {};
+    const parsedInput = this._parseJsonSafe(rawObj.input);
+    const parsedInfo = this._parseJsonSafe(rawObj.info);
+    const parsedData = this._parseJsonSafe(rawObj.data);
+    const parsedForm = this._parseJsonSafe(rawObj.form);
+    const parsedArgs = this._parseJsonSafe(rawObj.args || rawObj.arguments);
+
+    const pickContainer = (obj) => {
+      if (!obj || typeof obj !== "object") return false;
+      return (
+        Array.isArray(obj.questions) ||
+        Array.isArray(obj.fields) ||
+        Array.isArray(obj.items) ||
+        typeof obj.question === "string" ||
+        typeof obj.prompt === "string" ||
+        typeof obj.message === "string" ||
+        typeof obj.title === "string" ||
+        Array.isArray(obj.options) ||
+        Array.isArray(obj.choices)
+      );
+    };
+
+    const unwrapped = pickContainer(parsedInput)
+      ? parsedInput
+      : pickContainer(parsedInfo)
+        ? parsedInfo
+        : pickContainer(parsedForm)
+          ? parsedForm
+          : pickContainer(parsedData)
+            ? parsedData
+            : pickContainer(parsedArgs)
+              ? parsedArgs
+              : rawObj;
+
+    const parsedQuestions =
+      typeof unwrapped?.questions === "string"
+        ? this._parseJsonSafe(unwrapped.questions)
+        : unwrapped?.questions;
+    const parsedFields =
+      typeof unwrapped?.fields === "string"
+        ? this._parseJsonSafe(unwrapped.fields)
+        : unwrapped?.fields;
+    const parsedItems =
+      typeof unwrapped?.items === "string"
+        ? this._parseJsonSafe(unwrapped.items)
+        : unwrapped?.items;
+
+    const sourceList =
+      Array.isArray(parsedQuestions) && parsedQuestions.length > 0
+        ? parsedQuestions
+        : Array.isArray(parsedFields) && parsedFields.length > 0
+          ? parsedFields
+          : Array.isArray(parsedItems) && parsedItems.length > 0
+            ? parsedItems
+            : [unwrapped];
 
     return sourceList.map((q, idx) => {
-      const rawOpts = Array.isArray(q?.options)
-        ? q.options
-        : Array.isArray(q?.choices)
-          ? q.choices
+      const qObj = this._parseJsonSafe(q) || q || {};
+      const rawOpts = Array.isArray(qObj?.options)
+        ? qObj.options
+        : Array.isArray(qObj?.choices)
+          ? qObj.choices
           : [];
       const options = rawOpts
         .map((opt) => {
           if (typeof opt === "string") {
-            return { label: opt, description: "" };
+            const label = opt.trim();
+            return label ? { label, description: "" } : null;
           }
           if (opt && typeof opt === "object") {
-            const label = String(opt.label || opt.title || opt.value || opt.name || "").trim();
+            const label = String(
+              opt.label || opt.title || opt.name || opt.text || opt.value || opt.id || "",
+            ).trim();
             if (!label) return null;
             return {
               label,
-              description: String(opt.description || opt.hint || "").trim(),
+              description: String(opt.description || opt.hint || opt.subtitle || "").trim(),
             };
           }
           return null;
@@ -1020,15 +1160,21 @@ export class OpenCodeBridgeClient {
         .filter(Boolean);
 
       return {
-        header: String(q?.header || q?.title || q?.name || `Pregunta ${idx + 1}`).trim(),
+        header: String(qObj?.header || qObj?.title || qObj?.name || `Pregunta ${idx + 1}`).trim(),
         question: String(
-          q?.question || q?.prompt || q?.label || q?.text || "El agente necesita tu respuesta para continuar.",
+          qObj?.question ||
+            qObj?.prompt ||
+            qObj?.label ||
+            qObj?.text ||
+            qObj?.message ||
+            qObj?.description ||
+            "El agente necesita tu respuesta para continuar.",
         ).trim(),
         options,
         multiple: Boolean(
-          q?.multiple || q?.multiSelect || q?.allowMultiple || q?.type === "multiselect",
+          qObj?.multiple || qObj?.multiSelect || qObj?.allowMultiple || qObj?.type === "multiselect",
         ),
-        custom: q?.custom !== false,
+        custom: options.length === 0 ? true : qObj?.custom !== false,
       };
     });
   }
@@ -1036,17 +1182,17 @@ export class OpenCodeBridgeClient {
   _addPendingQuestion(rawQuestion, sessionIdHint = null) {
     if (!rawQuestion || typeof rawQuestion !== "object") return null;
     const callID = rawQuestion.tool?.callID || rawQuestion.callID || null;
-    const id =
-      rawQuestion.id ||
+    const realId =
       rawQuestion.requestID ||
       rawQuestion.questionID ||
       rawQuestion.formID ||
-      callID ||
+      (!rawQuestion.isSynthetic ? rawQuestion.id : null) ||
       null;
+    const id = realId || rawQuestion.id || callID || null;
     if (!id) return null;
 
     const isSynthetic = Boolean(
-      rawQuestion.isSynthetic || (!rawQuestion.requestID && !rawQuestion.questionID && callID && id === callID),
+      rawQuestion.isSynthetic || (!realId && callID && id === callID),
     );
 
     const sessionID =
@@ -1056,15 +1202,22 @@ export class OpenCodeBridgeClient {
       this.activeSessionId ||
       null;
 
-    const questions = this._normalizeQuestionList(rawQuestion);
-    const firstPrompt = questions[0]?.question || "";
+    let questions = this._normalizeQuestionList(rawQuestion);
+    const hasRealContent = this._hasRealQuestionContent(questions);
+    const firstPrompt = hasRealContent ? questions[0]?.question || "" : "";
 
-    // No degradar una pregunta real (que_...) ya registrada si vuelve a llegar message.part.updated sintético
+    // No degradar una pregunta real (que_... / formID) ya registrada si vuelve a llegar un evento sintético
     if (isSynthetic) {
       if (callID && this.questionCallIdMap.has(callID)) {
         const mappedId = this.questionCallIdMap.get(callID);
         if (mappedId && mappedId !== id && this.pendingQuestions.has(mappedId)) {
-          return this.pendingQuestions.get(mappedId);
+          const existingReal = this.pendingQuestions.get(mappedId);
+          if (!this._hasRealQuestionContent(existingReal.questions) && hasRealContent) {
+            existingReal.questions = questions;
+            existingReal.header = questions[0]?.header || existingReal.header;
+            this._emitQuestionsState(false, existingReal);
+          }
+          return existingReal;
         }
       }
       for (const existing of this.pendingQuestions.values()) {
@@ -1075,14 +1228,21 @@ export class OpenCodeBridgeClient {
             (firstPrompt && existing.questions?.[0]?.question === firstPrompt))
         ) {
           if (callID) this.questionCallIdMap.set(callID, existing.id);
+          if (!this._hasRealQuestionContent(existing.questions) && hasRealContent) {
+            existing.questions = questions;
+            existing.header = questions[0]?.header || existing.header;
+            this._emitQuestionsState(false, existing);
+          }
           return existing;
         }
       }
     } else {
       // Si existía un placeholder sintético creado desde tool="question", reemplazarlo por el ID real
+      const replacedSynthetics = [];
       if (callID) {
         const synthId = this.questionCallIdMap.get(callID) || callID;
         if (synthId !== id && this.pendingQuestions.has(synthId)) {
+          replacedSynthetics.push(this.pendingQuestions.get(synthId));
           this.pendingQuestions.delete(synthId);
         }
       }
@@ -1092,10 +1252,19 @@ export class OpenCodeBridgeClient {
           existingId !== id &&
           ((callID && existing.callID === callID) ||
             (existing.sessionID === sessionID &&
-              firstPrompt &&
-              existing.questions?.[0]?.question === firstPrompt))
+              ((firstPrompt && existing.questions?.[0]?.question === firstPrompt) ||
+                existing.isPlaceholderOnly)))
         ) {
+          replacedSynthetics.push(existing);
           this.pendingQuestions.delete(existingId);
+        }
+      }
+      if (!hasRealContent) {
+        const richer = replacedSynthetics.find((s) =>
+          this._hasRealQuestionContent(s?.questions),
+        );
+        if (richer) {
+          questions = richer.questions;
         }
       }
     }
@@ -1106,21 +1275,29 @@ export class OpenCodeBridgeClient {
 
     const firstHeader = questions[0]?.header || "Pregunta";
     const agentId =
+      this.resolveAgentId(rawQuestion.agentId || rawQuestion.agent) ||
       this._resolveEventAgentId("question.asked", {
         ...rawQuestion,
         sessionID,
-      }) || "architect";
+      }) ||
+      "architect";
 
     const isNew = !this.pendingQuestions.has(id);
+    const prevItem = this.pendingQuestions.get(id);
+    if (prevItem && !hasRealContent && this._hasRealQuestionContent(prevItem.questions)) {
+      questions = prevItem.questions;
+    }
+
     const item = {
       id,
-      callID,
+      callID: callID || prevItem?.callID || null,
       isSynthetic,
+      isPlaceholderOnly: !this._hasRealQuestionContent(questions),
       sessionID,
       agentId,
-      header: firstHeader,
+      header: questions[0]?.header || firstHeader,
       questions,
-      createdAt: rawQuestion.createdAt || Date.now(),
+      createdAt: rawQuestion.createdAt || prevItem?.createdAt || Date.now(),
     };
 
     this.pendingQuestions.set(id, item);
@@ -1133,7 +1310,7 @@ export class OpenCodeBridgeClient {
       sessionId: sessionID,
       agentId,
       status: "blocked",
-      title: `Pregunta: ${firstHeader}`,
+      title: `Pregunta: ${item.header}`,
       file: questions[0]?.question?.slice(0, 40) || "question",
     });
     this._emitQuestionsState(isNew, item);
@@ -1157,6 +1334,111 @@ export class OpenCodeBridgeClient {
     }
     this._emitQuestionsState(false, removed);
     return removed;
+  }
+
+  _purgePendingQuestions({
+    sessionId = null,
+    exceptSessionId = null,
+    reason = "cleared",
+    kanbanLabel = "Pregunta descartada",
+    taskLabel = "Disponible",
+  } = {}) {
+    if (this.pendingQuestions.size === 0) return [];
+
+    const childSet =
+      sessionId && this.childSessionsByParent.get(sessionId)
+        ? this.childSessionsByParent.get(sessionId)
+        : null;
+    const exceptChildSet =
+      exceptSessionId &&
+      exceptSessionId !== "__none__" &&
+      this.childSessionsByParent.get(exceptSessionId)
+        ? this.childSessionsByParent.get(exceptSessionId)
+        : null;
+
+    const removedItems = [];
+    for (const [id, item] of Array.from(this.pendingQuestions.entries())) {
+      const itemSid = item?.sessionID || null;
+      let shouldRemove = false;
+
+      if (exceptSessionId !== null) {
+        const keep =
+          exceptSessionId !== "__none__" &&
+          itemSid &&
+          (itemSid === exceptSessionId || exceptChildSet?.has(itemSid));
+        shouldRemove = !keep;
+      } else if (sessionId) {
+        shouldRemove =
+          !itemSid || itemSid === sessionId || Boolean(childSet?.has(itemSid));
+      } else {
+        shouldRemove = true;
+      }
+
+      if (!shouldRemove) continue;
+
+      this.pendingQuestions.delete(id);
+      if (item?.callID) {
+        this.questionCallIdMap.delete(item.callID);
+      }
+      for (const [callKey, mapped] of Array.from(this.questionCallIdMap.entries())) {
+        if (mapped === id) {
+          this.questionCallIdMap.delete(callKey);
+        }
+      }
+      removedItems.push(item);
+    }
+
+    if (removedItems.length === 0) return [];
+
+    const releasedAgents = new Set();
+    for (const item of removedItems) {
+      if (item.sessionID) {
+        this._markQuestionToolEntryDone(item.sessionID, item.callID);
+      }
+      if (item.agentId && !releasedAgents.has(`${item.sessionID || ""}:${item.agentId}`)) {
+        releasedAgents.add(`${item.sessionID || ""}:${item.agentId}`);
+        this._releaseSessionNow(item.sessionID, item.agentId, {
+          status: "passed",
+          label: taskLabel,
+          file: item.header || reason,
+        });
+      }
+      this._emitLiveKanbanSync({
+        sessionId: item.sessionID,
+        agentId: item.agentId,
+        status: "done",
+        title: kanbanLabel,
+        file: item.header || "question",
+      });
+    }
+
+    this._emitQuestionsState(false, removedItems[removedItems.length - 1]);
+    return removedItems;
+  }
+
+  dismissQuestion(requestId) {
+    const { targetId, item } = this._resolveQuestionTarget(requestId);
+    if (!item) {
+      return { ok: true, dismissed: false };
+    }
+    this._removePendingQuestion(targetId);
+    this._removePendingQuestion(requestId);
+    if (item.sessionID) {
+      this._markQuestionToolEntryDone(item.sessionID, item.callID);
+    }
+    this._releaseSessionNow(item.sessionID, item.agentId, {
+      status: "passed",
+      label: "Pregunta descartada",
+      file: item.header,
+    });
+    this._emitLiveKanbanSync({
+      sessionId: item.sessionID,
+      agentId: item.agentId,
+      status: "done",
+      title: "Pregunta descartada",
+      file: item.header,
+    });
+    return { ok: true, dismissed: true };
   }
 
   _releaseSessionNow(
@@ -1431,7 +1713,7 @@ export class OpenCodeBridgeClient {
 
       const rawName = props.name || props.tool || "tool";
       const toolName = String(rawName).toLowerCase();
-      const input = props.input || props.args || {};
+      const input = this._extractToolInputPayload(props);
       const file = formatToolTarget(input);
       const callKey = props.id || props.callID || props.partID || null;
       const isFinished =
@@ -1517,29 +1799,22 @@ export class OpenCodeBridgeClient {
           : null,
       });
 
-      // Preguntas / formularios interactivos (`question`) pueden responderse desde la web
+      // Preguntas / formularios interactivos (`question`) se disparan directo desde la tool en curso
       if (toolName === "question") {
         if (!isFinished && !isError) {
-          if (Array.isArray(input.questions) || typeof input.question === "string") {
-            this._addPendingQuestion(
-              {
-                id: callKey || `q_${Date.now()}`,
-                callID: callKey,
-                isSynthetic: true,
-                sessionID: targetSid,
-                ...input,
-              },
-              targetSid,
-            );
-          } else {
-            this._emitLiveKanbanSync({
-              sessionId,
+          const provisionalId =
+            callKey || `q_${targetSid || "global"}_${props.messageID || "active"}_question`;
+          this._addPendingQuestion(
+            {
+              ...input,
+              id: provisionalId,
+              callID: callKey || provisionalId,
+              isSynthetic: true,
+              sessionID: targetSid,
               agentId,
-              status: "blocked",
-              title: "Esperando respuesta",
-              file: file || "question",
-            });
-          }
+            },
+            targetSid,
+          );
           this.syncPendingQuestions(targetSid).catch(() => []);
           this._queueAgentTask(
             agentId,
@@ -2056,13 +2331,13 @@ export class OpenCodeBridgeClient {
 
       if (part.type === "tool") {
         const toolName = String(part.tool || part.name || "tool").toLowerCase();
-        const stateStatus = part.state?.status || "running";
-        const input = part.state?.input || part.input || {};
+        const stateStatus = String(part.state?.status || "running").toLowerCase();
+        const input = this._extractToolInputPayload(part);
         const metaObj = part.state?.metadata || part.metadata || {};
         const file = formatToolTarget(input);
         const callKey = part.callID || part.id || props.id || null;
         const isDone = stateStatus === "completed";
-        const isErr = stateStatus === "error";
+        const isErr = stateStatus === "error" || stateStatus === "failed";
 
         const isDelegation = isDelegationToolName(toolName);
         let parentAgent = null;
@@ -2132,27 +2407,20 @@ export class OpenCodeBridgeClient {
           errorMessage: isErr ? part.state?.error || part.error || null : null,
         });
 
-        if (toolName === "question" && stateStatus !== "completed" && stateStatus !== "error") {
-          if (Array.isArray(input.questions) || typeof input.question === "string") {
-            this._addPendingQuestion(
-              {
-                id: callKey || `q_${Date.now()}`,
-                callID: callKey,
-                isSynthetic: true,
-                sessionID: targetSid,
-                ...input,
-              },
-              targetSid,
-            );
-          } else {
-            this._emitLiveKanbanSync({
-              sessionId,
+        if (toolName === "question" && !isDone && !isErr) {
+          const provisionalId =
+            callKey || `q_${part.messageID || targetSid || "global"}_${part.id || "question"}`;
+          this._addPendingQuestion(
+            {
+              ...input,
+              id: provisionalId,
+              callID: callKey || provisionalId,
+              isSynthetic: true,
+              sessionID: targetSid,
               agentId,
-              status: "blocked",
-              title: "Esperando respuesta",
-              file: file || "question",
-            });
-          }
+            },
+            targetSid,
+          );
           this.syncPendingQuestions(targetSid).catch(() => []);
           this._queueAgentTask(
             agentId,
@@ -2565,16 +2833,28 @@ export class OpenCodeBridgeClient {
   }
 
   _fillEndpointTemplate(template, params = {}) {
+    const lowerTemplate = String(template || "").toLowerCase();
     return template.replace(/\{([^}]+)\}/g, (_, key) => {
       const lower = key.toLowerCase();
-      if (lower.includes("session") || lower === "id") {
+      if (lower.includes("session")) {
         return encodeURIComponent(params.sessionID || "");
+      }
+      if (lower === "id") {
+        const isSessionId = lowerTemplate.includes(`/session/{${lower}}`);
+        return encodeURIComponent(
+          isSessionId
+            ? params.sessionID || ""
+            : params.requestID || params.questionID || params.formID || params.sessionID || "",
+        );
+      }
+      if (lower.includes("question")) {
+        return encodeURIComponent(params.questionID || params.requestID || "");
+      }
+      if (lower.includes("form")) {
+        return encodeURIComponent(params.formID || params.requestID || "");
       }
       if (lower.includes("request") || lower.includes("permission")) {
         return encodeURIComponent(params.requestID || "");
-      }
-      if (lower.includes("form")) {
-        return encodeURIComponent(params.formID || "");
       }
       return encodeURIComponent(params[key] || "");
     });
@@ -2733,7 +3013,13 @@ export class OpenCodeBridgeClient {
         `${this.apiPrefix}/question/{requestID}/reject`,
         `${this.apiPrefix}/session/{sessionID}/question/{requestID}/reject`,
       ],
-      formListPaths: [],
+      formListPaths: [
+        `${this.apiPrefix}/session/{sessionID}/form`,
+        `${this.apiPrefix}/form`,
+      ],
+      formReplyPaths: [],
+      formReplySchemas: {},
+      formRejectPaths: [],
     };
 
     try {
@@ -2781,6 +3067,9 @@ export class OpenCodeBridgeClient {
       const questionReplySchemas = {};
       const questionRejectFound = [];
       const formListFound = [];
+      const formReplyFound = [];
+      const formReplySchemas = {};
+      const formRejectFound = [];
       const sessionAgentEndpoints = [];
       let createSessionSchema = null;
       let activeSessionPath = null;
@@ -2809,14 +3098,31 @@ export class OpenCodeBridgeClient {
             const info = this._extractBodySchemaInfo(spec, methods.post);
             if (info) permissionReplySchemas[norm] = info;
           } else if (
-            /\/question\/\{[^}]+\}\/(reply|answer)$/i.test(rawPath) ||
-            /\/session\/\{[^}]+\}\/(question|form)\/\{[^}]+\}\/(reply|submit|answer)$/i.test(rawPath)
+            /\/question\/\{[^}]+\}\/(reply|answer|submit)$/i.test(rawPath) ||
+            /\/session\/\{[^}]+\}\/question\/\{[^}]+\}\/(reply|answer|submit)$/i.test(rawPath) ||
+            /\/question\/\{[^}]+\}$/i.test(rawPath)
           ) {
             questionReplyFound.push(norm);
             const info = this._extractBodySchemaInfo(spec, methods.post);
             if (info) questionReplySchemas[norm] = info;
-          } else if (/\/question\/\{[^}]+\}\/reject$/i.test(rawPath)) {
+          } else if (
+            /\/question\/\{[^}]+\}\/(reject|cancel|dismiss)$/i.test(rawPath) ||
+            /\/session\/\{[^}]+\}\/question\/\{[^}]+\}\/(reject|cancel|dismiss)$/i.test(rawPath)
+          ) {
             questionRejectFound.push(norm);
+          } else if (
+            /\/form\/\{[^}]+\}\/(reply|answer|submit)$/i.test(rawPath) ||
+            /\/session\/\{[^}]+\}\/form(\/\{[^}]+\})?(\/(reply|answer|submit))?$/i.test(rawPath) ||
+            /\/form\/\{[^}]+\}$/i.test(rawPath)
+          ) {
+            formReplyFound.push(norm);
+            const info = this._extractBodySchemaInfo(spec, methods.post);
+            if (info) formReplySchemas[norm] = info;
+          } else if (
+            /\/form\/\{[^}]+\}\/(reject|cancel|dismiss)$/i.test(rawPath) ||
+            /\/session\/\{[^}]+\}\/form\/\{[^}]+\}\/(reject|cancel|dismiss)$/i.test(rawPath)
+          ) {
+            formRejectFound.push(norm);
           } else if (/\/session\/\{[^}]+\}\/agent$/i.test(rawPath)) {
             sessionAgentEndpoints.push({
               method: "POST",
@@ -2843,11 +3149,10 @@ export class OpenCodeBridgeClient {
             messageListFound.push(norm);
           } else if (/\/permission$/i.test(rawPath)) {
             permListFound.push(norm);
-          } else if (/\/(question|form)s?$/i.test(rawPath)) {
+          } else if (/\/(question)s?$/i.test(rawPath)) {
             questionListFound.push(norm);
-            if (/\/session\/\{[^}]+\}\/form$/i.test(rawPath)) {
-              formListFound.push(norm);
-            }
+          } else if (/\/(form)s?$/i.test(rawPath)) {
+            formListFound.push(norm);
           }
         }
       }
@@ -2905,11 +3210,13 @@ export class OpenCodeBridgeClient {
         messageListPaths:
           messageListFound.length > 0 ? unique(messageListFound) : defaults.messageListPaths,
         questionListPaths: unique(questionListFound),
-        questionReplyPaths:
-          questionReplyFound.length > 0 ? unique(questionReplyFound) : defaults.questionReplyPaths,
+        questionReplyPaths: unique(questionReplyFound),
         questionReplySchemas,
         questionRejectPaths: unique(questionRejectFound),
         formListPaths: unique(formListFound),
+        formReplyPaths: unique(formReplyFound),
+        formReplySchemas,
+        formRejectPaths: unique(formRejectFound),
       };
       this.capabilitiesCache.set(cacheKey, this.capabilities);
       return this.capabilities;
@@ -2965,51 +3272,105 @@ export class OpenCodeBridgeClient {
     return this.getPendingPermissions();
   }
 
-  async syncPendingQuestions(sessionId = this.activeSessionId, signal) {
-    const baseUrl = this.getActiveBaseUrl();
-    const caps = this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl, signal));
-    const headers = {
-      Accept: "application/json",
-      ...this._buildAuthHeaders(),
-    };
-
-    for (const template of caps.questionListPaths || []) {
-      if (this.deadGetPaths.has(template)) continue;
-      if (template.includes("{sessionID}") && !sessionId) continue;
-      const path = this._fillEndpointTemplate(template, { sessionID: sessionId || "" });
-      try {
-        const resp = await fetch(`${baseUrl}${path}`, {
-          headers,
-          signal: signal || AbortSignal.timeout(3000),
-        });
-        if (resp.status === 404 || resp.status === 405) {
-          this.deadGetPaths.add(template);
-          continue;
-        }
-        const ct = (resp.headers.get("content-type") || "").toLowerCase();
-        if (!resp.ok || !ct.includes("application/json")) continue;
-
-        const raw = await resp.json().catch(() => null);
-        const data = this._unwrapResponseData(raw);
-        const list = Array.isArray(data)
-          ? data
-          : Array.isArray(data?.questions)
-            ? data.questions
-            : Array.isArray(data?.items)
-              ? data.items
-              : data && typeof data === "object" && (data.id || data.requestID)
-                ? [data]
-                : [];
-
-        for (const q of list) {
-          this._addPendingQuestion(q, sessionId);
-        }
-        return this.getPendingQuestions();
-      } catch {
-        // Probar siguiente ruta candidata
-      }
+  async syncPendingQuestions(
+    sessionId = this.activeSessionId,
+    signal,
+    { force = false } = {},
+  ) {
+    const syncKey = sessionId || "__global__";
+    if (!force && this.questionSyncInFlight.has(syncKey)) {
+      return this.questionSyncInFlight.get(syncKey);
     }
-    return this.getPendingQuestions();
+    const lastAt = this.questionSyncLastAt.get(syncKey) || 0;
+    if (!force && Date.now() - lastAt < 400) {
+      return this.getPendingQuestions();
+    }
+
+    const runner = (async () => {
+      const baseUrl = this.getActiveBaseUrl();
+      const caps = this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl, signal));
+      const headers = {
+        Accept: "application/json",
+        ...this._buildAuthHeaders(),
+      };
+
+      const candidateTemplates = [
+        ...new Set([
+          ...(caps.questionListPaths || []),
+          ...(caps.formListPaths || []),
+        ]),
+      ];
+
+      for (const template of candidateTemplates) {
+        if (this.deadGetPaths.has(template)) continue;
+        if (template.includes("{sessionID}") && !sessionId) continue;
+        const path = this._fillEndpointTemplate(template, { sessionID: sessionId || "" });
+        try {
+          const resp = await fetch(`${baseUrl}${path}`, {
+            headers,
+            signal: signal || AbortSignal.timeout(3000),
+          });
+          if (resp.status === 404 || resp.status === 405) {
+            this.deadGetPaths.add(template);
+            continue;
+          }
+          const ct = (resp.headers.get("content-type") || "").toLowerCase();
+          if (!resp.ok || !ct.includes("application/json")) continue;
+
+          const raw = await resp.json().catch(() => null);
+          const data = this._unwrapResponseData(raw);
+          const list = Array.isArray(data)
+            ? data
+            : Array.isArray(data?.questions)
+              ? data.questions
+              : Array.isArray(data?.forms)
+                ? data.forms
+                : Array.isArray(data?.items)
+                  ? data.items
+                  : Array.isArray(data?.pending)
+                    ? data.pending
+                    : data &&
+                        typeof data === "object" &&
+                        (data.id ||
+                          data.requestID ||
+                          data.questionID ||
+                          data.formID ||
+                          data.callID ||
+                          Array.isArray(data.questions) ||
+                          typeof data.question === "string")
+                      ? [data]
+                      : [];
+
+          let addedAny = false;
+          for (const q of list) {
+            const itemStatus = String(q?.status || q?.state?.status || "").toLowerCase();
+            if (
+              itemStatus === "replied" ||
+              itemStatus === "answered" ||
+              itemStatus === "rejected" ||
+              itemStatus === "completed" ||
+              itemStatus === "submitted"
+            ) {
+              continue;
+            }
+            const added = this._addPendingQuestion(q, sessionId);
+            if (added) addedAny = true;
+          }
+          if (addedAny) break;
+        } catch {
+          // Probar siguiente ruta candidata
+        }
+      }
+      this.questionSyncLastAt.set(syncKey, Date.now());
+      return this.getPendingQuestions();
+    })();
+
+    this.questionSyncInFlight.set(syncKey, runner);
+    try {
+      return await runner;
+    } finally {
+      this.questionSyncInFlight.delete(syncKey);
+    }
   }
 
   _normalizeHistoryMessages(rawList, sessionId) {
@@ -3107,12 +3468,29 @@ export class OpenCodeBridgeClient {
             });
           } else if (part.type === "tool") {
             const toolName = String(part.tool || part.name || "tool").toLowerCase();
-            const input = part.state?.input || part.input || {};
+            const input = this._extractToolInputPayload(part);
             const metaObj = part.state?.metadata || part.metadata || {};
             const stateStatus = String(part.state?.status || "completed").toLowerCase();
             const callKey = part.callID || part.id || null;
             const isDelegation = isDelegationToolName(toolName);
             const file = formatToolTarget(input);
+
+            if (toolName === "question" && (stateStatus === "running" || stateStatus === "pending")) {
+              const provisionalId =
+                callKey || `q_${msgId}_${partId}_question`;
+              this._addPendingQuestion(
+                {
+                  ...input,
+                  id: provisionalId,
+                  callID: callKey || provisionalId,
+                  isSynthetic: true,
+                  sessionID: sessionId,
+                  agentId: msgAgent,
+                },
+                sessionId,
+              );
+              this.syncPendingQuestions(sessionId).catch(() => []);
+            }
 
             let subagentId = null;
             if (isDelegation) {
@@ -3460,6 +3838,12 @@ export class OpenCodeBridgeClient {
       const rawJson = await resp.json();
       const session = this._unwrapResponseData(rawJson);
       if (session?.id) {
+        this._purgePendingQuestions({
+          exceptSessionId: session.id,
+          reason: "new_session",
+          kanbanLabel: "Sesión anterior cerrada",
+          taskLabel: "Nueva sesión activa",
+        });
         if (agent) this.sessionAgentMap.set(session.id, agent);
         this._upsertSessionRecord({ ...session, agent: session.agent || agent });
         this.activeSessionId = session.id;
@@ -3721,14 +4105,18 @@ export class OpenCodeBridgeClient {
             continue;
           }
           if (!resp.ok) {
-            return {
-              ok: false,
-              status: resp.status,
-              error:
-                resp.status === 401
-                  ? "Credenciales Basic Auth inválidas (401)"
-                  : await this._extractHttpError(resp, `HTTP ${resp.status} en ${path}`),
-            };
+            if (resp.status === 401) {
+              return {
+                ok: false,
+                status: 401,
+                error: "Credenciales Basic Auth inválidas (401)",
+              };
+            }
+            lastHttpError = await this._extractHttpError(
+              resp,
+              `HTTP ${resp.status} en ${path}`,
+            );
+            break;
           }
 
           const targetAgentId = this.resolveAgentId(agent) || "architect";
@@ -3783,7 +4171,23 @@ export class OpenCodeBridgeClient {
     }
     this.promptAbortControllers.clear();
 
-    if (!sessionId) {
+    const targetSid = sessionId || this.activeSessionId || null;
+    if (targetSid) {
+      this._purgePendingQuestions({
+        sessionId: targetSid,
+        reason: "interrupted",
+        kanbanLabel: "Ejecución detenida",
+        taskLabel: "Ejecución detenida",
+      });
+    } else {
+      this._purgePendingQuestions({
+        reason: "interrupted",
+        kanbanLabel: "Ejecución detenida",
+        taskLabel: "Ejecución detenida",
+      });
+    }
+
+    if (!targetSid) {
       return { ok: false, error: "No hay sesión activa para detener." };
     }
 
@@ -3796,10 +4200,14 @@ export class OpenCodeBridgeClient {
     };
 
     let lastHttpError = null;
+    const interruptAgentId =
+      this.busySessions.get(targetSid) ||
+      this.resolveAgentId(this.sessionAgentMap.get(targetSid)) ||
+      "architect";
 
     for (const template of caps.interruptPaths) {
       const path = this._fillEndpointTemplate(template, {
-        sessionID: sessionId,
+        sessionID: targetSid,
       });
       const expectsBody = Boolean(caps.interruptBodyInfo?.[template]);
       const attemptBodies = expectsBody
@@ -3836,23 +4244,27 @@ export class OpenCodeBridgeClient {
               ),
             };
           }
-          const agentId =
-            this.busySessions.get(sessionId) ||
-            this.resolveAgentId(this.sessionAgentMap.get(sessionId)) ||
-            "architect";
-          this._releaseSessionNow(sessionId, agentId, {
+          this._releaseSessionNow(targetSid, interruptAgentId, {
             status: "passed",
             label: "Ejecución detenida",
           });
           return { ok: true, endpoint: path };
         } catch (err) {
           if (err?.name === "TimeoutError") {
+            this._releaseSessionNow(targetSid, interruptAgentId, {
+              status: "passed",
+              label: "Ejecución detenida",
+            });
             return { ok: false, error: "Tiempo de espera agotado al detener" };
           }
         }
       }
     }
 
+    this._releaseSessionNow(targetSid, interruptAgentId, {
+      status: "passed",
+      label: "Ejecución detenida",
+    });
     return {
       ok: false,
       error:
@@ -3994,10 +4406,113 @@ export class OpenCodeBridgeClient {
       return { ok: false, error: "Selecciona una opción o escribe una respuesta." };
     }
 
-    // Si aún teníamos un placeholder sintético (callID) en lugar del requestID real (que_...),
-    // sincronizar primero GET /question para evitar HTTP 404 y no dejar pensando al agente.
+    const baseUrl = this.getActiveBaseUrl();
+    const caps =
+      this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
+    const headers = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...this._buildAuthHeaders(),
+    };
+
+    const flatText = flatAnswers.join(", ");
+    const answersObject = Object.fromEntries(
+      (item.questions || []).map((q, idx) => [
+        q?.header || q?.question || `q_${idx + 1}`,
+        (normalizedAnswers[idx] || []).join(", "),
+      ]),
+    );
+
+    const finalizeQuestionReply = (endpoint, { appendPromptLog = true } = {}) => {
+      this._removePendingQuestion(targetId);
+      this._removePendingQuestion(requestId);
+      if (item.sessionID) {
+        this._markQuestionToolEntryDone(item.sessionID, item.callID);
+        if (appendPromptLog) {
+          this._appendSessionLogEntry(item.sessionID, {
+            kind: "prompt",
+            agentId: item.agentId,
+            content: reject
+              ? `Pregunta omitida (${item.header})`
+              : `Respuesta (${item.header}): ${flatText}`,
+            status: "done",
+          });
+        }
+      }
+      this._emitLiveKanbanSync({
+        sessionId: item.sessionID,
+        agentId: item.agentId,
+        status: reject ? "done" : "in_progress",
+        title: reject ? "Pregunta omitida" : "Respuesta enviada",
+        file: item.header,
+      });
+      this._queueAgentTask(
+        item.agentId,
+        {
+          status: reject ? "passed" : "started",
+          phase: "working",
+          label: reject ? "Pregunta omitida" : "Continuando tarea",
+          file: item.header,
+        },
+        { immediate: true },
+      );
+      return { ok: true, rejected: reject, endpoint };
+    };
+
+    const followUpText = reject
+      ? `Omitir pregunta (${item.header || "question"}): continúa aplicando la opción recomendada.`
+      : (item.questions || []).length > 1
+        ? (item.questions || [])
+            .map((q, idx) => {
+              const chosen = (normalizedAnswers[idx] || []).join(", ");
+              return `${q?.header || q?.question || `Pregunta ${idx + 1}`}: ${chosen}`;
+            })
+            .join("\n")
+        : flatText;
+
+    const hasRestReplyEndpoints = reject
+      ? (caps.questionRejectPaths?.length || 0) > 0 ||
+        (caps.formRejectPaths?.length || 0) > 0 ||
+        (caps.questionReplyPaths?.length || 0) > 0 ||
+        (caps.formReplyPaths?.length || 0) > 0
+      : (caps.questionReplyPaths?.length || 0) > 0 ||
+        (caps.formReplyPaths?.length || 0) > 0;
+
+    // Si /openapi.json confirmó que el servidor NO expone endpoint reply de question ni form,
+    // cerrar el banner de inmediato y enviar la opción elegida como prompt de texto normal.
+    if (caps.discoveredFrom !== "defaults" && !hasRestReplyEndpoints) {
+      if (reject) {
+        const dismissed = finalizeQuestionReply("local-omit", { appendPromptLog: false });
+        return { ...dismissed, viaLocalDismiss: true };
+      }
+      const instantDone = finalizeQuestionReply("session-prompt-fallback", {
+        appendPromptLog: false,
+      });
+      const promptFallback = await this.sendPrompt({
+        sessionId: item.sessionID || this.activeSessionId || null,
+        agent: item.agentId || "architect",
+        text: followUpText,
+      });
+      if (!promptFallback?.ok && item.sessionID && promptFallback?.error) {
+        this._appendSessionLogEntry(item.sessionID, {
+          kind: "error",
+          agentId: item.agentId,
+          content: promptFallback.error,
+          status: "error",
+        });
+      }
+      return {
+        ...instantDone,
+        endpoint: promptFallback?.endpoint || instantDone.endpoint,
+        viaSessionMessage: true,
+        promptOk: Boolean(promptFallback?.ok),
+      };
+    }
+
+    // Si aún teníamos un placeholder sintético (callID) en lugar del requestID real (que_... / formID),
+    // sincronizar primero GET /question y /form para enlazar el ID real si el backend lo expone.
     if (item.isSynthetic) {
-      await this.syncPendingQuestions(item.sessionID).catch(() => []);
+      await this.syncPendingQuestions(item.sessionID, undefined, { force: true }).catch(() => []);
       const refreshed = this._resolveQuestionTarget(requestId);
       if (refreshed.item) {
         targetId = refreshed.targetId;
@@ -4017,25 +4532,23 @@ export class OpenCodeBridgeClient {
       }
     }
 
-    const baseUrl = this.getActiveBaseUrl();
-    const caps =
-      this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
-    const headers = {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      ...this._buildAuthHeaders(),
-    };
-
     let lastHttpError = null;
-    const flatText = flatAnswers.join(", ");
 
     const sendWithId = async (effectiveId) => {
       if (reject) {
-        for (const template of caps.questionRejectPaths || []) {
+        const rejectTemplates = [
+          ...new Set([
+            ...(caps.questionRejectPaths || []),
+            ...(caps.formRejectPaths || []),
+          ]),
+        ];
+        for (const template of rejectTemplates) {
           if (template.includes("{sessionID}") && !item.sessionID) continue;
           const path = this._fillEndpointTemplate(template, {
             sessionID: item.sessionID || "",
             requestID: effectiveId,
+            questionID: effectiveId,
+            formID: effectiveId,
           });
           try {
             const resp = await fetch(`${baseUrl}${path}`, {
@@ -4052,49 +4565,63 @@ export class OpenCodeBridgeClient {
               );
               continue;
             }
-            this._removePendingQuestion(effectiveId);
-            this._removePendingQuestion(requestId);
-            this._emitLiveKanbanSync({
-              sessionId: item.sessionID,
-              agentId: item.agentId,
-              status: "blocked",
-              title: "Pregunta omitida",
-              file: item.header,
-            });
-            this._queueAgentTask(item.agentId, {
-              status: "failed",
-              label: "Pregunta omitida",
-              file: item.header,
-            });
-            return { ok: true, rejected: true, endpoint: path };
+            return finalizeQuestionReply(path, { appendPromptLog: false });
           } catch (err) {
             lastHttpError = err?.message || "No se pudo omitir la pregunta";
           }
         }
       }
 
-      for (const template of caps.questionReplyPaths || []) {
+      const replyTemplates = [
+        ...new Set([
+          ...(caps.questionReplyPaths || []),
+          ...(caps.formReplyPaths || []),
+        ]),
+      ];
+
+      for (const template of replyTemplates) {
         if (template.includes("{sessionID}") && !item.sessionID) continue;
         const path = this._fillEndpointTemplate(template, {
           sessionID: item.sessionID || "",
           requestID: effectiveId,
+          questionID: effectiveId,
+          formID: effectiveId,
         });
 
-        const schemaProps = caps.questionReplySchemas?.[template]?.props || [];
+        const schemaProps =
+          caps.questionReplySchemas?.[template]?.props ||
+          caps.formReplySchemas?.[template]?.props ||
+          [];
+        const isFormEndpoint = /\/form/i.test(template);
+
         const bodyCandidates = reject
-          ? [{ reject: true }, { decision: "reject" }, { answers: [] }]
+          ? [{ reject: true }, { decision: "reject" }, { cancelled: true }, { answers: [] }]
           : schemaProps.includes("answers")
-            ? [{ answers: normalizedAnswers }]
+            ? [{ answers: normalizedAnswers }, { answers: flatAnswers }]
             : schemaProps.includes("answer")
               ? [{ answer: flatText }, { answers: normalizedAnswers }]
               : schemaProps.includes("values")
-                ? [{ values: flatAnswers }, { answers: normalizedAnswers }]
-                : [
-                    { answers: normalizedAnswers },
-                    { answer: flatText },
-                    { reply: flatText },
-                    { text: flatText },
-                  ];
+                ? [{ values: flatAnswers }, { values: answersObject }, { answers: normalizedAnswers }]
+                : schemaProps.includes("data")
+                  ? [{ data: answersObject }, { data: { answers: normalizedAnswers } }]
+                  : schemaProps.includes("responses")
+                    ? [{ responses: normalizedAnswers }, { responses: answersObject }]
+                    : isFormEndpoint
+                      ? [
+                          { answers: normalizedAnswers, formID: effectiveId },
+                          { values: answersObject, formID: effectiveId },
+                          { data: answersObject, formID: effectiveId },
+                          { answers: normalizedAnswers },
+                          { answer: flatText },
+                        ]
+                      : [
+                          { answers: normalizedAnswers },
+                          { answer: flatText },
+                          { values: flatAnswers },
+                          { data: answersObject },
+                          { reply: flatText },
+                          { text: flatText },
+                        ];
 
         for (const payload of bodyCandidates) {
           try {
@@ -4116,46 +4643,17 @@ export class OpenCodeBridgeClient {
               continue;
             }
             if (!resp.ok) {
-              return {
-                ok: false,
-                error: await this._extractHttpError(
-                  resp,
-                  `Error HTTP ${resp.status} al responder pregunta`,
-                ),
-              };
+              lastHttpError = await this._extractHttpError(
+                resp,
+                `Error HTTP ${resp.status} al responder pregunta`,
+              );
+              break;
             }
 
-            this._removePendingQuestion(effectiveId);
-            this._removePendingQuestion(requestId);
-            if (item.sessionID) {
-              this._appendSessionLogEntry(item.sessionID, {
-                kind: "prompt",
-                agentId: item.agentId,
-                content: reject
-                  ? `Pregunta omitida (${item.header})`
-                  : `Respuesta (${item.header}): ${flatText}`,
-                status: "done",
-              });
-            }
-            this._emitLiveKanbanSync({
-              sessionId: item.sessionID,
-              agentId: item.agentId,
-              status: reject ? "blocked" : "in_progress",
-              title: reject ? "Pregunta omitida" : "Respuesta enviada",
-              file: item.header,
-            });
-            this._queueAgentTask(item.agentId, {
-              status: reject ? "failed" : "started",
-              phase: "working",
-              label: reject ? "Pregunta omitida" : "Continuando tarea",
-              file: item.header,
-            });
-            return { ok: true, endpoint: path };
+            return finalizeQuestionReply(path, { appendPromptLog: true });
           } catch (err) {
-            return {
-              ok: false,
-              error: err?.message || "No se pudo responder la pregunta",
-            };
+            lastHttpError = err?.message || "No se pudo responder la pregunta";
+            break;
           }
         }
       }
@@ -4166,7 +4664,7 @@ export class OpenCodeBridgeClient {
     if (firstAttempt) return firstAttempt;
 
     // Si devolvió 404 por desfase de IDs, intentar sincronizar una vez más y reintentar
-    await this.syncPendingQuestions(item.sessionID).catch(() => []);
+    await this.syncPendingQuestions(item.sessionID, undefined, { force: true }).catch(() => []);
     const retriedTarget = this._resolveQuestionTarget(requestId);
     const retryMatch =
       (retriedTarget.item && retriedTarget.targetId !== targetId && retriedTarget.item) ||
@@ -4184,11 +4682,33 @@ export class OpenCodeBridgeClient {
       if (secondAttempt) return secondAttempt;
     }
 
+    // Respaldo final: cerrar el banner y enviar la respuesta elegida como prompt de texto normal
+    if (reject) {
+      const doneRes = finalizeQuestionReply("local-omit", { appendPromptLog: false });
+      return { ...doneRes, viaLocalDismiss: true };
+    }
+
+    const doneRes = finalizeQuestionReply("session-prompt-fallback", {
+      appendPromptLog: false,
+    });
+    const promptFallback = await this.sendPrompt({
+      sessionId: item.sessionID || this.activeSessionId || null,
+      agent: item.agentId || "architect",
+      text: followUpText,
+    });
+    if (!promptFallback?.ok && item.sessionID && (lastHttpError || promptFallback?.error)) {
+      this._appendSessionLogEntry(item.sessionID, {
+        kind: "error",
+        agentId: item.agentId,
+        content: promptFallback?.error || lastHttpError,
+        status: "error",
+      });
+    }
     return {
-      ok: false,
-      error:
-        lastHttpError ||
-        "No se encontró endpoint compatible para responder preguntas (/question/.../reply)",
+      ...doneRes,
+      endpoint: promptFallback?.endpoint || doneRes.endpoint,
+      viaSessionMessage: true,
+      promptOk: Boolean(promptFallback?.ok),
     };
   }
 
@@ -4461,6 +4981,15 @@ export class OpenCodeBridgeClient {
     }
     this.promptAbortControllers.clear();
     this._clearThrottleQueues();
+    for (const item of this.pendingQuestions.values()) {
+      this._emitLiveKanbanSync({
+        sessionId: item.sessionID,
+        agentId: item.agentId,
+        status: "done",
+        title: "Puente desconectado",
+        file: item.header || "question",
+      });
+    }
     this.activeAgents.clear();
     this.sessionsById.clear();
     this.activeSessionId = null;
@@ -4469,6 +4998,8 @@ export class OpenCodeBridgeClient {
     this.pendingPermissions.clear();
     this.pendingQuestions.clear();
     this.questionCallIdMap.clear();
+    this.questionSyncInFlight.clear();
+    this.questionSyncLastAt.clear();
     this.liveTaskMeta.clear();
     this.taskCallsByChildSession.clear();
     this.taskCallsByPartId.clear();
