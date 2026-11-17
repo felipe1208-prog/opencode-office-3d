@@ -503,6 +503,8 @@ export class VisualActionQueue {
     {
       hostAgentId = "architect",
       subagentId = null,
+      hostName = "Tech Lead",
+      subagentName = null,
       topic = "Delegando subtarea",
       hostCheckpointId = "meeting-presenter",
       subagentCheckpointId = "meeting-chair-n1",
@@ -530,6 +532,7 @@ export class VisualActionQueue {
             actionKey: "presenting",
             waitingActionKey: "standingIdle",
             socialMode: "MEETING",
+            partnerName: subagentName || `@${subagentId}`,
             seatedRequired: false,
           },
           {
@@ -539,6 +542,7 @@ export class VisualActionQueue {
             actionKey: "listening",
             waitingActionKey: "sittingIdle",
             socialMode: "MEETING",
+            partnerName: hostName || "Tech Lead",
             seatedRequired: true,
           },
         ],
@@ -835,13 +839,17 @@ export class VisualActionQueue {
 
             if (hasLiveWork) {
               entry.phase = "walk_to_desk";
+              const fallbackLabel =
+                p.role === "host"
+                  ? "Consolidando delegación"
+                  : "Ejecutando subtarea";
               const nextInfo = entry.pendingBursts[0] || {
                 phase: "working",
                 label:
                   entry.pendingCompletion?.label &&
                   entry.pendingCompletion.label !== "Tarea finalizada"
                     ? entry.pendingCompletion.label
-                    : "Ejecutando subtarea",
+                    : fallbackLabel,
                 file: entry.pendingCompletion?.file || null,
               };
               dispatched.push({

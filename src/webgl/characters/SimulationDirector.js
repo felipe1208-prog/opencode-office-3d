@@ -90,6 +90,7 @@ export class SimulationDirector {
     this.agentTimers = new Map();
     this.liveOwnership = new Map(); // agentId -> { active: boolean, idleCooldown: number }
     this.activeDelegation = null; // { hostAgentId, participants: Set }
+    this._lastOpenCodeStatus = null;
     this.visualQueue = new VisualActionQueue({
       meetingHoldMs: 5000,
       meetingExtendMs: 5000,
@@ -174,6 +175,29 @@ export class SimulationDirector {
       return true;
     }
 
+    const isMeetingBarrier =
+      barrier.kind === "delegation" || barrier.kind === "team_meeting";
+    const isMeetingHost = participant.role === "host" && isMeetingBarrier;
+
+    if (isMeetingHost) {
+      const currentCp = checkpointManager.get(participant.checkpointId);
+      const prevHolderId = currentCp?.reservedBy;
+      if (
+        prevHolderId &&
+        prevHolderId !== participant.agentId &&
+        !barrier.participants.has(prevHolderId)
+      ) {
+        const prevAgent = this.characterManager.getAgent(prevHolderId);
+        if (
+          prevAgent &&
+          (prevAgent.currentCheckpointId === participant.checkpointId ||
+            prevAgent.targetCheckpointId === participant.checkpointId)
+        ) {
+          prevAgent.returnHome();
+        }
+      }
+    }
+
     const initialAction =
       barrier.kind === "desk_review" && participant.role === "host"
         ? "typing"
@@ -185,6 +209,8 @@ export class SimulationDirector {
       socialPhase: "APPROACHING",
       socialPartnerName: participant.partnerName,
       overrideRotY: participant.overrideRotY,
+      forceReserve: isMeetingHost,
+      moveSpeed: barrier.kind === "delegation" ? 2.35 : null,
       onSeated,
     });
   }
@@ -311,7 +337,18 @@ export class SimulationDirector {
           agent.applyActionProfile(waitAction);
         }
 
-        if (firstPartnerAgent && !(barrier.kind === "desk_review" && participant.role === "host")) {
+        if (
+          (barrier.kind === "delegation" || barrier.kind === "team_meeting") &&
+          participant.role !== "host"
+        ) {
+          const presenterPos = checkpointManager.get("meeting-presenter")?.pos;
+          if (presenterPos) {
+            agent.lookAtWorldPosition(presenterPos);
+          }
+        } else if (
+          firstPartnerAgent &&
+          !(barrier.kind === "desk_review" && participant.role === "host")
+        ) {
           const partnerTarget =
             firstPartnerAgent.model?.position ||
             checkpointManager.get(partners[0].checkpointId)?.pos;
@@ -428,8 +465,11 @@ export class SimulationDirector {
           const agent = this.characterManager.getAgent(agentId);
           if (!agent) continue;
 
+          const returnSpeed = barrier.kind === "delegation" ? 1.85 : null;
+
           if (hasLiveWork && step) {
             agent.returnHome({
+              moveSpeed: returnSpeed,
               pendingLiveTask: {
                 status: "started",
                 phase: step.phase,
@@ -480,7 +520,7 @@ export class SimulationDirector {
                 partnerName: null,
               });
             } else {
-              agent.returnHome();
+              agent.returnHome({ moveSpeed: returnSpeed });
             }
           }
         }
@@ -689,10 +729,15 @@ export class SimulationDirector {
       MEETING_SEATS.find((s) => !usedSeats.has(s)) ||
       MEETING_SEATS[0];
 
+    const hostFirst = host.config.name.split(" ")[0];
+    const subFirst = subagent.config.name.split(" ")[0];
+
     const delegation = this.visualQueue.startDelegation(
       {
         hostAgentId: host.config.id,
         subagentId: subagent.config.id,
+        hostName: hostFirst,
+        subagentName: subFirst,
         topic,
         hostCheckpointId: "meeting-presenter",
         subagentCheckpointId: subSeat,
@@ -726,9 +771,28 @@ export class SimulationDirector {
     }
 
     if (barrier) {
-      for (const id of delegation.newlyAdded || []) {
-        const participant = barrier.participants.get(id);
-        if (participant) {
+      if (barrier.participants.size > 2) {
+        const hostP = barrier.participants.get(host.config.id);
+        if (hostP) hostP.partnerName = "Equipo";
+      }
+
+      const newlyAddedSet = new Set(delegation.newlyAdded || []);
+      for (const [id, participant] of barrier.participants.entries()) {
+        const pAgent = this.characterManager.getAgent(id);
+        if (!pAgent) continue;
+
+        const isAtAssignedSpot =
+          pAgent.currentCheckpointId === participant.checkpointId &&
+          !pAgent.isTransitioningSeat &&
+          pAgent.state !== "TRAVELING";
+        const isHeadingToAssignedSpot =
+          pAgent.state === "TRAVELING" &&
+          pAgent.targetCheckpointId === participant.checkpointId;
+
+        // Enviar obligatoriamente a todo recién incorporado y a cualquiera (especialmente host)
+        // que no esté físicamente en su puesto asignado ni caminando hacia él.
+        if (newlyAddedSet.has(id) || (!isAtAssignedSpot && !isHeadingToAssignedSpot)) {
+          participant.ready = false;
           this._sendBarrierParticipantToCheckpoint(barrier, participant);
         }
       }
@@ -811,13 +875,27 @@ export class SimulationDirector {
     this.visualQueue.reset();
     this.activeDelegation = null;
     this.monitorSystem?.setMeetingState({ active: false });
+    for (const agent of this.characterManager.characters) {
+      const keepCp = agent.currentCheckpointId || agent.targetCheckpointId || null;
+      checkpointManager.releaseAllByAgent(agent.config.id, {
+        exceptCheckpointId: keepCp,
+      });
+    }
   }
 
   bindEventBus() {
     this.unsubscribers.push(
       officeEventBus.on(OFFICE_EVENTS.OPENCODE_CONNECTION, (payload) => {
-        if (payload?.status === "disconnected") {
+        const nextStatus = payload?.status || null;
+        if (
+          nextStatus === "disconnected" &&
+          this._lastOpenCodeStatus &&
+          this._lastOpenCodeStatus !== "disconnected"
+        ) {
           this.clearAllLiveClaims();
+        }
+        if (nextStatus) {
+          this._lastOpenCodeStatus = nextStatus;
         }
       }),
 

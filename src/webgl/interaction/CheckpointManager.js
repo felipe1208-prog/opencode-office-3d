@@ -37,7 +37,12 @@ export class CheckpointManager {
     const cp = this.checkpoints[checkpointId];
     if (!cp) return false;
 
-    if (!cp.isOccupied && (!cp.reservedBy || cp.reservedBy === agentId)) {
+    if (cp.reservedBy === agentId) {
+      cp.isOccupied = true;
+      return true;
+    }
+
+    if (!cp.isOccupied && !cp.reservedBy) {
       cp.reservedBy = agentId;
       cp.isOccupied = true;
       return true;
@@ -48,6 +53,29 @@ export class CheckpointManager {
       queue.push(agentId);
     }
     return false;
+  }
+
+  forceReserve(checkpointId, agentId) {
+    const cp = this.checkpoints[checkpointId];
+    if (!cp) return { ok: false, evictedAgentId: null };
+
+    const previousHolder =
+      cp.reservedBy && cp.reservedBy !== agentId ? cp.reservedBy : null;
+    this.removeAgentFromAllQueues(agentId);
+    cp.reservedBy = agentId;
+    cp.isOccupied = true;
+    return { ok: true, evictedAgentId: previousHolder };
+  }
+
+  releaseAllByAgent(agentId, { exceptCheckpointId = null } = {}) {
+    if (!agentId) return;
+    this.removeAgentFromAllQueues(agentId);
+    for (const [id, cp] of Object.entries(this.checkpoints)) {
+      if (id === exceptCheckpointId) continue;
+      if (cp.reservedBy === agentId) {
+        this.release(id, agentId);
+      }
+    }
   }
 
   release(checkpointId, agentId) {

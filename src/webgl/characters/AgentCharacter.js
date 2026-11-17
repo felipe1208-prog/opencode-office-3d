@@ -20,6 +20,7 @@ export class AgentCharacter {
     this.model = CharacterModel.create(resources, config);
     this.animator = new CharacterAnimator(this.model, resources);
     this.locomotion = new CharacterLocomotion(this.model);
+    this.baseSpeed = this.locomotion.speed;
     this.propSockets = new PropSocketManager(this.model, resources);
     this.bubble = new AgentStatusBubble(this.model, config);
 
@@ -314,6 +315,8 @@ export class AgentCharacter {
       socialPhase = null,
       socialPartnerName = null,
       overrideRotY = null,
+      forceReserve = false,
+      moveSpeed = null,
       onSeated = null,
     } = {},
   ) {
@@ -342,10 +345,17 @@ export class AgentCharacter {
       return true;
     }
 
+    const hasActivePath =
+      this.isTransitioningSeat ||
+      this.locomotion.currentWaypointIndex < this.locomotion.waypoints.length;
     if (
       this.state === "TRAVELING" &&
-      this.targetCheckpointId === checkpointId
+      this.targetCheckpointId === checkpointId &&
+      hasActivePath
     ) {
+      if (moveSpeed) {
+        this.locomotion.speed = moveSpeed;
+      }
       if (socialMode !== null) this.socialMode = socialMode;
       if (socialPhase !== null) this.socialPhase = socialPhase;
       if (socialPartnerName !== null) this.socialPartnerName = socialPartnerName;
@@ -366,14 +376,21 @@ export class AgentCharacter {
       this.socialPartnerName = socialPartnerName;
     }
     this.overrideRotY = overrideRotY;
+    this.locomotion.speed = moveSpeed || this.baseSpeed;
 
+    if (this.waitingSeatId) {
+      checkpointManager.release(this.waitingSeatId, this.config.id);
+      this.waitingSeatId = null;
+    }
     if (this.targetCheckpointId && this.targetCheckpointId !== checkpointId) {
       checkpointManager.release(this.targetCheckpointId, this.config.id);
     }
     checkpointManager.removeAgentFromAllQueues(this.config.id);
     this.targetCheckpointId = checkpointId;
 
-    const reserved = checkpointManager.reserve(checkpointId, this.config.id);
+    const reserved = forceReserve
+      ? checkpointManager.forceReserve(checkpointId, this.config.id).ok
+      : checkpointManager.reserve(checkpointId, this.config.id);
 
     if (reserved) {
       this.beginTravel(() => {
@@ -628,7 +645,7 @@ export class AgentCharacter {
     return true;
   }
 
-  returnHome({ pendingLiveTask = null } = {}) {
+  returnHome({ pendingLiveTask = null, moveSpeed = null } = {}) {
     if (!this.homeCheckpointId) return;
     const home = checkpointManager.get(this.homeCheckpointId);
     if (!home) return;
@@ -640,6 +657,9 @@ export class AgentCharacter {
       (this.currentCheckpointId === this.homeCheckpointId && this.isTransitioningSeat);
 
     if (alreadyGoingHome) {
+      if (moveSpeed) {
+        this.locomotion.speed = moveSpeed;
+      }
       if (pendingLiveTask) {
         this.pendingLiveArrival = pendingLiveTask;
       }
@@ -650,6 +670,7 @@ export class AgentCharacter {
     this.clearSocialContext();
     this.pendingStationOnSeated = null;
     this.taskAccentColor = null;
+    this.locomotion.speed = moveSpeed || this.baseSpeed;
 
     // Blindaje 3: liberar de inmediato cualquier reserva previa (en viaje, espera o estación)
     if (this.targetCheckpointId && this.targetCheckpointId !== this.homeCheckpointId) {

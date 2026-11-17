@@ -1218,32 +1218,30 @@ export class OpenCodeBridgeClient {
     const callKey = part?.callID || part?.id || props?.id || null;
     const toolName = String(part?.tool || props?.name || "").toLowerCase();
 
-    // Nivel 1: part.agent o argumento dentro de herramientas de delegación (task / subagent)
+    // Nivel 1: argumento dentro de herramientas de delegación (task / subagent) o part.agent
     const partInput = part?.state?.input || part?.input || props?.input || {};
     const partMeta = part?.state?.metadata || part?.metadata || props?.metadata || {};
     const isDelegation = isDelegationToolName(toolName);
-    const tier1Candidate =
-      part?.agent ||
-      (isDelegation
-        ? partInput.subagent_type ||
-          partInput.agent ||
-          partInput.target ||
-          partInput.delegate ||
-          partMeta.agent
-        : null);
+    const delegationTargetCandidate = isDelegation
+      ? partInput.subagent_type ||
+        partInput.agent ||
+        partInput.target ||
+        partInput.delegate ||
+        partMeta.agent
+      : null;
 
-    const tier1Resolved =
-      this.resolveAgentId(tier1Candidate) ||
-      (isDelegation
-        ? this._inferSubagentFromText(
-            partInput.description ||
-              partInput.title ||
-              partInput.prompt ||
-              partInput.task ||
-              partMeta.title ||
-              "",
-          )
-        : null);
+    const tier1Resolved = isDelegation
+      ? this.resolveAgentId(delegationTargetCandidate) ||
+        this._inferSubagentFromText(
+          partInput.description ||
+            partInput.title ||
+            partInput.prompt ||
+            partInput.task ||
+            partMeta.title ||
+            "",
+        )
+      : this.resolveAgentId(part?.agent);
+
     if (tier1Resolved) {
       if (callKey) this.taskCallsByPartId.set(callKey, tier1Resolved);
       if (partMeta.sessionId) {
@@ -1254,6 +1252,11 @@ export class OpenCodeBridgeClient {
         this.sessionAgentMap.set(sessionId, part.agent);
       }
       return tier1Resolved;
+    }
+
+    if (isDelegation && part?.agent) {
+      const fallbackHost = this.resolveAgentId(part.agent);
+      if (fallbackHost) return fallbackHost;
     }
 
     // Si pertenece a un callID previo de tool="task" o "subagent"
