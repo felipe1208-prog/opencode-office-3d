@@ -3,6 +3,8 @@ import { agentProfileManager } from "../state/officeWorkspace.js";
 import { DEFAULT_AGENT_ALIASES } from "./openCodeTemplates.js";
 
 const STORAGE_KEY = "oficina3d:opencode_config:v1";
+const DISMISSED_QUESTIONS_STORAGE_KEY = "oficina3d:opencode_dismissed_questions:v1";
+const MAX_PERSISTED_DISMISSED_IDS = 250;
 const WATCHDOG_SILENCE_MS = 30000;
 const WATCHDOG_CHECK_INTERVAL_MS = 5000;
 const AGENT_THROTTLE_MS = 250;
@@ -61,6 +63,35 @@ function safeWriteConfig(cfg) {
   try {
     if (typeof localStorage === "undefined") return;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+  } catch {
+    // Ignorar error de cuota
+  }
+}
+
+function safeReadDismissedQuestionIds() {
+  try {
+    if (typeof localStorage === "undefined") return [];
+    const raw = localStorage.getItem(DISMISSED_QUESTIONS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+      .slice(-MAX_PERSISTED_DISMISSED_IDS);
+  } catch {
+    return [];
+  }
+}
+
+function safeWriteDismissedQuestionIds(idSet) {
+  try {
+    if (typeof localStorage === "undefined") return;
+    const list = Array.from(idSet || [])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+      .slice(-MAX_PERSISTED_DISMISSED_IDS);
+    localStorage.setItem(DISMISSED_QUESTIONS_STORAGE_KEY, JSON.stringify(list));
   } catch {
     // Ignorar error de cuota
   }
@@ -156,9 +187,12 @@ export class OpenCodeBridgeClient {
     this.pendingPermissions = new Map();
     this.pendingQuestions = new Map();
     this.questionCallIdMap = new Map();
+    this.dismissedQuestionIds = new Set(safeReadDismissedQuestionIds());
+    this.dismissedSignatureExpiresAt = new Map();
     this.questionSyncInFlight = new Map();
     this.questionSyncLastAt = new Map();
     this.liveTaskMeta = new Map(); // externalKey -> { title, file }
+    this.openapiSpec = null;
     this.capabilities = null;
     this.capabilitiesCache = new Map();
     this.deadGetPaths = new Set();
@@ -1075,6 +1109,118 @@ export class OpenCodeBridgeClient {
     }
   }
 
+  _collectQuestionIdentifiers(rawOrItem) {
+    if (!rawOrItem || typeof rawOrItem !== "object") return [];
+    const ids = new Set();
+    const candidates = [
+      rawOrItem.id,
+      rawOrItem.formID,
+      rawOrItem.formId,
+      rawOrItem.requestID,
+      rawOrItem.requestId,
+      rawOrItem.questionID,
+      rawOrItem.questionId,
+      rawOrItem.callID,
+      rawOrItem.callId,
+      rawOrItem.tool?.callID,
+      rawOrItem.tool?.callId,
+    ];
+    for (const c of candidates) {
+      if (typeof c === "string" && c.trim()) {
+        const trimmed = c.trim();
+        ids.add(trimmed);
+        const mapped = this.questionCallIdMap.get(trimmed);
+        if (typeof mapped === "string" && mapped.trim()) {
+          ids.add(mapped.trim());
+        }
+      }
+    }
+    return Array.from(ids);
+  }
+
+  _buildQuestionSignature(rawOrItem, sessionIdHint = null) {
+    if (!rawOrItem || typeof rawOrItem !== "object") return null;
+    const sid =
+      rawOrItem.sessionID ||
+      rawOrItem.sessionId ||
+      sessionIdHint ||
+      "";
+    const questions = Array.isArray(rawOrItem.questions)
+      ? rawOrItem.questions
+      : this._normalizeQuestionList(rawOrItem);
+    const firstQ = questions?.[0]?.question;
+    if (!firstQ || firstQ === "El agente necesita tu respuesta para continuar.") {
+      return null;
+    }
+    return `${sid}::${String(firstQ).trim()}`;
+  }
+
+  _isQuestionDismissed(rawOrItem, sessionIdHint = null) {
+    if (!rawOrItem) return false;
+    if (typeof rawOrItem === "string") {
+      return this.dismissedQuestionIds.has(rawOrItem.trim());
+    }
+    const ids = this._collectQuestionIdentifiers(rawOrItem);
+    for (const id of ids) {
+      if (this.dismissedQuestionIds.has(id)) return true;
+    }
+    const sig = this._buildQuestionSignature(rawOrItem, sessionIdHint);
+    if (sig && this.dismissedSignatureExpiresAt.has(sig)) {
+      const expiresAt = this.dismissedSignatureExpiresAt.get(sig) || 0;
+      if (Date.now() <= expiresAt) return true;
+      this.dismissedSignatureExpiresAt.delete(sig);
+    }
+    return false;
+  }
+
+  _markQuestionDismissed(rawOrItem, extraIds = [], { ttlSignatureMs = 60000 } = {}) {
+    let changed = false;
+    const addId = (val) => {
+      if (typeof val !== "string") return;
+      const trimmed = val.trim();
+      if (!trimmed) return;
+      if (this.dismissedQuestionIds.has(trimmed)) {
+        // Reinsertar al final para mantener orden LRU
+        this.dismissedQuestionIds.delete(trimmed);
+      } else {
+        changed = true;
+      }
+      this.dismissedQuestionIds.add(trimmed);
+    };
+
+    if (typeof rawOrItem === "string") {
+      addId(rawOrItem);
+    } else if (rawOrItem && typeof rawOrItem === "object") {
+      for (const id of this._collectQuestionIdentifiers(rawOrItem)) {
+        addId(id);
+      }
+      if (rawOrItem.rawFormData) {
+        for (const id of this._collectQuestionIdentifiers(rawOrItem.rawFormData)) {
+          addId(id);
+        }
+      }
+      const sig = this._buildQuestionSignature(rawOrItem);
+      if (sig) {
+        this.dismissedSignatureExpiresAt.set(sig, Date.now() + ttlSignatureMs);
+      }
+    }
+
+    for (const extra of extraIds || []) {
+      addId(extra);
+    }
+
+    while (this.dismissedQuestionIds.size > MAX_PERSISTED_DISMISSED_IDS) {
+      const oldest = this.dismissedQuestionIds.values().next().value;
+      if (!oldest) break;
+      this.dismissedQuestionIds.delete(oldest);
+      changed = true;
+    }
+
+    if (changed || extraIds.length > 0) {
+      safeWriteDismissedQuestionIds(this.dismissedQuestionIds);
+    }
+  }
+
   _normalizeQuestionList(raw = {}) {
     const rawObj = this._parseJsonSafe(raw) || raw || {};
     const parsedInput = this._parseJsonSafe(rawObj.input);
@@ -1143,15 +1289,17 @@ export class OpenCodeBridgeClient {
         .map((opt) => {
           if (typeof opt === "string") {
             const label = opt.trim();
-            return label ? { label, description: "" } : null;
+            return label ? { label, value: label, description: "" } : null;
           }
           if (opt && typeof opt === "object") {
             const label = String(
               opt.label || opt.title || opt.name || opt.text || opt.value || opt.id || "",
             ).trim();
             if (!label) return null;
+            const rawValue = opt.value ?? opt.id ?? opt.key ?? label;
             return {
               label,
+              value: String(rawValue),
               description: String(opt.description || opt.hint || opt.subtitle || "").trim(),
             };
           }
@@ -1160,6 +1308,8 @@ export class OpenCodeBridgeClient {
         .filter(Boolean);
 
       return {
+        id: qObj?.id || qObj?.fieldID || qObj?.fieldId || qObj?.key || qObj?.name || null,
+        fieldType: qObj?.type || qObj?.kind || null,
         header: String(qObj?.header || qObj?.title || qObj?.name || `Pregunta ${idx + 1}`).trim(),
         question: String(
           qObj?.question ||
@@ -1181,11 +1331,22 @@ export class OpenCodeBridgeClient {
 
   _addPendingQuestion(rawQuestion, sessionIdHint = null) {
     if (!rawQuestion || typeof rawQuestion !== "object") return null;
-    const callID = rawQuestion.tool?.callID || rawQuestion.callID || null;
-    const realId =
-      rawQuestion.requestID ||
-      rawQuestion.questionID ||
+    if (this._isQuestionDismissed(rawQuestion, sessionIdHint)) return null;
+
+    const callID = rawQuestion.tool?.callID || rawQuestion.callID || rawQuestion.callId || null;
+    const formID =
       rawQuestion.formID ||
+      rawQuestion.formId ||
+      (/^frm_/i.test(String(rawQuestion.id || "")) ? rawQuestion.id : null);
+    const requestID =
+      rawQuestion.requestID ||
+      rawQuestion.requestId ||
+      rawQuestion.questionID ||
+      rawQuestion.questionId ||
+      (/^que_/i.test(String(rawQuestion.id || "")) ? rawQuestion.id : null);
+    const realId =
+      requestID ||
+      formID ||
       (!rawQuestion.isSynthetic ? rawQuestion.id : null) ||
       null;
     const id = realId || rawQuestion.id || callID || null;
@@ -1290,6 +1451,8 @@ export class OpenCodeBridgeClient {
 
     const item = {
       id,
+      formID: formID || prevItem?.formID || null,
+      requestID: requestID || prevItem?.requestID || null,
       callID: callID || prevItem?.callID || null,
       isSynthetic,
       isPlaceholderOnly: !this._hasRealQuestionContent(questions),
@@ -1297,8 +1460,13 @@ export class OpenCodeBridgeClient {
       agentId,
       header: questions[0]?.header || firstHeader,
       questions,
+      rawFormData: !isSynthetic ? rawQuestion : prevItem?.rawFormData || rawQuestion,
       createdAt: rawQuestion.createdAt || prevItem?.createdAt || Date.now(),
     };
+
+    if (this._isQuestionDismissed(item, sessionID)) {
+      return null;
+    }
 
     this.pendingQuestions.set(id, item);
     if (sessionID) {
@@ -1342,6 +1510,7 @@ export class OpenCodeBridgeClient {
     reason = "cleared",
     kanbanLabel = "Pregunta descartada",
     taskLabel = "Disponible",
+    persistDismiss = false,
   } = {}) {
     if (this.pendingQuestions.size === 0) return [];
 
@@ -1375,6 +1544,10 @@ export class OpenCodeBridgeClient {
       }
 
       if (!shouldRemove) continue;
+
+      if (persistDismiss) {
+        this._markQuestionDismissed(item, [id]);
+      }
 
       this.pendingQuestions.delete(id);
       if (item?.callID) {
@@ -1418,6 +1591,7 @@ export class OpenCodeBridgeClient {
 
   dismissQuestion(requestId) {
     const { targetId, item } = this._resolveQuestionTarget(requestId);
+    this._markQuestionDismissed(item || requestId, [requestId, targetId]);
     if (!item) {
       return { ok: true, dismissed: false };
     }
@@ -2860,14 +3034,31 @@ export class OpenCodeBridgeClient {
     });
   }
 
+  _resolveComponentRef(spec, refString) {
+    if (!spec || typeof refString !== "string" || !refString.startsWith("#/")) {
+      return null;
+    }
+    const parts = refString
+      .slice(2)
+      .split("/")
+      .map((seg) => decodeURIComponent(seg.replace(/~1/g, "/").replace(/~0/g, "~")));
+    let cursor = spec;
+    for (const part of parts) {
+      if (!cursor || typeof cursor !== "object") return null;
+      cursor = cursor[part];
+    }
+    return cursor && typeof cursor === "object" ? cursor : null;
+  }
+
   _resolveSchemaRef(spec, schema, seen = new Set()) {
     if (!schema || typeof schema !== "object") return null;
     if (schema.$ref && typeof schema.$ref === "string") {
       if (seen.has(schema.$ref)) return null;
-      seen.add(schema.$ref);
-      const match = schema.$ref.match(/^#\/components\/schemas\/(.+)$/);
-      if (match && spec?.components?.schemas?.[match[1]]) {
-        return this._resolveSchemaRef(spec, spec.components.schemas[match[1]], seen);
+      const nextSeen = new Set(seen);
+      nextSeen.add(schema.$ref);
+      const target = this._resolveComponentRef(spec, schema.$ref);
+      if (target) {
+        return this._resolveSchemaRef(spec, target, nextSeen);
       }
     }
     if (Array.isArray(schema.allOf)) {
@@ -2883,7 +3074,7 @@ export class OpenCodeBridgeClient {
       return {
         type: "object",
         properties: mergedProps,
-        required: mergedReq,
+        required: [...new Set(mergedReq)],
         ...(strict ? { additionalProperties: false } : {}),
       };
     }
@@ -2893,25 +3084,400 @@ export class OpenCodeBridgeClient {
         const resolved = this._resolveSchemaRef(spec, v, seen);
         if (resolved?.properties) return resolved;
       }
+      for (const v of variants) {
+        const resolved = this._resolveSchemaRef(spec, v, seen);
+        if (resolved && resolved.type !== "null") return resolved;
+      }
     }
     return schema;
   }
 
+  _expandSchemaTree(spec, schema, depth = 0, seen = new Set()) {
+    if (!schema || typeof schema !== "object") return null;
+    if (depth > 6) return schema;
+
+    if (schema.$ref && typeof schema.$ref === "string") {
+      if (seen.has(schema.$ref)) return null;
+      const nextSeen = new Set(seen);
+      nextSeen.add(schema.$ref);
+      const target = this._resolveComponentRef(spec, schema.$ref);
+      if (target) {
+        return this._expandSchemaTree(spec, target, depth + 1, nextSeen);
+      }
+    }
+
+    if (Array.isArray(schema.allOf)) {
+      const mergedProps = {};
+      const mergedReq = [];
+      let strict = false;
+      let additionalProperties = undefined;
+      for (const item of schema.allOf) {
+        const expanded = this._expandSchemaTree(spec, item, depth + 1, seen);
+        if (!expanded) continue;
+        if (expanded.properties) Object.assign(mergedProps, expanded.properties);
+        if (Array.isArray(expanded.required)) mergedReq.push(...expanded.required);
+        if (expanded.additionalProperties === false) strict = true;
+        else if (expanded.additionalProperties && additionalProperties === undefined) {
+          additionalProperties = expanded.additionalProperties;
+        }
+      }
+      return {
+        type: "object",
+        properties: mergedProps,
+        required: [...new Set(mergedReq)],
+        ...(strict
+          ? { additionalProperties: false }
+          : additionalProperties !== undefined
+            ? { additionalProperties }
+            : {}),
+      };
+    }
+
+    const copy = { ...schema };
+    if (Array.isArray(schema.anyOf)) {
+      copy.anyOf = schema.anyOf
+        .map((v) => this._expandSchemaTree(spec, v, depth + 1, seen))
+        .filter(Boolean);
+    }
+    if (Array.isArray(schema.oneOf)) {
+      copy.oneOf = schema.oneOf
+        .map((v) => this._expandSchemaTree(spec, v, depth + 1, seen))
+        .filter(Boolean);
+    }
+    if (schema.items && typeof schema.items === "object") {
+      copy.items = this._expandSchemaTree(spec, schema.items, depth + 1, seen);
+    }
+    if (schema.additionalProperties && typeof schema.additionalProperties === "object") {
+      copy.additionalProperties = this._expandSchemaTree(
+        spec,
+        schema.additionalProperties,
+        depth + 1,
+        seen,
+      );
+    }
+    if (schema.properties && typeof schema.properties === "object") {
+      const expandedProps = {};
+      for (const [k, v] of Object.entries(schema.properties)) {
+        expandedProps[k] = this._expandSchemaTree(spec, v, depth + 1, seen) || v;
+      }
+      copy.properties = expandedProps;
+    }
+    return copy;
+  }
+
   _extractBodySchemaInfo(spec, operation) {
-    const rawBody = operation?.requestBody;
+    let rawBody = operation?.requestBody;
     if (!rawBody) return null;
+    if (rawBody.$ref && typeof rawBody.$ref === "string") {
+      rawBody = this._resolveComponentRef(spec, rawBody.$ref) || rawBody;
+    }
     const rawSchema =
       rawBody?.content?.["application/json"]?.schema ||
       rawBody?.content?.["*/*"]?.schema ||
+      Object.values(rawBody?.content || {})[0]?.schema ||
       null;
     const resolved = this._resolveSchemaRef(spec, rawSchema);
+    const expanded = this._expandSchemaTree(spec, rawSchema);
     if (!resolved || typeof resolved !== "object") {
-      return { hasBody: true, props: [], required: [], strict: false };
+      return { hasBody: true, props: [], required: [], strict: false, schema: expanded };
     }
     const props = resolved.properties ? Object.keys(resolved.properties) : [];
     const required = Array.isArray(resolved.required) ? resolved.required : [];
     const strict = resolved.additionalProperties === false;
-    return { hasBody: true, props, required, strict };
+    return {
+      hasBody: true,
+      props,
+      required,
+      strict,
+      schema: expanded || resolved,
+    };
+  }
+
+  _buildReplyBodiesFromSchema(schemaInfo, context) {
+    const schema = schemaInfo?.schema || schemaInfo;
+    if (!schema || typeof schema !== "object") return [];
+
+    const {
+      effectiveId = "",
+      item = {},
+      normalizedAnswers = [],
+      flatAnswers = [],
+      flatText = "",
+      reject = false,
+    } = context || {};
+
+    const questions = Array.isArray(item?.questions) ? item.questions : [];
+    const fieldKeys = questions.map(
+      (q, idx) => q?.id || q?.header || q?.question || `field_${idx + 1}`,
+    );
+
+    const resolveChoiceLists = (useLabelOverValue = false) =>
+      questions.map((q, idx) => {
+        const chosen = normalizedAnswers[idx] || [];
+        return chosen.map((lbl) => {
+          if (useLabelOverValue) return lbl;
+          const match = (q?.options || []).find(
+            (o) => o.label === lbl || o.value === lbl,
+          );
+          return match?.value ?? lbl;
+        });
+      });
+
+    const buildRecordForQuestions = (valSchema, useLabelOverValue = false) => {
+      const lists = resolveChoiceLists(useLabelOverValue);
+      const record = {};
+      questions.forEach((q, idx) => {
+        const key = fieldKeys[idx];
+        const vals = lists[idx] || [];
+        const vsType = valSchema?.type;
+        if (vsType === "array") {
+          record[key] = vals;
+        } else if (vsType === "boolean") {
+          record[key] = /^(true|s[ií]|yes|1|accept|confirm|ok)/i.test(vals[0] || "");
+        } else if (vsType === "number" || vsType === "integer") {
+          const parsed = Number(vals[0]);
+          record[key] = Number.isFinite(parsed) ? parsed : 0;
+        } else if (vsType === "string") {
+          record[key] = vals.join(", ");
+        } else {
+          // anyOf / string | string[] / unspecified: arreglo si multi-select, string si single
+          record[key] = q?.multiple ? vals : (vals[0] ?? "");
+        }
+      });
+      if (questions.length === 0 && flatText) {
+        record.answer = flatText;
+      }
+      return record;
+    };
+
+    const buildItemArrayForSchema = (itemsSchema, useLabelOverValue = false) => {
+      const lists = resolveChoiceLists(useLabelOverValue);
+      if (!itemsSchema || typeof itemsSchema !== "object") {
+        return reject ? [] : lists;
+      }
+      if (itemsSchema.type === "array") {
+        return reject ? [] : lists;
+      }
+      if (itemsSchema.type === "string") {
+        return reject ? [] : lists.flat();
+      }
+      if (itemsSchema.type === "object" || itemsSchema.properties) {
+        const itemProps = itemsSchema.properties || {};
+        return questions.map((q, idx) => {
+          const vals = lists[idx] || [];
+          const entry = {};
+          for (const [pk, pSchema] of Object.entries(itemProps)) {
+            const lowerPk = pk.toLowerCase();
+            if (lowerPk === "id" || lowerPk === "fieldid" || lowerPk === "questionid" || lowerPk === "key" || lowerPk === "name") {
+              entry[pk] = fieldKeys[idx];
+            } else if (lowerPk === "value" || lowerPk === "values" || lowerPk === "answer" || lowerPk === "answers" || lowerPk === "selected" || lowerPk === "text") {
+              if (pSchema?.type === "array") entry[pk] = vals;
+              else if (pSchema?.type === "boolean") entry[pk] = /^(true|s[ií]|yes|1)/i.test(vals[0] || "");
+              else if (pSchema?.type === "string") entry[pk] = vals.join(", ");
+              else entry[pk] = q?.multiple ? vals : (vals[0] ?? "");
+            }
+          }
+          if (Object.keys(entry).length === 0) {
+            return { id: fieldKeys[idx], value: q?.multiple ? vals : (vals[0] ?? "") };
+          }
+          return entry;
+        });
+      }
+      return reject ? [] : lists;
+    };
+
+    const buildPropValue = (propName, propSchema, useLabelOverValue = false) => {
+      const lower = propName.toLowerCase();
+      if (!propSchema || typeof propSchema !== "object") {
+        return lower.includes("answer") ? normalizedAnswers : flatText;
+      }
+      if (propSchema.const !== undefined) return propSchema.const;
+      if (Array.isArray(propSchema.enum) && propSchema.enum.length > 0) {
+        if (reject) {
+          const hit = propSchema.enum.find((v) =>
+            /reject|cancel|dismiss|decline|skip|abort/i.test(String(v)),
+          );
+          if (hit !== undefined) return hit;
+        } else {
+          const hit = propSchema.enum.find((v) =>
+            /submit|reply|answer|accept|confirm|complete|ok/i.test(String(v)),
+          );
+          if (hit !== undefined) return hit;
+        }
+        return propSchema.enum[0];
+      }
+
+      if (lower === "formid" || lower === "form_id") return effectiveId;
+      if (lower === "questionid" || lower === "question_id" || lower === "requestid" || lower === "request_id") {
+        return effectiveId;
+      }
+      if (lower === "sessionid" || lower === "session_id") return item?.sessionID || "";
+      if (lower === "callid" || lower === "call_id") return item?.callID || "";
+      if (lower === "id") return effectiveId;
+
+      if (lower === "reject" || lower === "rejected" || lower === "cancel" || lower === "cancelled" || lower === "canceled" || lower === "dismiss" || lower === "dismissed") {
+        return Boolean(reject);
+      }
+      if (lower === "submitted" || lower === "completed" || lower === "accepted" || lower === "confirmed" || lower === "ok") {
+        return !reject;
+      }
+
+      const targetType = propSchema.type;
+      const lists = resolveChoiceLists(useLabelOverValue);
+
+      if (targetType === "boolean") return !reject;
+      if (targetType === "string") return reject ? "" : lists.flat().join(", ");
+      if (targetType === "array") {
+        return buildItemArrayForSchema(propSchema.items, useLabelOverValue);
+      }
+      if (targetType === "object" || propSchema.properties || propSchema.additionalProperties) {
+        if (propSchema.properties && Object.keys(propSchema.properties).length > 0) {
+          const nested = {};
+          const reqSet = new Set(propSchema.required || []);
+          for (const [nk, ns] of Object.entries(propSchema.properties)) {
+            if (
+              reqSet.has(nk) ||
+              /answer|value|field|data|response|submit|reject|cancel|id/i.test(nk)
+            ) {
+              nested[nk] = buildPropValue(nk, ns, useLabelOverValue);
+            }
+          }
+          if (Object.keys(nested).length > 0) return nested;
+        }
+        const apSchema =
+          typeof propSchema.additionalProperties === "object"
+            ? propSchema.additionalProperties
+            : null;
+        return buildRecordForQuestions(apSchema, useLabelOverValue);
+      }
+
+      // Union dentro de propiedad (ej. answers: string[][] | Record<string, string>)
+      const variants = propSchema.anyOf || propSchema.oneOf;
+      if (Array.isArray(variants) && variants.length > 0) {
+        const preferred =
+          variants.find((v) => v?.type === "object" || v?.additionalProperties) ||
+          variants.find((v) => v?.type === "array") ||
+          variants.find((v) => v?.type === "string") ||
+          variants[0];
+        return buildPropValue(propName, preferred, useLabelOverValue);
+      }
+
+      return lower === "answer" || lower === "reply" || lower === "text"
+        ? flatText
+        : lists;
+    };
+
+    const schemaSupportsReject = (objSchema) => {
+      if (!objSchema || typeof objSchema !== "object") return false;
+      const props = objSchema.properties || {};
+      for (const [pk, ps] of Object.entries(props)) {
+        if (/reject|cancel|dismiss|decline|skip|abort/i.test(pk)) return true;
+        if (ps?.const !== undefined && /reject|cancel|dismiss/i.test(String(ps.const))) return true;
+        if (
+          Array.isArray(ps?.enum) &&
+          ps.enum.some((v) => /reject|cancel|dismiss/i.test(String(v)))
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const buildFromObjectSchema = (objSchema, useLabelOverValue = false) => {
+      if (!objSchema || typeof objSchema !== "object") return null;
+      const props = objSchema.properties || {};
+      const propKeys = Object.keys(props);
+
+      if (propKeys.length === 0) {
+        if (objSchema.additionalProperties) {
+          const apSchema =
+            typeof objSchema.additionalProperties === "object"
+              ? objSchema.additionalProperties
+              : null;
+          return buildRecordForQuestions(apSchema, useLabelOverValue);
+        }
+        return reject ? {} : null;
+      }
+
+      if (reject && !schemaSupportsReject(objSchema)) {
+        return null;
+      }
+
+      const payload = {};
+      const requiredSet = new Set(objSchema.required || []);
+      const answerPropRx =
+        /^(answers?|values?|fields?|data|responses?|submission|payload|result|reply|text|content|input|body|action|status|decision|reject|rejected|cancel|cancelled|canceled|dismiss|dismissed|submitted|formid|form_id|questionid|question_id|requestid|request_id)$/i;
+
+      for (const pk of propKeys) {
+        const ps = props[pk];
+        if (requiredSet.has(pk) || answerPropRx.test(pk)) {
+          payload[pk] = buildPropValue(pk, ps, useLabelOverValue);
+        }
+      }
+
+      // Si no coincidió ninguna clave conocida, poblar la primera propiedad
+      if (Object.keys(payload).length === 0) {
+        const firstKey = propKeys[0];
+        payload[firstKey] = buildPropValue(firstKey, props[firstKey], useLabelOverValue);
+      }
+      return payload;
+    };
+
+    const candidates = [];
+    const seenJson = new Set();
+    const pushCandidate = (obj) => {
+      if (obj === null || obj === undefined) return;
+      try {
+        const key = JSON.stringify(obj);
+        if (!seenJson.has(key)) {
+          seenJson.add(key);
+          candidates.push(obj);
+        }
+      } catch {
+        // Ignorar payloads no serializables
+      }
+    };
+
+    const topVariants =
+      Array.isArray(schema.anyOf) || Array.isArray(schema.oneOf)
+        ? (schema.anyOf || schema.oneOf).filter((v) => v && v.type !== "null")
+        : [schema];
+
+    // Si es reject, priorizar variantes que expliciten cancel/reject
+    const orderedVariants = reject
+      ? [
+          ...topVariants.filter((v) => schemaSupportsReject(v)),
+          ...topVariants.filter((v) => !schemaSupportsReject(v)),
+        ]
+      : topVariants;
+
+    const hasDistinctLabelValue = questions.some((q) =>
+      (q?.options || []).some((o) => o.value && o.label && o.value !== o.label),
+    );
+
+    for (const variant of orderedVariants) {
+      if (variant.type === "array") {
+        if (!reject) {
+          pushCandidate(buildItemArrayForSchema(variant.items, false));
+          if (hasDistinctLabelValue) {
+            pushCandidate(buildItemArrayForSchema(variant.items, true));
+          }
+        }
+        continue;
+      }
+      if (
+        variant.type === "object" ||
+        variant.properties ||
+        variant.additionalProperties
+      ) {
+        pushCandidate(buildFromObjectSchema(variant, false));
+        if (!reject && hasDistinctLabelValue) {
+          pushCandidate(buildFromObjectSchema(variant, true));
+        }
+      }
+    }
+
+    return candidates;
   }
 
   async _extractHttpError(resp, fallbackText) {
@@ -3013,6 +3579,7 @@ export class OpenCodeBridgeClient {
         `${this.apiPrefix}/question/{requestID}/reject`,
         `${this.apiPrefix}/session/{sessionID}/question/{requestID}/reject`,
       ],
+      questionRejectSchemas: {},
       formListPaths: [
         `${this.apiPrefix}/session/{sessionID}/form`,
         `${this.apiPrefix}/form`,
@@ -3020,6 +3587,8 @@ export class OpenCodeBridgeClient {
       formReplyPaths: [],
       formReplySchemas: {},
       formRejectPaths: [],
+      formRejectSchemas: {},
+      openapiSpec: null,
     };
 
     try {
@@ -3054,6 +3623,8 @@ export class OpenCodeBridgeClient {
         return defaults;
       }
 
+      this.openapiSpec = spec;
+
       const promptFound = [];
       const promptBodySchemas = {};
       const interruptFound = [];
@@ -3066,10 +3637,12 @@ export class OpenCodeBridgeClient {
       const questionReplyFound = [];
       const questionReplySchemas = {};
       const questionRejectFound = [];
+      const questionRejectSchemas = {};
       const formListFound = [];
       const formReplyFound = [];
       const formReplySchemas = {};
       const formRejectFound = [];
+      const formRejectSchemas = {};
       const sessionAgentEndpoints = [];
       let createSessionSchema = null;
       let activeSessionPath = null;
@@ -3110,9 +3683,12 @@ export class OpenCodeBridgeClient {
             /\/session\/\{[^}]+\}\/question\/\{[^}]+\}\/(reject|cancel|dismiss)$/i.test(rawPath)
           ) {
             questionRejectFound.push(norm);
+            const info = this._extractBodySchemaInfo(spec, methods.post);
+            if (info) questionRejectSchemas[norm] = info;
           } else if (
             /\/form\/\{[^}]+\}\/(reply|answer|submit)$/i.test(rawPath) ||
-            /\/session\/\{[^}]+\}\/form(\/\{[^}]+\})?(\/(reply|answer|submit))?$/i.test(rawPath) ||
+            /\/session\/\{[^}]+\}\/form\/\{[^}]+\}(\/(reply|answer|submit))?$/i.test(rawPath) ||
+            /\/session\/\{[^}]+\}\/form\/(reply|answer|submit)$/i.test(rawPath) ||
             /\/form\/\{[^}]+\}$/i.test(rawPath)
           ) {
             formReplyFound.push(norm);
@@ -3123,6 +3699,8 @@ export class OpenCodeBridgeClient {
             /\/session\/\{[^}]+\}\/form\/\{[^}]+\}\/(reject|cancel|dismiss)$/i.test(rawPath)
           ) {
             formRejectFound.push(norm);
+            const info = this._extractBodySchemaInfo(spec, methods.post);
+            if (info) formRejectSchemas[norm] = info;
           } else if (/\/session\/\{[^}]+\}\/agent$/i.test(rawPath)) {
             sessionAgentEndpoints.push({
               method: "POST",
@@ -3158,6 +3736,20 @@ export class OpenCodeBridgeClient {
       }
 
       const unique = (arr) => [...new Set(arr)];
+      const rankInteractiveReplyPath = (p) => {
+        const hasAction = /\/(reply|answer|submit)$/i.test(p) ? 0 : 1;
+        const hasId = /\{[^}]+\}/.test(p.split("/form").pop() || p.split("/question").pop() || "")
+          ? 0
+          : 1;
+        const hasSession = p.includes("/session/") ? 0 : 1;
+        return hasAction * 10 + hasId * 4 + hasSession;
+      };
+      questionReplyFound.sort(
+        (a, b) => rankInteractiveReplyPath(a) - rankInteractiveReplyPath(b),
+      );
+      formReplyFound.sort(
+        (a, b) => rankInteractiveReplyPath(a) - rankInteractiveReplyPath(b),
+      );
       promptFound.sort((a, b) => {
         const rank = (p) =>
           p.endsWith("/prompt") ? 0 : p.endsWith("/prompt_async") ? 1 : 2;
@@ -3195,6 +3787,7 @@ export class OpenCodeBridgeClient {
       // Estricto según el OpenAPI descubierto: no mezclar URLs fallback que producirían HTTP 404
       this.capabilities = {
         discoveredFrom: specSource,
+        openapiSpec: spec,
         createSessionSchema,
         activeSessionPath,
         sessionStatusPath,
@@ -3213,10 +3806,12 @@ export class OpenCodeBridgeClient {
         questionReplyPaths: unique(questionReplyFound),
         questionReplySchemas,
         questionRejectPaths: unique(questionRejectFound),
+        questionRejectSchemas,
         formListPaths: unique(formListFound),
         formReplyPaths: unique(formReplyFound),
         formReplySchemas,
         formRejectPaths: unique(formRejectFound),
+        formRejectSchemas,
       };
       this.capabilitiesCache.set(cacheKey, this.capabilities);
       return this.capabilities;
@@ -3343,6 +3938,9 @@ export class OpenCodeBridgeClient {
 
           let addedAny = false;
           for (const q of list) {
+            if (this._isQuestionDismissed(q, sessionId)) {
+              continue;
+            }
             const itemStatus = String(q?.status || q?.state?.status || "").toLowerCase();
             if (
               itemStatus === "replied" ||
@@ -4178,12 +4776,14 @@ export class OpenCodeBridgeClient {
         reason: "interrupted",
         kanbanLabel: "Ejecución detenida",
         taskLabel: "Ejecución detenida",
+        persistDismiss: true,
       });
     } else {
       this._purgePendingQuestions({
         reason: "interrupted",
         kanbanLabel: "Ejecución detenida",
         taskLabel: "Ejecución detenida",
+        persistDismiss: true,
       });
     }
 
@@ -4418,12 +5018,18 @@ export class OpenCodeBridgeClient {
     const flatText = flatAnswers.join(", ");
     const answersObject = Object.fromEntries(
       (item.questions || []).map((q, idx) => [
-        q?.header || q?.question || `q_${idx + 1}`,
+        q?.id || q?.header || q?.question || `q_${idx + 1}`,
         (normalizedAnswers[idx] || []).join(", "),
       ]),
     );
 
-    const finalizeQuestionReply = (endpoint, { appendPromptLog = true } = {}) => {
+    const finalizeQuestionReply = (
+      endpoint,
+      { appendPromptLog = true, persistDismiss = false } = {},
+    ) => {
+      if (persistDismiss) {
+        this._markQuestionDismissed(item, [requestId, targetId]);
+      }
       this._removePendingQuestion(targetId);
       this._removePendingQuestion(requestId);
       if (item.sessionID) {
@@ -4479,14 +5085,18 @@ export class OpenCodeBridgeClient {
         (caps.formReplyPaths?.length || 0) > 0;
 
     // Si /openapi.json confirmó que el servidor NO expone endpoint reply de question ni form,
-    // cerrar el banner de inmediato y enviar la opción elegida como prompt de texto normal.
+    // cerrar el banner de inmediato, persistir el descarte y enviar la opción elegida como prompt.
     if (caps.discoveredFrom !== "defaults" && !hasRestReplyEndpoints) {
       if (reject) {
-        const dismissed = finalizeQuestionReply("local-omit", { appendPromptLog: false });
+        const dismissed = finalizeQuestionReply("local-omit", {
+          appendPromptLog: false,
+          persistDismiss: true,
+        });
         return { ...dismissed, viaLocalDismiss: true };
       }
       const instantDone = finalizeQuestionReply("session-prompt-fallback", {
         appendPromptLog: false,
+        persistDismiss: true,
       });
       const promptFallback = await this.sendPrompt({
         sessionId: item.sessionID || this.activeSessionId || null,
@@ -4546,15 +5156,31 @@ export class OpenCodeBridgeClient {
           if (template.includes("{sessionID}") && !item.sessionID) continue;
           const path = this._fillEndpointTemplate(template, {
             sessionID: item.sessionID || "",
-            requestID: effectiveId,
-            questionID: effectiveId,
-            formID: effectiveId,
+            requestID: item.requestID || effectiveId,
+            questionID: item.requestID || effectiveId,
+            formID: item.formID || effectiveId,
           });
+          const rejectSchemaInfo =
+            caps.questionRejectSchemas?.[template] ||
+            caps.formRejectSchemas?.[template] ||
+            null;
+          const rejectBodies = rejectSchemaInfo?.schema
+            ? this._buildReplyBodiesFromSchema(rejectSchemaInfo, {
+                effectiveId,
+                item,
+                normalizedAnswers,
+                flatAnswers,
+                flatText,
+                answersObject,
+                reject: true,
+              })
+            : [];
+          const bodyText = JSON.stringify(rejectBodies[0] || {});
           try {
             const resp = await fetch(`${baseUrl}${path}`, {
               method: "POST",
               headers,
-              body: JSON.stringify({}),
+              body: bodyText,
               signal: AbortSignal.timeout(5000),
             });
             if (resp.status === 404 || resp.status === 405) continue;
@@ -4565,7 +5191,10 @@ export class OpenCodeBridgeClient {
               );
               continue;
             }
-            return finalizeQuestionReply(path, { appendPromptLog: false });
+            return finalizeQuestionReply(path, {
+              appendPromptLog: false,
+              persistDismiss: true,
+            });
           } catch (err) {
             lastHttpError = err?.message || "No se pudo omitir la pregunta";
           }
@@ -4583,45 +5212,62 @@ export class OpenCodeBridgeClient {
         if (template.includes("{sessionID}") && !item.sessionID) continue;
         const path = this._fillEndpointTemplate(template, {
           sessionID: item.sessionID || "",
-          requestID: effectiveId,
-          questionID: effectiveId,
-          formID: effectiveId,
+          requestID: item.requestID || effectiveId,
+          questionID: item.requestID || effectiveId,
+          formID: item.formID || effectiveId,
         });
 
-        const schemaProps =
-          caps.questionReplySchemas?.[template]?.props ||
-          caps.formReplySchemas?.[template]?.props ||
-          [];
+        const schemaInfo =
+          caps.questionReplySchemas?.[template] ||
+          caps.formReplySchemas?.[template] ||
+          null;
+        const schemaProps = schemaInfo?.props || [];
         const isFormEndpoint = /\/form/i.test(template);
 
-        const bodyCandidates = reject
-          ? [{ reject: true }, { decision: "reject" }, { cancelled: true }, { answers: [] }]
-          : schemaProps.includes("answers")
-            ? [{ answers: normalizedAnswers }, { answers: flatAnswers }]
+        let bodyCandidates = [];
+        if (schemaInfo?.schema) {
+          bodyCandidates = this._buildReplyBodiesFromSchema(schemaInfo, {
+            effectiveId,
+            item,
+            normalizedAnswers,
+            flatAnswers,
+            flatText,
+            answersObject,
+            reject,
+          });
+          // En reject sobre /reply, si el esquema OpenAPI no declara cancel/reject, no spammear 400
+          if (reject && bodyCandidates.length === 0) {
+            continue;
+          }
+        }
+
+        if (bodyCandidates.length === 0 && !reject) {
+          bodyCandidates = schemaProps.includes("answers")
+            ? [{ answers: normalizedAnswers }, { answers: answersObject }, { answers: flatAnswers }]
             : schemaProps.includes("answer")
               ? [{ answer: flatText }, { answers: normalizedAnswers }]
               : schemaProps.includes("values")
-                ? [{ values: flatAnswers }, { values: answersObject }, { answers: normalizedAnswers }]
+                ? [{ values: answersObject }, { values: flatAnswers }, { answers: normalizedAnswers }]
                 : schemaProps.includes("data")
                   ? [{ data: answersObject }, { data: { answers: normalizedAnswers } }]
                   : schemaProps.includes("responses")
                     ? [{ responses: normalizedAnswers }, { responses: answersObject }]
                     : isFormEndpoint
                       ? [
-                          { answers: normalizedAnswers, formID: effectiveId },
-                          { values: answersObject, formID: effectiveId },
-                          { data: answersObject, formID: effectiveId },
+                          { answers: answersObject },
                           { answers: normalizedAnswers },
-                          { answer: flatText },
+                          { values: answersObject },
+                          { data: answersObject },
                         ]
                       : [
                           { answers: normalizedAnswers },
                           { answer: flatText },
                           { values: flatAnswers },
                           { data: answersObject },
-                          { reply: flatText },
-                          { text: flatText },
                         ];
+        } else if (bodyCandidates.length === 0 && reject && !schemaInfo?.schema) {
+          bodyCandidates = [{ reject: true }, { decision: "reject" }, { cancelled: true }];
+        }
 
         for (const payload of bodyCandidates) {
           try {
@@ -4650,7 +5296,10 @@ export class OpenCodeBridgeClient {
               break;
             }
 
-            return finalizeQuestionReply(path, { appendPromptLog: true });
+            return finalizeQuestionReply(path, {
+              appendPromptLog: true,
+              persistDismiss: true,
+            });
           } catch (err) {
             lastHttpError = err?.message || "No se pudo responder la pregunta";
             break;
@@ -4663,33 +5312,40 @@ export class OpenCodeBridgeClient {
     const firstAttempt = await sendWithId(targetId);
     if (firstAttempt) return firstAttempt;
 
-    // Si devolvió 404 por desfase de IDs, intentar sincronizar una vez más y reintentar
-    await this.syncPendingQuestions(item.sessionID, undefined, { force: true }).catch(() => []);
-    const retriedTarget = this._resolveQuestionTarget(requestId);
-    const retryMatch =
-      (retriedTarget.item && retriedTarget.targetId !== targetId && retriedTarget.item) ||
-      Array.from(this.pendingQuestions.values()).find(
-        (q) =>
-          !q.isSynthetic &&
-          q.id !== targetId &&
-          q.sessionID === item.sessionID &&
-          q.questions?.[0]?.question === item.questions?.[0]?.question,
-      );
-    if (retryMatch) {
-      targetId = retryMatch.id;
-      item = retryMatch;
-      const secondAttempt = await sendWithId(targetId);
-      if (secondAttempt) return secondAttempt;
+    // Si devolvió 404 por desfase de IDs (excepto en reject sin endpoint), intentar sincronizar una vez más
+    if (!reject || hasRestReplyEndpoints) {
+      await this.syncPendingQuestions(item.sessionID, undefined, { force: true }).catch(() => []);
+      const retriedTarget = this._resolveQuestionTarget(requestId);
+      const retryMatch =
+        (retriedTarget.item && retriedTarget.targetId !== targetId && retriedTarget.item) ||
+        Array.from(this.pendingQuestions.values()).find(
+          (q) =>
+            !q.isSynthetic &&
+            q.id !== targetId &&
+            q.sessionID === item.sessionID &&
+            q.questions?.[0]?.question === item.questions?.[0]?.question,
+        );
+      if (retryMatch) {
+        targetId = retryMatch.id;
+        item = retryMatch;
+        const secondAttempt = await sendWithId(targetId);
+        if (secondAttempt) return secondAttempt;
+      }
     }
 
-    // Respaldo final: cerrar el banner y enviar la respuesta elegida como prompt de texto normal
+    // Respaldo final: marcar descartada en localStorage (para que no reaparezca), cerrar el banner
+    // y enviar la respuesta elegida como prompt de texto normal.
     if (reject) {
-      const doneRes = finalizeQuestionReply("local-omit", { appendPromptLog: false });
+      const doneRes = finalizeQuestionReply("local-omit", {
+        appendPromptLog: false,
+        persistDismiss: true,
+      });
       return { ...doneRes, viaLocalDismiss: true };
     }
 
     const doneRes = finalizeQuestionReply("session-prompt-fallback", {
       appendPromptLog: false,
+      persistDismiss: true,
     });
     const promptFallback = await this.sendPrompt({
       sessionId: item.sessionID || this.activeSessionId || null,
