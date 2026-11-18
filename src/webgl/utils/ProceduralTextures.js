@@ -705,11 +705,12 @@ export function createLaptopProp(x, y, z, rotY = 0, isOpen = true) {
 /**
  * Lámpara articulada de escritorio estilo estudio nórdico con soporte para NightLightingRig
  */
-export function createDeskLamp(x, y, z, rotY = 0, nightRig = null) {
+export function createDeskLamp(x, y, z, rotY = 0, nightRig = null, scale = 1.0) {
   const pbr = getProceduralPBRTextures();
   const group = new THREE.Group();
   group.position.set(x, y, z);
   group.rotation.y = rotY;
+  if (scale !== 1.0) group.scale.setScalar(scale);
 
   const metalMat = new THREE.MeshStandardMaterial({
     color: "#22262E",

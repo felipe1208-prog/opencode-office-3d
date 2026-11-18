@@ -109,14 +109,20 @@ export class DevArea {
       createContactShadowDecal(centerX, centerZ, totalW + 0.55, totalD + 0.55, 0.0135),
     );
 
-    // Lámpara articulada nórdica centrada sobre el divisor de cada pod (1 por pod)
+    // Lámpara articulada nórdica en esquina trasera exterior libre del pod, orientada al centro de trabajo
+    const lampX =
+      podId === 2
+        ? centerX + totalW / 2 - 0.08
+        : centerX - totalW / 2 + 0.08;
+    const lampRotY = podId === 2 ? -2.72 : 2.72;
     podGroup.add(
       createDeskLamp(
-        centerX + (pairs === 2 ? 0.0 : -0.45),
+        lampX,
         tableH,
-        centerZ - 0.08,
-        0.25,
+        centerZ - 0.1,
+        lampRotY,
         this.experience?.nightRig,
+        0.85,
       ),
     );
 
@@ -217,6 +223,11 @@ export class DevArea {
         chairTone: NORDIC_PALETTE.chairsDev[(seatId + 1) % NORDIC_PALETTE.chairsDev.length],
       });
     });
+
+    // Portátil cerrado opcional en el hueco central despejado de los pods dobles
+    if (pairs === 2) {
+      this.group.add(createLaptopProp(centerX, 0.752, centerZ - 0.54, 0.18, false));
+    }
   }
 
   // --- POST-ITS / TARJETAS KANBAN EN EL FIELTRO CENTRAL ---
@@ -273,17 +284,17 @@ export class DevArea {
     if (isNorth) {
       // === PUESTO NORTE (Usuario en Z < centerZ, mira al SUR +Z) ===
 
-      // 1. Monitores duales cóncavos
+      // 1. Monitores duales cóncavos con holgura lateral limpia para lámpara en esquina
       const monL = this.place(
         "monitor",
-        { x: slotX - 0.28, y: 0.75, z: centerZ - 0.2 },
-        { height: 0.44 },
+        { x: slotX - 0.255, y: 0.75, z: centerZ - 0.22 },
+        { height: 0.4 },
         -0.26,
       );
       const monR = this.place(
         "monitor",
-        { x: slotX + 0.28, y: 0.75, z: centerZ - 0.2 },
-        { height: 0.44 },
+        { x: slotX + 0.255, y: 0.75, z: centerZ - 0.22 },
+        { height: 0.4 },
         0.26,
       );
       if (monitorSys && stationKey) {
@@ -294,7 +305,7 @@ export class DevArea {
       // 2. Teclado
       this.place(
         "keyboard",
-        { x: slotX, y: tableY, z: centerZ - 0.52 },
+        { x: slotX, y: tableY, z: centerZ - 0.54 },
         { width: 0.36 },
         0,
       );
@@ -302,7 +313,7 @@ export class DevArea {
       // 3. Mousepad y Ratón a la derecha del usuario (-X)
       const pad = this.place(
         "mousepad",
-        { x: slotX - 0.38, y: 0.751, z: centerZ - 0.52 },
+        { x: slotX - 0.38, y: 0.751, z: centerZ - 0.54 },
         { width: 0.2 },
         0,
       );
@@ -317,7 +328,7 @@ export class DevArea {
       }
       this.place(
         "mouse",
-        { x: slotX - 0.38, y: 0.753, z: centerZ - 0.52 },
+        { x: slotX - 0.38, y: 0.753, z: centerZ - 0.54 },
         { width: 0.08 },
         0,
       );
@@ -326,7 +337,7 @@ export class DevArea {
       if (stationIndex % 2 === 0) {
         const mug = this.place(
           "coffeeMug",
-          { x: slotX + 0.44, y: tableY, z: centerZ - 0.48 },
+          { x: slotX + 0.44, y: tableY, z: centerZ - 0.5 },
           { maxDim: 0.1 },
         );
         if (mug) {
@@ -344,7 +355,7 @@ export class DevArea {
         this.createThermalBottle(
           slotX + 0.44,
           tableY,
-          centerZ - 0.48,
+          centerZ - 0.5,
           stationIndex,
         );
       }
@@ -354,18 +365,18 @@ export class DevArea {
         this.createPostItPad(
           slotX + 0.26,
           tableY,
-          centerZ - 0.52,
+          centerZ - 0.54,
           stationIndex % 2 === 0 ? "#FEF08A" : "#BAE6FD",
         );
       }
 
       // 6. Accesorio derecho detrás del ratón: Auriculares o Moleskine
       if (stationIndex % 3 === 1) {
-        this.createHeadset(slotX - 0.55, tableY, centerZ - 0.38, 0.35);
+        this.createHeadset(slotX - 0.56, tableY, centerZ - 0.42, 0.35);
       } else if (stationIndex % 3 === 2) {
-        this.createNotebook(slotX - 0.55, tableY, centerZ - 0.38, -0.15, false);
+        this.createNotebook(slotX - 0.56, tableY, centerZ - 0.42, -0.15, false);
       } else {
-        this.createPencilCup(slotX + 0.56, tableY, centerZ - 0.36);
+        this.createPencilCup(slotX + 0.56, tableY, centerZ - 0.38);
       }
 
       // 7. Torre PC y canaleta pasacables vertical
@@ -389,23 +400,20 @@ export class DevArea {
           }
         });
       }
-      if (stationIndex % 5 === 0) {
-        this.group.add(createLaptopProp(slotX - 0.44, tableY, centerZ - 0.24, 0.35, false));
-      }
     } else {
       // === PUESTO SUR (Usuario en Z > centerZ, mira al NORTE -Z) ===
 
       // 1. Monitores duales cóncavos simétricos
       const monSL = this.place(
         "monitor",
-        { x: slotX - 0.28, y: 0.75, z: centerZ + 0.2 },
-        { height: 0.44 },
+        { x: slotX - 0.255, y: 0.75, z: centerZ + 0.22 },
+        { height: 0.4 },
         Math.PI + 0.26,
       );
       const monSR = this.place(
         "monitor",
-        { x: slotX + 0.28, y: 0.75, z: centerZ + 0.2 },
-        { height: 0.44 },
+        { x: slotX + 0.255, y: 0.75, z: centerZ + 0.22 },
+        { height: 0.4 },
         Math.PI - 0.26,
       );
       if (monitorSys && stationKey) {
@@ -416,7 +424,7 @@ export class DevArea {
       // 2. Teclado
       this.place(
         "keyboard",
-        { x: slotX, y: tableY, z: centerZ + 0.52 },
+        { x: slotX, y: tableY, z: centerZ + 0.54 },
         { width: 0.36 },
         Math.PI,
       );
@@ -424,7 +432,7 @@ export class DevArea {
       // 3. Mousepad y Ratón a la derecha del usuario (+X)
       const pad = this.place(
         "mousepad",
-        { x: slotX + 0.38, y: 0.751, z: centerZ + 0.52 },
+        { x: slotX + 0.38, y: 0.751, z: centerZ + 0.54 },
         { width: 0.2 },
         Math.PI,
       );
@@ -439,7 +447,7 @@ export class DevArea {
       }
       this.place(
         "mouse",
-        { x: slotX + 0.38, y: 0.753, z: centerZ + 0.52 },
+        { x: slotX + 0.38, y: 0.753, z: centerZ + 0.54 },
         { width: 0.08 },
         Math.PI,
       );
@@ -448,7 +456,7 @@ export class DevArea {
       if (stationIndex % 2 === 1) {
         const mug = this.place(
           "coffeeMug",
-          { x: slotX - 0.44, y: tableY, z: centerZ + 0.48 },
+          { x: slotX - 0.44, y: tableY, z: centerZ + 0.5 },
           { maxDim: 0.1 },
         );
         if (mug) {
@@ -466,7 +474,7 @@ export class DevArea {
         this.createThermalBottle(
           slotX - 0.44,
           tableY,
-          centerZ + 0.48,
+          centerZ + 0.5,
           stationIndex,
         );
       }
@@ -476,18 +484,18 @@ export class DevArea {
         this.createPostItPad(
           slotX - 0.26,
           tableY,
-          centerZ + 0.52,
+          centerZ + 0.54,
           stationIndex % 2 === 0 ? "#BAE6FD" : "#FEF08A",
         );
       }
 
       // 6. Accesorio derecho detrás del ratón: Auriculares o Moleskine
       if (stationIndex % 3 === 0) {
-        this.createHeadset(slotX + 0.55, tableY, centerZ + 0.38, -0.25);
+        this.createHeadset(slotX + 0.56, tableY, centerZ + 0.42, -0.25);
       } else if (stationIndex % 3 === 1) {
-        this.createNotebook(slotX + 0.55, tableY, centerZ + 0.38, 0.2, true);
+        this.createNotebook(slotX + 0.56, tableY, centerZ + 0.42, 0.2, true);
       } else {
-        this.createPencilCup(slotX - 0.56, tableY, centerZ + 0.36);
+        this.createPencilCup(slotX - 0.56, tableY, centerZ + 0.38);
       }
 
       // 7. Torre PC y canaleta pasacables vertical

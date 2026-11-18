@@ -14,20 +14,54 @@ import { disposeProceduralPBRTextures } from "./utils/ProceduralTextures.js";
 
 let instance = null;
 
-const DAY_BG = new THREE.Color("#F3EFE8");
-const DUSK_BG = new THREE.Color("#2C2436");
-const NIGHT_BG = new THREE.Color("#0D1424");
-const DAY_SUN = new THREE.Color("#FFF1D6");
-const DUSK_SUN = new THREE.Color("#FDBA74");
-const NIGHT_SUN = new THREE.Color("#93C5FD");
-const DAY_HEMI_SKY = new THREE.Color("#FFFBF4");
-const NIGHT_HEMI_SKY = new THREE.Color("#3D5378");
-const DAY_HEMI_GROUND = new THREE.Color("#AC7748");
-const NIGHT_HEMI_GROUND = new THREE.Color("#4A3420");
+const DUSK_FACTOR = 0.44;
+const NIGHT_FACTOR = 0.84;
+
+const DAY_BG = new THREE.Color("#EAE3D7");
+const DUSK_BG = new THREE.Color("#F2C99D");
+// Valores exactos de Noche (t = 0.84) conservados intactos
+const NIGHT_BG = new THREE.Color("#2C2436").lerp(
+  new THREE.Color("#0D1424"),
+  (NIGHT_FACTOR - 0.45) / 0.55,
+);
+const DEEP_NIGHT_BG = new THREE.Color("#0D1424");
+
+const DAY_SUN = new THREE.Color("#FFF9F0");
+const DUSK_SUN = new THREE.Color("#FBB04B");
+const NIGHT_SUN = new THREE.Color("#FDBA74").lerp(
+  new THREE.Color("#93C5FD"),
+  (NIGHT_FACTOR - 0.45) / 0.55,
+);
+const DEEP_NIGHT_SUN = new THREE.Color("#93C5FD");
+
+const DAY_AMBIENT = new THREE.Color("#FFF8EE");
+const DUSK_AMBIENT = new THREE.Color("#FFE4C4");
+const NIGHT_AMBIENT = new THREE.Color("#FFF8EE");
+
+const DAY_HEMI_SKY = new THREE.Color("#F4F7FC");
+const DUSK_HEMI_SKY = new THREE.Color("#FDE68A");
+const NIGHT_HEMI_SKY = new THREE.Color("#FFFBF4").lerp(
+  new THREE.Color("#3D5378"),
+  NIGHT_FACTOR,
+);
+
+const DAY_HEMI_GROUND = new THREE.Color("#8F5D34");
+const DUSK_HEMI_GROUND = new THREE.Color("#C87D4B");
+const NIGHT_HEMI_GROUND = new THREE.Color("#AC7748").lerp(
+  new THREE.Color("#4A3420"),
+  NIGHT_FACTOR,
+);
+
+const DAY_SUN_POS = new THREE.Vector3(-18, 25, -16);
+const DUSK_SUN_POS = new THREE.Vector3(-25, 11.2, -13);
+const NIGHT_SUN_POS = new THREE.Vector3(-18, 25, -16);
+
 const _bgColor = new THREE.Color();
 const _sunColor = new THREE.Color();
+const _ambientColor = new THREE.Color();
 const _hemiSky = new THREE.Color();
 const _hemiGround = new THREE.Color();
+const _sunPos = new THREE.Vector3();
 const _corner = new THREE.Vector3();
 
 const OFFICE_SHADOW_MIN = new THREE.Vector3(-12.4, -0.4, -9.6);
@@ -100,7 +134,7 @@ export class Experience {
 
     this.scene = new THREE.Scene();
     this.scene.background = DAY_BG.clone();
-    this.scene.fog = new THREE.FogExp2(DAY_BG.getHex(), 0.0082);
+    this.scene.fog = new THREE.FogExp2(DAY_BG.getHex(), 0.0068);
 
     this.sizes = new Sizes(this.canvas.parentElement);
     this.camera = new Camera(this);
@@ -116,6 +150,7 @@ export class Experience {
     this.isAutoCycle = false;
     this.autoClock = 0;
     this.lightingAppliedOnce = false;
+    this._lastShadowSunPos = DAY_SUN_POS.clone();
     this.isPageHidden = typeof document !== "undefined" ? Boolean(document.hidden) : false;
     this.isDestroyed = false;
 
@@ -312,45 +347,109 @@ export class Experience {
     }
 
     const t = this.dayNightCycle;
-    if (t <= 0.45) {
-      const k = t / 0.45;
+    let fogDensity;
+    let envIntensity;
+    let exposure;
+    let totalSunIntensity;
+    let hemiIntensity;
+    let ambientIntensity;
+
+    if (t <= DUSK_FACTOR) {
+      const k = t / DUSK_FACTOR;
       _bgColor.copy(DAY_BG).lerp(DUSK_BG, k);
       _sunColor.copy(DAY_SUN).lerp(DUSK_SUN, k);
-    } else {
-      const k = (t - 0.45) / 0.55;
+      _ambientColor.copy(DAY_AMBIENT).lerp(DUSK_AMBIENT, k);
+      _hemiSky.copy(DAY_HEMI_SKY).lerp(DUSK_HEMI_SKY, k);
+      _hemiGround.copy(DAY_HEMI_GROUND).lerp(DUSK_HEMI_GROUND, k);
+      _sunPos.copy(DAY_SUN_POS).lerp(DUSK_SUN_POS, k);
+
+      fogDensity = THREE.MathUtils.lerp(0.0068, 0.0078, k);
+      envIntensity = THREE.MathUtils.lerp(0.34, 0.42, k);
+      exposure = THREE.MathUtils.lerp(1.04, 1.05, k);
+      totalSunIntensity = THREE.MathUtils.lerp(2.28, 1.82, k);
+      hemiIntensity = THREE.MathUtils.lerp(0.36, 0.56, k);
+      ambientIntensity = THREE.MathUtils.lerp(0.24, 0.28, k);
+    } else if (t <= NIGHT_FACTOR) {
+      const k = (t - DUSK_FACTOR) / (NIGHT_FACTOR - DUSK_FACTOR);
       _bgColor.copy(DUSK_BG).lerp(NIGHT_BG, k);
       _sunColor.copy(DUSK_SUN).lerp(NIGHT_SUN, k);
+      _ambientColor.copy(DUSK_AMBIENT).lerp(NIGHT_AMBIENT, k);
+      _hemiSky.copy(DUSK_HEMI_SKY).lerp(NIGHT_HEMI_SKY, k);
+      _hemiGround.copy(DUSK_HEMI_GROUND).lerp(NIGHT_HEMI_GROUND, k);
+      _sunPos.copy(DUSK_SUN_POS).lerp(NIGHT_SUN_POS, k);
+
+      fogDensity = THREE.MathUtils.lerp(0.0078, 0.0124, k);
+      envIntensity = THREE.MathUtils.lerp(0.42, 0.3112, k);
+      exposure = THREE.MathUtils.lerp(1.05, 0.9628, k);
+      totalSunIntensity = THREE.MathUtils.lerp(1.82, 0.6664, k);
+      hemiIntensity = THREE.MathUtils.lerp(0.56, 0.3376, k);
+      ambientIntensity = THREE.MathUtils.lerp(0.28, 0.3104, k);
+    } else {
+      const k = (t - NIGHT_FACTOR) / (1.0 - NIGHT_FACTOR);
+      _bgColor.copy(NIGHT_BG).lerp(DEEP_NIGHT_BG, k);
+      _sunColor.copy(NIGHT_SUN).lerp(DEEP_NIGHT_SUN, k);
+      _ambientColor.copy(NIGHT_AMBIENT);
+      _hemiSky.copy(NIGHT_HEMI_SKY);
+      _hemiGround.copy(NIGHT_HEMI_GROUND);
+      _sunPos.copy(NIGHT_SUN_POS);
+
+      fogDensity = THREE.MathUtils.lerp(0.0124, 0.0132, k);
+      envIntensity = THREE.MathUtils.lerp(0.3112, 0.26, k);
+      exposure = THREE.MathUtils.lerp(0.9628, 0.95, k);
+      totalSunIntensity = THREE.MathUtils.lerp(0.6664, 0.46, k);
+      hemiIntensity = THREE.MathUtils.lerp(0.3376, 0.28, k);
+      ambientIntensity = THREE.MathUtils.lerp(0.3104, 0.24, k);
     }
 
     this.scene.background.copy(_bgColor);
     if (this.scene.fog) {
       this.scene.fog.color.copy(_bgColor);
       if (this.scene.fog.isFogExp2) {
-        this.scene.fog.density = THREE.MathUtils.lerp(0.0082, 0.0132, t);
+        this.scene.fog.density = fogDensity;
       }
     }
-    this.scene.environmentIntensity = THREE.MathUtils.lerp(0.58, 0.26, t);
+    this.scene.environmentIntensity = envIntensity;
     if (this.renderer?.instance) {
-      this.renderer.instance.toneMappingExposure = THREE.MathUtils.lerp(
-        1.03,
-        0.95,
-        t,
-      );
+      this.renderer.instance.toneMappingExposure = exposure;
     }
 
-    const totalSunIntensity = THREE.MathUtils.lerp(1.75, 0.46, t);
+    const sunMoved = !this.dynamicSunLight.position.equals(_sunPos);
     this.staticSunLight.color.copy(_sunColor);
     this.staticSunLight.intensity = totalSunIntensity * 0.65;
     this.dynamicSunLight.color.copy(_sunColor);
     this.dynamicSunLight.intensity = totalSunIntensity * 0.35;
 
-    _hemiSky.copy(DAY_HEMI_SKY).lerp(NIGHT_HEMI_SKY, t);
-    _hemiGround.copy(DAY_HEMI_GROUND).lerp(NIGHT_HEMI_GROUND, t);
+    if (sunMoved) {
+      this.staticSunLight.position.copy(_sunPos);
+      this.dynamicSunLight.position.copy(_sunPos);
+      fitDirectionalShadowFrustum(
+        this.dynamicSunLight,
+        OFFICE_SHADOW_MIN,
+        OFFICE_SHADOW_MAX,
+        0.7,
+      );
+      const settled = !this.isAutoCycle && Math.abs(t - this.targetDayNight) < 0.0005;
+      if (
+        settled ||
+        _sunPos.distanceToSquared(this._lastShadowSunPos) > 0.25
+      ) {
+        fitDirectionalShadowFrustum(
+          this.staticSunLight,
+          OFFICE_SHADOW_MIN,
+          OFFICE_SHADOW_MAX,
+          0.7,
+        );
+        this.staticSunLight.shadow.needsUpdate = true;
+        this._lastShadowSunPos.copy(_sunPos);
+      }
+    }
+
     this.hemiLight.color.copy(_hemiSky);
     this.hemiLight.groundColor.copy(_hemiGround);
-    this.hemiLight.intensity = THREE.MathUtils.lerp(0.64, 0.28, t);
+    this.hemiLight.intensity = hemiIntensity;
 
-    this.ambientLight.intensity = THREE.MathUtils.lerp(0.68, 0.24, t);
+    this.ambientLight.color.copy(_ambientColor);
+    this.ambientLight.intensity = ambientIntensity;
     this.world?.setDayNightFactor(t);
     this.lightingAppliedOnce = true;
   }
@@ -361,17 +460,17 @@ export class Experience {
     const roomEnv = new RoomEnvironment();
     this.envRenderTarget = pmremGenerator.fromScene(roomEnv, 0.04);
     this.scene.environment = this.envRenderTarget.texture;
-    this.scene.environmentIntensity = 0.58;
+    this.scene.environmentIntensity = 0.34;
     roomEnv.dispose();
     pmremGenerator.dispose();
   }
 
   initLighting() {
-    this.ambientLight = new THREE.AmbientLight("#FFF8EE", 0.68);
+    this.ambientLight = new THREE.AmbientLight("#FFF8EE", 0.24);
     this.scene.add(this.ambientLight);
 
-    // Luz hemisférica cálida/fría: cielo suave arriba + rebote cálido del roble abajo
-    this.hemiLight = new THREE.HemisphereLight("#FFFBF4", "#AC7748", 0.64);
+    // Luz hemisférica cálida/fría: cielo limpio arriba + rebote cálido del roble abajo
+    this.hemiLight = new THREE.HemisphereLight("#F4F7FC", "#8F5D34", 0.36);
     this.scene.add(this.hemiLight);
 
     const sunTarget = new THREE.Object3D();
@@ -379,7 +478,7 @@ export class Experience {
     this.scene.add(sunTarget);
 
     // 1. Sol estático cacheado (2048x2048, autoUpdate=false, capa STATIC_SHADOW_LAYER)
-    this.staticSunLight = new THREE.DirectionalLight("#FFEED4", 1.85 * 0.65);
+    this.staticSunLight = new THREE.DirectionalLight("#FFF9F0", 2.28 * 0.65);
     this.staticSunLight.position.set(-18, 25, -16);
     this.staticSunLight.target = sunTarget;
     this.staticSunLight.castShadow = true;
@@ -399,7 +498,7 @@ export class Experience {
     );
 
     // 2. Sol dinámico en tiempo real SOLO para avatares y props de mano (1024x1024, DYNAMIC_SHADOW_LAYER)
-    this.dynamicSunLight = new THREE.DirectionalLight("#FFEED4", 1.85 * 0.35);
+    this.dynamicSunLight = new THREE.DirectionalLight("#FFF9F0", 2.28 * 0.35);
     this.dynamicSunLight.position.set(-18, 25, -16);
     this.dynamicSunLight.target = sunTarget;
     this.dynamicSunLight.castShadow = true;

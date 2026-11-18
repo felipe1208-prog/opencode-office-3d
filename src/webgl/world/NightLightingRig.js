@@ -2,9 +2,20 @@ import * as THREE from "three";
 import { getProceduralPBRTextures } from "../utils/ProceduralTextures.js";
 
 const DAY_WINDOW_COLOR = new THREE.Color("#FFFFFF");
-const NIGHT_WINDOW_COLOR = new THREE.Color("#1E293B");
+const DUSK_WINDOW_COLOR = new THREE.Color("#FFE8CC");
+const NIGHT_WINDOW_COLOR = new THREE.Color("#FFFFFF").lerp(
+  new THREE.Color("#1E293B"),
+  0.84,
+);
+const DEEP_NIGHT_WINDOW_COLOR = new THREE.Color("#1E293B");
+
 const DAY_WINDOW_EMISSIVE = new THREE.Color("#FFF5E6");
-const NIGHT_WINDOW_EMISSIVE = new THREE.Color("#0F172A");
+const DUSK_WINDOW_EMISSIVE = new THREE.Color("#FDBA74");
+const NIGHT_WINDOW_EMISSIVE = new THREE.Color("#FFF5E6").lerp(
+  new THREE.Color("#0F172A"),
+  0.84,
+);
+const DEEP_NIGHT_WINDOW_EMISSIVE = new THREE.Color("#0F172A");
 
 const _winColor = new THREE.Color();
 const _winEmissive = new THREE.Color();
@@ -57,7 +68,7 @@ export class NightLightingRig {
       },
       {
         name: "dev-pod1-lamp-light",
-        pos: [-9.6, 1.45, 5.2],
+        pos: [-10.6, 1.38, 4.9],
         color: "#FBBF24",
         maxIntensity: 2.1,
         distance: 5.5,
@@ -65,7 +76,7 @@ export class NightLightingRig {
       },
       {
         name: "dev-pod2-lamp-light",
-        pos: [-6.0, 1.45, 5.2],
+        pos: [-4.95, 1.38, 4.9],
         color: "#FCD34D",
         maxIntensity: 2.1,
         distance: 5.5,
@@ -73,7 +84,7 @@ export class NightLightingRig {
       },
       {
         name: "dev-pod3-lamp-light",
-        pos: [-7.8, 1.45, 1.0],
+        pos: [-8.15, 1.38, 0.72],
         color: "#FBBF24",
         maxIntensity: 1.8,
         distance: 4.8,
@@ -81,7 +92,7 @@ export class NightLightingRig {
       },
       {
         name: "supervisor-desk-light",
-        pos: [-8.95, 1.35, -5.25],
+        pos: [-8.9, 1.35, -5.25],
         color: "#FBBF24",
         maxIntensity: 2.3,
         distance: 6.2,
@@ -132,10 +143,10 @@ export class NightLightingRig {
       { pos: [11.25, 0.02, 5.8], scale: 1.7, maxOpacity: 0.28 },
       { pos: [11.45, 0.02, -6.4], scale: 1.5, maxOpacity: 0.26 },
       { pos: [-1.35, 0.91, 5.85], scale: 1.4, maxOpacity: 0.28 },
-      { pos: [-9.6, 0.76, 5.2], scale: 1.35, maxOpacity: 0.28 },
-      { pos: [-6.0, 0.76, 5.2], scale: 1.35, maxOpacity: 0.28 },
-      { pos: [-7.8, 0.76, 1.0], scale: 1.2, maxOpacity: 0.26 },
-      { pos: [-8.95, 0.76, -5.25], scale: 1.2, maxOpacity: 0.32 },
+      { pos: [-10.78, 0.758, 4.96], scale: 1.15, maxOpacity: 0.28 },
+      { pos: [-4.82, 0.758, 4.96], scale: 1.15, maxOpacity: 0.28 },
+      { pos: [-8.28, 0.758, 0.76], scale: 1.05, maxOpacity: 0.26 },
+      { pos: [-9.02, 0.758, -5.24], scale: 1.15, maxOpacity: 0.32 },
     ];
 
     const geo = new THREE.PlaneGeometry(1, 1);
@@ -218,17 +229,32 @@ export class NightLightingRig {
     }
 
     if (this.windowGlassMat) {
-      _winColor.copy(DAY_WINDOW_COLOR).lerp(NIGHT_WINDOW_COLOR, dayNightCycle);
-      _winEmissive
-        .copy(DAY_WINDOW_EMISSIVE)
-        .lerp(NIGHT_WINDOW_EMISSIVE, dayNightCycle);
+      if (dayNightCycle <= 0.44) {
+        const k = dayNightCycle / 0.44;
+        _winColor.copy(DAY_WINDOW_COLOR).lerp(DUSK_WINDOW_COLOR, k);
+        _winEmissive.copy(DAY_WINDOW_EMISSIVE).lerp(DUSK_WINDOW_EMISSIVE, k);
+        this.windowGlassMat.emissiveIntensity = THREE.MathUtils.lerp(0.42, 0.48, k);
+      } else if (dayNightCycle <= 0.84) {
+        const k = (dayNightCycle - 0.44) / 0.4;
+        _winColor.copy(DUSK_WINDOW_COLOR).lerp(NIGHT_WINDOW_COLOR, k);
+        _winEmissive.copy(DUSK_WINDOW_EMISSIVE).lerp(NIGHT_WINDOW_EMISSIVE, k);
+        this.windowGlassMat.emissiveIntensity = THREE.MathUtils.lerp(
+          0.48,
+          THREE.MathUtils.lerp(0.42, 0.09, 0.84),
+          k,
+        );
+      } else {
+        const k = (dayNightCycle - 0.84) / 0.16;
+        _winColor.copy(NIGHT_WINDOW_COLOR).lerp(DEEP_NIGHT_WINDOW_COLOR, k);
+        _winEmissive.copy(NIGHT_WINDOW_EMISSIVE).lerp(DEEP_NIGHT_WINDOW_EMISSIVE, k);
+        this.windowGlassMat.emissiveIntensity = THREE.MathUtils.lerp(
+          THREE.MathUtils.lerp(0.42, 0.09, 0.84),
+          0.09,
+          k,
+        );
+      }
       this.windowGlassMat.color.copy(_winColor);
       this.windowGlassMat.emissive.copy(_winEmissive);
-      this.windowGlassMat.emissiveIntensity = THREE.MathUtils.lerp(
-        0.42,
-        0.09,
-        dayNightCycle,
-      );
     }
   }
 

@@ -322,13 +322,13 @@ export class SupervisorOffice {
       new THREE.CylinderGeometry(0.035, 0.035, 0.08, 16),
       cupMat,
     );
-    penCup.position.set(-7.58, 0.79, -5.45);
+    penCup.position.set(-7.68, 0.79, -5.45);
     penCup.castShadow = true;
     this.group.add(penCup);
 
-    // Lámpara articulada nórdica con halo nocturno ámbar
+    // Lámpara articulada nórdica en esquina trasera exterior libre, orientada al área de trabajo
     this.group.add(
-      createDeskLamp(-8.96, 0.752, -5.25, 0.45, this.experience?.nightRig),
+      createDeskLamp(-9.11, 0.752, -5.12, 2.82, this.experience?.nightRig, 0.9),
     );
     // Portátil secundario cerrado junto al borde izquierdo del escritorio
     this.group.add(createLaptopProp(-8.88, 0.752, -5.84, 0.22, false));
