@@ -1,5 +1,11 @@
 import * as THREE from "three";
 import { fitModel } from "../utils/modelUtils.js";
+import {
+  createContactShadowDecal,
+  createZoneSignPlaque,
+  getProceduralPBRTextures,
+  NORDIC_PALETTE,
+} from "../utils/ProceduralTextures.js";
 
 export class CoffeeArea {
   constructor(experience) {
@@ -15,6 +21,8 @@ export class CoffeeArea {
 
     this.group = new THREE.Group();
     this.group.name = "zone-coffee-kitchen";
+    this.pbr = getProceduralPBRTextures();
+    this._mugIdx = 0;
 
     // 1. Frente de Cocina y Encimera (Z: 4.45 a Z: 6.95)
     this.initMainCounter();
@@ -59,6 +67,26 @@ export class CoffeeArea {
     return fitted;
   }
 
+  placeMug(pos, maxDim = 0.1) {
+    const mug = this.place("coffeeMug", pos, { maxDim });
+    if (mug) {
+      const tint =
+        NORDIC_PALETTE.mugs[this._mugIdx++ % NORDIC_PALETTE.mugs.length];
+      mug.traverse((child) => {
+        if (child.isMesh && child.material) {
+          const mat = child.material.clone();
+          if (!mat.map) {
+            mat.color = new THREE.Color(tint);
+          }
+          mat.roughnessMap = mat.roughnessMap || this.pbr.matteMicroRoughnessMap;
+          mat.roughness = Math.max(mat.roughness ?? 0.4, 0.42);
+          child.material = mat;
+        }
+      });
+    }
+    return mug;
+  }
+
   // --- 1. MUEBLE DE COCINA Y GRIFO CORREGIDO ---
   initMainCounter() {
     const counterGroup = new THREE.Group();
@@ -70,11 +98,15 @@ export class CoffeeArea {
     const centerX = wallFaceX + cWidth / 2; // -1.535
     const centerZ = 5.7;
 
-    // Base de armarios en nogal oscuro
+    // Base de armarios en roble nórdico cálido satinado
     const woodMat = new THREE.MeshStandardMaterial({
-      color: "#342217",
-      roughness: 0.45,
-      metalness: 0.04,
+      color: "#8E623B",
+      map: this.pbr.deskWoodColorMap,
+      roughnessMap: this.pbr.deskWoodRoughnessMap,
+      bumpMap: this.pbr.deskWoodBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.72,
+      metalness: 0.03,
     });
     const baseCabinet = new THREE.Mesh(
       new THREE.BoxGeometry(cWidth - 0.04, cHeight - 0.04, cLength),
@@ -87,8 +119,8 @@ export class CoffeeArea {
 
     // Rodapié rehundido
     const toeMat = new THREE.MeshStandardMaterial({
-      color: "#14161C",
-      roughness: 0.6,
+      color: "#1B1F27",
+      roughness: 0.65,
     });
     const toekick = new THREE.Mesh(
       new THREE.BoxGeometry(0.06, 0.08, cLength - 0.06),
@@ -97,11 +129,14 @@ export class CoffeeArea {
     toekick.position.set(centerX + cWidth / 2 - 0.05, 0.04, centerZ);
     counterGroup.add(toekick);
 
-    // Encimera continua de cuarzo blanco satinado
+    // Encimera continua de cuarzo cálido mate/satinado
     const topMat = new THREE.MeshStandardMaterial({
-      color: "#F8FAFC",
-      roughness: 0.22,
-      metalness: 0.05,
+      color: "#F3EFE8",
+      roughnessMap: this.pbr.matteMicroRoughnessMap,
+      bumpMap: this.pbr.matteMicroBumpMap,
+      bumpScale: 0.004,
+      roughness: 0.42,
+      metalness: 0.03,
     });
     const counterTop = new THREE.Mesh(
       new THREE.BoxGeometry(cWidth, 0.04, cLength),
@@ -112,10 +147,13 @@ export class CoffeeArea {
     counterTop.receiveShadow = true;
     counterGroup.add(counterTop);
 
-    // Fregadero de acero inoxidable encastrado (Z = 4.95)
+    // Fregadero de acero inoxidable cepillado (Z = 4.95)
     const sinkMat = new THREE.MeshStandardMaterial({
       color: "#CBD5E1",
-      roughness: 0.28,
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      bumpMap: this.pbr.brushedMetalBumpMap,
+      bumpScale: 0.003,
+      roughness: 0.3,
       metalness: 0.85,
     });
     const sinkBasin = new THREE.Mesh(
@@ -128,8 +166,9 @@ export class CoffeeArea {
     // Grifo monomando de cuello de cisne elegante (curvado hacia el interior del seno en +X)
     const tapMat = new THREE.MeshStandardMaterial({
       color: "#E2E8F0",
-      roughness: 0.15,
-      metalness: 0.95,
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      roughness: 0.22,
+      metalness: 0.92,
     });
 
     const faucetX = centerX - 0.15;
@@ -180,6 +219,9 @@ export class CoffeeArea {
     leverHandle.castShadow = true;
 
     counterGroup.add(baseRing, faucetMesh, aerator, leverBase, leverHandle);
+    counterGroup.add(
+      createContactShadowDecal(centerX, centerZ, cWidth + 0.28, cLength + 0.22, 0.0135),
+    );
     this.group.add(counterGroup);
   }
 
@@ -224,17 +266,9 @@ export class CoffeeArea {
       this.createProceduralEspressoBar(cX, tableY, 6.45);
     }
 
-    // Tazas de café sobre la encimera
-    this.place(
-      "coffeeMug",
-      { x: cX + 0.12, y: tableY, z: 5.42 },
-      { maxDim: 0.1 },
-    );
-    this.place(
-      "coffeeMug",
-      { x: cX + 0.1, y: tableY, z: 6.1 },
-      { maxDim: 0.1 },
-    );
+    // Tazas de café con variación tonal nórdica sobre la encimera
+    this.placeMug({ x: cX + 0.12, y: tableY, z: 5.42 }, 0.1);
+    this.placeMug({ x: cX + 0.1, y: tableY, z: 6.1 }, 0.1);
 
     // Botellas de sirope gourmet
     const syrupColors = ["#B45309", "#78350F", "#D97706"];
@@ -306,8 +340,11 @@ export class CoffeeArea {
       fridgeGroup.position.set(fridgeX, 0.0, fridgeZ);
 
       const steelMat = new THREE.MeshStandardMaterial({
-        color: "#282C35",
-        roughness: 0.35,
+        color: "#2B313B",
+        roughnessMap: this.pbr.brushedMetalRoughnessMap,
+        bumpMap: this.pbr.brushedMetalBumpMap,
+        bumpScale: 0.003,
+        roughness: 0.36,
         metalness: 0.8,
       });
       const chromeMat = new THREE.MeshStandardMaterial({
@@ -356,15 +393,30 @@ export class CoffeeArea {
       fridgeGroup.add(doorTop, doorBottom, handleTop, handleBottom);
       this.group.add(fridgeGroup);
     }
+
+    this.group.add(
+      createContactShadowDecal(fridgeX, fridgeZ, 0.86, 0.9, 0.0135),
+    );
   }
 
   // --- 4. ESTANTES FLOTANTES EN PARED ---
   initFloatingShelves() {
     const wallX = -1.86;
     const shelfMat = new THREE.MeshStandardMaterial({
-      color: "#442817",
-      roughness: 0.42,
+      color: "#9B6E46",
+      map: this.pbr.deskWoodColorMap,
+      roughnessMap: this.pbr.deskWoodRoughnessMap,
+      bumpMap: this.pbr.deskWoodBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.72,
+      metalness: 0.03,
     });
+
+    // Placa arquitectónica minimalista sobre la barra de café
+    const sign = createZoneSignPlaque("CAFÉ & KITCHEN", "ESPRESSO BAR", 0.92, 0.2);
+    sign.position.set(wallX + 0.015, 2.15, 5.7);
+    sign.rotation.y = Math.PI / 2;
+    this.group.add(sign);
 
     const sLength = 2.1;
     const sDepth = 0.22;
@@ -425,10 +477,9 @@ export class CoffeeArea {
           jarGroup.add(jar, lid, beans);
           this.group.add(jarGroup);
         } else {
-          this.place(
-            "coffeeMug",
+          this.placeMug(
             { x: sX, y: yPos + sThick / 2 + 0.002, z: itemZ },
-            { maxDim: 0.09 },
+            0.09,
           );
         }
       }
@@ -521,6 +572,11 @@ export class CoffeeArea {
       fallbackTrash.castShadow = true;
       this.group.add(fallbackTrash);
     }
+
+    this.group.add(
+      createContactShadowDecal(-1.55, 4.0, 0.56, 0.56, 0.0135),
+      createContactShadowDecal(-1.55, 3.45, 0.52, 0.52, 0.0135),
+    );
   }
 
   // --- 6. BARRA DE CAFETERÍA ---
@@ -534,8 +590,13 @@ export class CoffeeArea {
     const barZ = 6.0;
 
     const woodMat = new THREE.MeshStandardMaterial({
-      color: "#2C1B12",
-      roughness: 0.45,
+      color: "#8A5E37",
+      map: this.pbr.deskWoodColorMap,
+      roughnessMap: this.pbr.deskWoodRoughnessMap,
+      bumpMap: this.pbr.deskWoodBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.72,
+      metalness: 0.03,
     });
     const baseMesh = new THREE.Mesh(
       new THREE.BoxGeometry(barW - 0.15, barH - 0.05, barL),
@@ -547,9 +608,12 @@ export class CoffeeArea {
     barGroup.add(baseMesh);
 
     const topMat = new THREE.MeshStandardMaterial({
-      color: "#FFFFFF",
-      roughness: 0.2,
-      metalness: 0.05,
+      color: "#F5F1EA",
+      roughnessMap: this.pbr.matteMicroRoughnessMap,
+      bumpMap: this.pbr.matteMicroBumpMap,
+      bumpScale: 0.004,
+      roughness: 0.36,
+      metalness: 0.03,
     });
     const barTop = new THREE.Mesh(
       new THREE.BoxGeometry(barW, 0.05, barL),
@@ -560,6 +624,9 @@ export class CoffeeArea {
     barTop.receiveShadow = true;
     barGroup.add(barTop);
 
+    barGroup.add(
+      createContactShadowDecal(barX - 0.05, barZ, barW + 0.36, barL + 0.34, 0.0135),
+    );
     this.group.add(barGroup);
 
     this.place("waterGlass", { x: barX, y: barH, z: 5.4 }, { maxDim: 0.1 });
@@ -595,15 +662,20 @@ export class CoffeeArea {
     const seatH = 0.75;
 
     const legMat = new THREE.MeshStandardMaterial({
-      color: "#14161C",
-      roughness: 0.4,
-      metalness: 0.85,
+      color: "#22262E",
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      roughness: 0.42,
+      metalness: 0.82,
     });
     const legGeo = new THREE.CylinderGeometry(0.014, 0.016, seatH, 8);
     const ringGeo = new THREE.TorusGeometry(0.16, 0.01, 8, 16);
     const seatMat = new THREE.MeshStandardMaterial({
-      color: "#6A3D1E",
-      roughness: 0.45,
+      color: "#9B6E46",
+      map: this.pbr.deskWoodColorMap,
+      roughnessMap: this.pbr.deskWoodRoughnessMap,
+      bumpMap: this.pbr.deskWoodBumpMap,
+      bumpScale: 0.006,
+      roughness: 0.72,
     });
     const seatGeo = new THREE.CylinderGeometry(0.18, 0.17, 0.045, 24);
 
@@ -637,6 +709,7 @@ export class CoffeeArea {
       stoolGroup.add(seat);
 
       this.group.add(stoolGroup);
+      this.group.add(createContactShadowDecal(stoolX, zPos, 0.52, 0.52, 0.0135));
     });
   }
 
@@ -647,6 +720,10 @@ export class CoffeeArea {
       "plantFlowerPot",
       { x: -1.86, y: 0.0, z: 3.1 },
       { height: 0.95 },
+    );
+    this.group.add(
+      createContactShadowDecal(0.4, 7.75, 0.72, 0.72, 0.0135),
+      createContactShadowDecal(-1.86, 3.1, 0.56, 0.56, 0.0135),
     );
   }
 

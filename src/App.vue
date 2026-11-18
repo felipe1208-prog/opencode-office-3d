@@ -10,6 +10,7 @@ import {
 } from "vue";
 import {
   Sun,
+  Sunset,
   Moon,
   RefreshCw,
   Play,
@@ -1195,6 +1196,19 @@ onBeforeUnmount(() => {
         >
           <Sun class="w-3.5 h-3.5" />
           <span>Día</span>
+        </button>
+        <button
+          type="button"
+          @click="setLightingMode('dusk')"
+          :class="[
+            'px-2 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap',
+            timeMode === 'dusk'
+              ? 'bg-[#2A201E] text-[#FB923C]'
+              : 'text-[#9CA3AF] hover:bg-[#1F232D] hover:text-[#E5E7EB]',
+          ]"
+        >
+          <Sunset class="w-3.5 h-3.5" />
+          <span>Tarde</span>
         </button>
         <button
           type="button"

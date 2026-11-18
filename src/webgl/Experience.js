@@ -10,15 +10,24 @@ import {
   DYNAMIC_SHADOW_LAYER,
   STATIC_SHADOW_LAYER,
 } from "./utils/SceneOptimizer.js";
+import { disposeProceduralPBRTextures } from "./utils/ProceduralTextures.js";
 
 let instance = null;
 
-const DAY_BG = new THREE.Color("#F7F5F2");
-const NIGHT_BG = new THREE.Color("#0F172A");
-const DAY_SUN = new THREE.Color("#FFEED4");
+const DAY_BG = new THREE.Color("#F3EFE8");
+const DUSK_BG = new THREE.Color("#2C2436");
+const NIGHT_BG = new THREE.Color("#0D1424");
+const DAY_SUN = new THREE.Color("#FFF1D6");
+const DUSK_SUN = new THREE.Color("#FDBA74");
 const NIGHT_SUN = new THREE.Color("#93C5FD");
+const DAY_HEMI_SKY = new THREE.Color("#FFFBF4");
+const NIGHT_HEMI_SKY = new THREE.Color("#3D5378");
+const DAY_HEMI_GROUND = new THREE.Color("#AC7748");
+const NIGHT_HEMI_GROUND = new THREE.Color("#4A3420");
 const _bgColor = new THREE.Color();
 const _sunColor = new THREE.Color();
+const _hemiSky = new THREE.Color();
+const _hemiGround = new THREE.Color();
 const _corner = new THREE.Vector3();
 
 const OFFICE_SHADOW_MIN = new THREE.Vector3(-12.4, -0.4, -9.6);
@@ -91,7 +100,7 @@ export class Experience {
 
     this.scene = new THREE.Scene();
     this.scene.background = DAY_BG.clone();
-    this.scene.fog = new THREE.Fog(DAY_BG.clone(), 34, 82);
+    this.scene.fog = new THREE.FogExp2(DAY_BG.getHex(), 0.0082);
 
     this.sizes = new Sizes(this.canvas.parentElement);
     this.camera = new Camera(this);
@@ -131,7 +140,8 @@ export class Experience {
       OFFICE_EVENTS.OFFICE_LIGHTING,
       ({ mode }) => {
         if (mode === "day") this.setDayNightFactor(0.0, false);
-        else if (mode === "night") this.setDayNightFactor(0.82, false);
+        else if (mode === "dusk") this.setDayNightFactor(0.44, false);
+        else if (mode === "night") this.setDayNightFactor(0.84, false);
         else if (mode === "auto") this.setDayNightFactor(0.0, true);
       },
     );
@@ -302,29 +312,45 @@ export class Experience {
     }
 
     const t = this.dayNightCycle;
-    _bgColor.copy(DAY_BG).lerp(NIGHT_BG, t);
+    if (t <= 0.45) {
+      const k = t / 0.45;
+      _bgColor.copy(DAY_BG).lerp(DUSK_BG, k);
+      _sunColor.copy(DAY_SUN).lerp(DUSK_SUN, k);
+    } else {
+      const k = (t - 0.45) / 0.55;
+      _bgColor.copy(DUSK_BG).lerp(NIGHT_BG, k);
+      _sunColor.copy(DUSK_SUN).lerp(NIGHT_SUN, k);
+    }
+
     this.scene.background.copy(_bgColor);
     if (this.scene.fog) {
       this.scene.fog.color.copy(_bgColor);
+      if (this.scene.fog.isFogExp2) {
+        this.scene.fog.density = THREE.MathUtils.lerp(0.0082, 0.0132, t);
+      }
     }
-    this.scene.environmentIntensity = THREE.MathUtils.lerp(0.62, 0.28, t);
+    this.scene.environmentIntensity = THREE.MathUtils.lerp(0.58, 0.26, t);
     if (this.renderer?.instance) {
       this.renderer.instance.toneMappingExposure = THREE.MathUtils.lerp(
-        1.04,
-        0.94,
+        1.03,
+        0.95,
         t,
       );
     }
 
-    _sunColor.copy(DAY_SUN).lerp(NIGHT_SUN, t);
-    const totalSunIntensity = THREE.MathUtils.lerp(1.85, 0.52, t);
+    const totalSunIntensity = THREE.MathUtils.lerp(1.75, 0.46, t);
     this.staticSunLight.color.copy(_sunColor);
     this.staticSunLight.intensity = totalSunIntensity * 0.65;
     this.dynamicSunLight.color.copy(_sunColor);
     this.dynamicSunLight.intensity = totalSunIntensity * 0.35;
 
-    this.ambientLight.intensity = THREE.MathUtils.lerp(0.95, 0.28, t);
-    this.hemiLight.intensity = THREE.MathUtils.lerp(0.55, 0.2, t);
+    _hemiSky.copy(DAY_HEMI_SKY).lerp(NIGHT_HEMI_SKY, t);
+    _hemiGround.copy(DAY_HEMI_GROUND).lerp(NIGHT_HEMI_GROUND, t);
+    this.hemiLight.color.copy(_hemiSky);
+    this.hemiLight.groundColor.copy(_hemiGround);
+    this.hemiLight.intensity = THREE.MathUtils.lerp(0.64, 0.28, t);
+
+    this.ambientLight.intensity = THREE.MathUtils.lerp(0.68, 0.24, t);
     this.world?.setDayNightFactor(t);
     this.lightingAppliedOnce = true;
   }
@@ -335,16 +361,17 @@ export class Experience {
     const roomEnv = new RoomEnvironment();
     this.envRenderTarget = pmremGenerator.fromScene(roomEnv, 0.04);
     this.scene.environment = this.envRenderTarget.texture;
-    this.scene.environmentIntensity = 0.62;
+    this.scene.environmentIntensity = 0.58;
     roomEnv.dispose();
     pmremGenerator.dispose();
   }
 
   initLighting() {
-    this.ambientLight = new THREE.AmbientLight("#FFF7EB", 0.95);
+    this.ambientLight = new THREE.AmbientLight("#FFF8EE", 0.68);
     this.scene.add(this.ambientLight);
 
-    this.hemiLight = new THREE.HemisphereLight("#FFFDF9", "#7A4B24", 0.55);
+    // Luz hemisférica cálida/fría: cielo suave arriba + rebote cálido del roble abajo
+    this.hemiLight = new THREE.HemisphereLight("#FFFBF4", "#AC7748", 0.64);
     this.scene.add(this.hemiLight);
 
     const sunTarget = new THREE.Object3D();
@@ -427,6 +454,7 @@ export class Experience {
     this.unsubLightingBus?.();
     this.raycaster?.destroy();
     this.world?.destroy();
+    disposeProceduralPBRTextures();
     this.envRenderTarget?.dispose();
     this.sizes.destroy();
     this.camera.destroy();

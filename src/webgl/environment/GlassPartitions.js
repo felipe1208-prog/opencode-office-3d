@@ -1,6 +1,11 @@
 import * as THREE from "three";
 import { DIORAMA_CONFIG } from "../../config/officeLayout.js";
 import { mergeStaticGroupByMaterial } from "../utils/SceneOptimizer.js";
+import {
+  createContactShadowDecal,
+  createZoneSignPlaque,
+  getProceduralPBRTextures,
+} from "../utils/ProceduralTextures.js";
 
 export class GlassPartitions {
   constructor(scene, resources) {
@@ -22,37 +27,64 @@ export class GlassPartitions {
   }
 
   initMaterials() {
-    // Acero negro industrial carbón mate (#12141A)
+    const pbr = getProceduralPBRTextures();
+
+    // Perfilería metálica cepillada en grafito arquitectónico
     this.frameMat = new THREE.MeshStandardMaterial({
-      color: "#12141A",
-      roughness: 0.35,
-      metalness: 0.82,
+      color: "#1E232B",
+      roughnessMap: pbr.brushedMetalRoughnessMap,
+      bumpMap: pbr.brushedMetalBumpMap,
+      bumpScale: 0.004,
+      roughness: 0.42,
+      metalness: 0.84,
+      envMapIntensity: 1.15,
     });
 
-    // Vidrio arquitectónico de alta reflectividad sin pase de refracción/transmission extra
+    // Junquillo interior satinado contrastado para borde biselado visual
+    this.trimMat = new THREE.MeshStandardMaterial({
+      color: "#525B69",
+      roughness: 0.34,
+      metalness: 0.88,
+      envMapIntensity: 1.25,
+    });
+
+    // Vidrio arquitectónico ligero (transmission: 0) con clearcoat nítido y reflejos ambientales
     this.glassMat = new THREE.MeshPhysicalMaterial({
-      color: "#E8F3FA",
+      color: "#E4F0F6",
       transparent: true,
-      opacity: 0.28,
+      opacity: 0.22,
       transmission: 0,
-      roughness: 0.05,
+      roughness: 0.035,
       metalness: 0.08,
       clearcoat: 1.0,
-      clearcoatRoughness: 0.04,
-      reflectivity: 0.9,
-      envMapIntensity: 1.25,
+      clearcoatRoughness: 0.03,
+      reflectivity: 0.94,
+      envMapIntensity: 1.4,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+
+    // Banda arquitectónica esmerilada sutil a media altura
+    this.frostedBandMat = new THREE.MeshBasicMaterial({
+      map: pbr.frostedBandTexture,
+      transparent: true,
+      opacity: 0.55,
       depthWrite: false,
       side: THREE.DoubleSide,
     });
 
     this.planterMat = new THREE.MeshStandardMaterial({
-      color: "#FFFFFF",
-      roughness: 0.4,
+      color: "#EAE4DA",
+      roughnessMap: pbr.matteMicroRoughnessMap,
+      bumpMap: pbr.matteMicroBumpMap,
+      bumpScale: 0.006,
+      roughness: 0.82,
+      metalness: 0.02,
     });
 
     this.foliageMat = new THREE.MeshStandardMaterial({
-      color: "#28622A",
-      roughness: 0.75,
+      color: "#3F6B46",
+      roughness: 0.78,
     });
   }
 
@@ -73,8 +105,16 @@ export class GlassPartitions {
     glass.position.y = height / 2;
     panel.add(glass);
 
-    // Perfiles estructurales gruesos de 12cm
-    const frameW = 0.11;
+    // Banda esmerilada de privacidad acústica
+    const frosted = new THREE.Mesh(
+      new THREE.PlaneGeometry(Math.max(0.2, len - 0.12), 0.34),
+      this.frostedBandMat,
+    );
+    frosted.position.set(0, 1.24, 0.002);
+    panel.add(frosted);
+
+    // Perfiles estructurales cepillados + junquillos biselados de contraste
+    const frameW = 0.1;
     const bottom = new THREE.Mesh(
       new THREE.BoxGeometry(len, frameW, frameW),
       this.frameMat,
@@ -86,7 +126,20 @@ export class GlassPartitions {
       this.frameMat,
     );
     top.position.y = height - frameW / 2;
-    panel.add(bottom, top);
+
+    const topTrim = new THREE.Mesh(
+      new THREE.BoxGeometry(len, 0.018, frameW + 0.016),
+      this.trimMat,
+    );
+    topTrim.position.y = height - frameW - 0.005;
+
+    const bottomTrim = new THREE.Mesh(
+      new THREE.BoxGeometry(len, 0.018, frameW + 0.016),
+      this.trimMat,
+    );
+    bottomTrim.position.y = frameW + 0.005;
+
+    panel.add(bottom, top, topTrim, bottomTrim);
 
     // Montantes verticales
     for (let i = 0; i <= cols; i++) {
@@ -96,15 +149,22 @@ export class GlassPartitions {
         this.frameMat,
       );
       post.position.set(px, height / 2, 0);
-      panel.add(post);
+
+      const postTrim = new THREE.Mesh(
+        new THREE.BoxGeometry(0.022, height - frameW * 2, frameW + 0.014),
+        this.trimMat,
+      );
+      postTrim.position.set(px, height / 2, 0);
+
+      panel.add(post, postTrim);
     }
 
     return panel;
   }
 
-  createFramedPortal(doorX, z, doorWidth = 1.45, height = 3.2) {
+  createFramedPortal(doorX, z, doorWidth = 1.45, height = 3.2, label = "") {
     const portalGroup = new THREE.Group();
-    const frameW = 0.11;
+    const frameW = 0.1;
     const doorHeight = 2.35;
 
     // Jambas izquierda y derecha
@@ -120,12 +180,18 @@ export class GlassPartitions {
     );
     jambR.position.set(doorX + doorWidth / 2, height / 2, z);
 
-    // Dintel intermedio de la puerta
+    // Dintel intermedio de la puerta con remate cepillado
     const lintel = new THREE.Mesh(
       new THREE.BoxGeometry(doorWidth, frameW, frameW),
       this.frameMat,
     );
     lintel.position.set(doorX, doorHeight, z);
+
+    const lintelTrim = new THREE.Mesh(
+      new THREE.BoxGeometry(doorWidth, 0.02, frameW + 0.018),
+      this.trimMat,
+    );
+    lintelTrim.position.set(doorX, doorHeight - frameW / 2, z);
 
     // Viga superior del techo
     const header = new THREE.Mesh(
@@ -141,7 +207,14 @@ export class GlassPartitions {
     );
     glassTop.position.set(doorX, doorHeight + (height - doorHeight) / 2, z);
 
-    portalGroup.add(jambL, jambR, lintel, header, glassTop);
+    portalGroup.add(jambL, jambR, lintel, lintelTrim, header, glassTop);
+
+    if (label) {
+      const sign = createZoneSignPlaque(label, "", 0.84, 0.18);
+      sign.position.set(doorX, doorHeight + 0.01, z + 0.06);
+      portalGroup.add(sign);
+    }
+
     return portalGroup;
   }
 
@@ -152,7 +225,7 @@ export class GlassPartitions {
     const doorW = s.doorGap.end - s.doorGap.start;
 
     // Fachada Frontal (Sur) continua
-    this.group.add(this.createFramedPortal(doorX, s.maxZ, doorW, H));
+    this.group.add(this.createFramedPortal(doorX, s.maxZ, doorW, H, "DIRECCIÓN"));
 
     const pLeft1 = new THREE.Vector3(s.minX, 0, s.maxZ);
     const pLeft2 = new THREE.Vector3(s.doorGap.start, 0, s.maxZ);
@@ -175,7 +248,9 @@ export class GlassPartitions {
     const doorW = m.doorGap.end - m.doorGap.start;
 
     // Fachada Frontal (Sur) alineada exactamente a Z = -2.8
-    this.group.add(this.createFramedPortal(doorX, m.maxZ, doorW, H));
+    this.group.add(
+      this.createFramedPortal(doorX, m.maxZ, doorW, H, "SALA DE REUNIONES"),
+    );
 
     const pLeft1 = new THREE.Vector3(m.minX, 0, m.maxZ);
     const pLeft2 = new THREE.Vector3(m.doorGap.start, 0, m.maxZ);
@@ -193,15 +268,6 @@ export class GlassPartitions {
     const pEast1 = new THREE.Vector3(m.maxX, 0, -8.5);
     const pEast2 = new THREE.Vector3(m.maxX, 0, m.maxZ);
     this.group.add(this.createGlassSpan(pEast1, pEast2, H, 2));
-
-    // // Pizarra de conferencias empotrada
-    // const rawWhiteboard = this.resources.get("whiteboard");
-    // if (rawWhiteboard) {
-    //   const wb = rawWhiteboard.clone(true);
-    //   const fitted = fitModel(wb, { height: 1.45 });
-    //   fitted.position.set(2.4, 1.95, -9.05);
-    //   this.group.add(fitted);
-    // }
   }
 
   buildPlanterBoxes() {
@@ -212,16 +278,20 @@ export class GlassPartitions {
       );
       box.position.set(x, 0.16, z);
       box.castShadow = true;
+      box.receiveShadow = true;
 
       const leaves = new THREE.Mesh(
         new THREE.BoxGeometry(w - 0.1, 0.24, d - 0.1),
         this.foliageMat,
       );
       leaves.position.set(x, 0.34, z);
-      this.group.add(box, leaves);
+      leaves.castShadow = true;
+
+      const ao = createContactShadowDecal(x, z, w + 0.34, d + 0.34, 0.008);
+      this.group.add(box, leaves, ao);
     };
 
-    // Jardineras decorativas a los pies de la fachada de reuniones
+    // Jardineras decorativas de cerámica mate a los pies de la fachada de reuniones
     addPlanter(4.35, -5.5, 0.45, 2.0);
     addPlanter(4.35, -3.4, 0.45, 1.6);
   }

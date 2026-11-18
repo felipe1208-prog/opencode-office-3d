@@ -1,6 +1,14 @@
 import * as THREE from "three";
 import { fitModel } from "../utils/modelUtils.js";
 import { configureTexture } from "../utils/SceneOptimizer.js";
+import {
+  createContactShadowDecal,
+  createDeskLamp,
+  createLaptopProp,
+  createMinimalWallArt,
+  getProceduralPBRTextures,
+  NORDIC_PALETTE,
+} from "../utils/ProceduralTextures.js";
 
 export class SupervisorOffice {
   constructor(experience) {
@@ -17,6 +25,7 @@ export class SupervisorOffice {
     this.group = new THREE.Group();
     this.group.name = "zone-supervisor";
     this._unitBoxGeo = new THREE.BoxGeometry(1, 1, 1);
+    this.pbr = getProceduralPBRTextures();
 
     // 1. Mobiliario e infraestructura existente (Intacto)
     this.initExecutiveDesk();
@@ -72,17 +81,23 @@ export class SupervisorOffice {
             name.includes("frame") ||
             name.includes("metal")
           ) {
-            child.material.color.set("#1E2129");
-            child.material.roughness = 0.4;
-            child.material.metalness = 0.8;
-          } else {
-            child.material.color.set("#4A2E1B");
+            child.material.color.set("#21252D");
+            child.material.roughnessMap = this.pbr.brushedMetalRoughnessMap;
             child.material.roughness = 0.42;
-            child.material.metalness = 0.04;
+            child.material.metalness = 0.82;
+          } else {
+            child.material.color.set("#946640"); // Roble nórdico cálido
+            child.material.map = this.pbr.deskWoodColorMap;
+            child.material.roughnessMap = this.pbr.deskWoodRoughnessMap;
+            child.material.bumpMap = this.pbr.deskWoodBumpMap;
+            child.material.bumpScale = 0.008;
+            child.material.roughness = 0.72;
+            child.material.metalness = 0.03;
           }
         }
       });
     }
+    this.group.add(createContactShadowDecal(-8.4, -5.6, 2.35, 1.35, 0.008));
 
     // Monitores 10% más grandes con curvatura y materiales originales
     const monL = this.place(
@@ -192,13 +207,19 @@ export class SupervisorOffice {
         cabinet.traverse((child) => {
           if (child.isMesh && child.material) {
             child.material = child.material.clone();
-            child.material.color.set("#4E301D");
-            child.material.roughness = 0.45;
-            child.material.metalness = 0.04;
+            child.material.color.set("#8C603B");
+            child.material.map = this.pbr.deskWoodColorMap;
+            child.material.roughnessMap = this.pbr.deskWoodRoughnessMap;
+            child.material.bumpMap = this.pbr.deskWoodBumpMap;
+            child.material.bumpScale = 0.007;
+            child.material.roughness = 0.72;
+            child.material.metalness = 0.03;
           }
         });
       }
     });
+    this.group.add(createContactShadowDecal(-5.5, -8.0, 1.4, 0.72, 0.008));
+    this.group.add(createContactShadowDecal(-11.4, -6.0, 0.72, 1.45, 0.008));
   }
 
   initPlants() {
@@ -207,24 +228,19 @@ export class SupervisorOffice {
       { x: -11.2, y: 0, z: -3.8 },
       { height: 1.45 },
     );
+    this.group.add(createContactShadowDecal(-11.2, -3.8, 0.9, 0.9, 0.008));
+
     this.place("plantFlowerPot", { x: -11.2, y: 0, z: -7.8 }, { height: 0.95 });
+    this.group.add(createContactShadowDecal(-11.2, -7.8, 0.8, 0.8, 0.008));
   }
 
-  // --- LIBROS: SOLO DENTRO DE LAS BALDAS (SIN PILAS ENCIMA) ---
+  // --- LIBROS CON VARIACIÓN TONAL CONTROLADA POR INSTANCING ---
   createBookRow(startX, y, startZ, totalWidth, depth, rotY = 0) {
     const rowGroup = new THREE.Group();
     rowGroup.position.set(startX, y, startZ);
     rowGroup.rotation.y = rotY;
 
-    const bookColors = [
-      "#7F1D1D",
-      "#1E3A8A",
-      "#14532D",
-      "#78350F",
-      "#1F2937",
-      "#B45309",
-      "#312E81",
-    ];
+    const bookColors = NORDIC_PALETTE.books;
     let curX = -totalWidth / 2 + 0.04;
     let idx = 0;
 
@@ -235,14 +251,16 @@ export class SupervisorOffice {
 
       const mat = new THREE.MeshStandardMaterial({
         color: bookColors[idx % bookColors.length],
-        roughness: 0.55,
-        metalness: 0.05,
+        roughnessMap: this.pbr.matteMicroRoughnessMap,
+        roughness: 0.74,
+        metalness: 0.02,
       });
 
       const book = new THREE.Mesh(this._unitBoxGeo, mat);
       book.scale.set(bookW, bookH, bookD);
       book.position.set(curX + bookW / 2, bookH / 2, 0);
       book.castShadow = true;
+      book.userData.sharedGeometry = true;
 
       if (curX > totalWidth / 2 - 0.12 && idx % 2 === 0) {
         book.rotation.z = -0.16;
@@ -308,26 +326,18 @@ export class SupervisorOffice {
     penCup.castShadow = true;
     this.group.add(penCup);
 
-    const frameMat = new THREE.MeshStandardMaterial({
-      color: "#3E2415",
-      roughness: 0.5,
-    });
-    const canvasMat = new THREE.MeshStandardMaterial({
-      color: "#1E293B",
-      emissive: new THREE.Color("#0369A1"),
-      emissiveIntensity: 0.2,
-    });
-    const frame = new THREE.Mesh(
-      new THREE.BoxGeometry(0.04, 0.95, 1.4),
-      frameMat,
+    // Lámpara articulada nórdica con halo nocturno ámbar
+    this.group.add(
+      createDeskLamp(-8.96, 0.752, -5.25, 0.45, this.experience?.nightRig),
     );
-    frame.position.set(-11.96, 2.35, -5.8);
-    const art = new THREE.Mesh(
-      new THREE.BoxGeometry(0.05, 0.85, 1.3),
-      canvasMat,
-    );
-    art.position.set(-11.96, 2.35, -5.8);
-    this.group.add(frame, art);
+    // Portátil secundario cerrado junto al borde izquierdo del escritorio
+    this.group.add(createLaptopProp(-8.88, 0.752, -5.84, 0.22, false));
+
+    // Cuadro geométrico nórdico minimalista en muro Oeste
+    const art = createMinimalWallArt(0, 1.38, 0.92);
+    art.rotation.y = Math.PI / 2;
+    art.position.set(-11.8, 2.35, -5.8);
+    this.group.add(art);
   }
 
   // --- TV Y PANTALLA CCTV (ENCAPSULADAS CON PRECISIÓN) ---

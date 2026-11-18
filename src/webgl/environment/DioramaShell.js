@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { DIORAMA_CONFIG } from "../../config/officeLayout.js";
 import { mergeStaticGroupByMaterial } from "../utils/SceneOptimizer.js";
+import { getProceduralPBRTextures } from "../utils/ProceduralTextures.js";
 
 export class DioramaShell {
   constructor(scene) {
@@ -18,27 +19,37 @@ export class DioramaShell {
   }
 
   initMaterials() {
+    const pbr = getProceduralPBRTextures();
     this.wallMat = new THREE.MeshStandardMaterial({
-      color: "#F5ECE2", // Crema marfil cálido de estudio
-      roughness: 0.88,
-      metalness: 0.02,
+      color: "#F2EAE0", // Estuco cálido nórdico
+      roughnessMap: pbr.stuccoRoughnessMap,
+      bumpMap: pbr.stuccoBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.94,
+      metalness: 0.01,
+      envMapIntensity: 0.65,
     });
 
     this.capMat = new THREE.MeshStandardMaterial({
-      color: "#FCF9F5",
-      roughness: 0.55,
+      color: "#F8F4ED",
+      roughnessMap: pbr.matteMicroRoughnessMap,
+      roughness: 0.68,
     });
 
     this.woodFrameMat = new THREE.MeshStandardMaterial({
-      color: "#523018", // Madera nogal cálida para marcos y zócalos
-      roughness: 0.55,
-      metalness: 0.05,
+      color: "#704B2E", // Roble tostado cálido para marcos y zócalos
+      map: pbr.deskWoodColorMap,
+      roughnessMap: pbr.deskWoodRoughnessMap,
+      bumpMap: pbr.deskWoodBumpMap,
+      bumpScale: 0.006,
+      roughness: 0.6,
+      metalness: 0.03,
     });
 
     this.windowGlassMat = new THREE.MeshStandardMaterial({
       color: "#FFFFFF",
       emissive: new THREE.Color("#FFF5E6"),
-      emissiveIntensity: 0.45,
+      emissiveIntensity: 0.42,
       roughness: 0.08,
     });
   }

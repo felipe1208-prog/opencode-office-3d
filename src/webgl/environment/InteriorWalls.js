@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { DIORAMA_CONFIG } from "../../config/officeLayout.js";
 import { mergeStaticGroupByMaterial } from "../utils/SceneOptimizer.js";
+import { getProceduralPBRTextures } from "../utils/ProceduralTextures.js";
 
 export class InteriorWalls {
   constructor(scene) {
@@ -18,15 +19,25 @@ export class InteriorWalls {
   }
 
   initMaterials() {
+    const pbr = getProceduralPBRTextures();
     this.wallMat = new THREE.MeshStandardMaterial({
-      color: "#F5ECE2", // Blanco arena cálido
-      roughness: 0.86,
-      metalness: 0.02,
+      color: "#F2EAE0", // Estuco lino nórdico cálido
+      roughnessMap: pbr.stuccoRoughnessMap,
+      bumpMap: pbr.stuccoBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.94,
+      metalness: 0.01,
+      envMapIntensity: 0.65,
     });
 
     this.baseboardMat = new THREE.MeshStandardMaterial({
-      color: "#523018",
+      color: "#7A5233",
+      map: pbr.deskWoodColorMap,
+      roughnessMap: pbr.deskWoodRoughnessMap,
+      bumpMap: pbr.deskWoodBumpMap,
+      bumpScale: 0.006,
       roughness: 0.65,
+      metalness: 0.02,
     });
   }
 

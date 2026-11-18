@@ -1,6 +1,13 @@
 import * as THREE from "three";
 import { fitModel } from "../utils/modelUtils.js";
 import { configureTexture } from "../utils/SceneOptimizer.js";
+import {
+  createContactShadowDecal,
+  createLaptopProp,
+  createMinimalWallArt,
+  createZoneSignPlaque,
+  getProceduralPBRTextures,
+} from "../utils/ProceduralTextures.js";
 
 export class LoungeArea {
   constructor(experience) {
@@ -16,6 +23,7 @@ export class LoungeArea {
 
     this.group = new THREE.Group();
     this.group.name = "zone-lounge-tv";
+    this.pbr = getProceduralPBRTextures();
 
     // Generadores de Texturas Procedurales
     this.textures = this.initProceduralTextures();
@@ -27,7 +35,7 @@ export class LoungeArea {
     this.initInnerRug();
     this.initLivingRoomSeating();
 
-    // 3. Mesa de Centro de nogal texturizado con revistas y bebidas
+    // 3. Mesa de Centro de roble nórdico con revistas, portátil y bebidas
     this.initCentralCoffeeTable();
 
     // 4. Mesas Auxiliares, iluminación ambiental de lino y puffs
@@ -44,58 +52,9 @@ export class LoungeArea {
 
   // --- GENERACIÓN DE TEXTURAS PROCEDURALES CANVAS 2D ---
   initProceduralTextures() {
-    // 1. Veta de Madera de Nogal Oscuro (Walnut Grain)
-    const woodCanvas = document.createElement("canvas");
-    woodCanvas.width = 512;
-    woodCanvas.height = 512;
-    const wCtx = woodCanvas.getContext("2d");
-    wCtx.fillStyle = "#2B180E";
-    wCtx.fillRect(0, 0, 512, 512);
-
-    for (let y = 0; y < 512; y++) {
-      const n = Math.sin(y * 0.06) * 12 + Math.cos(y * 0.02) * 20;
-      const alpha = 0.04 + Math.sin(y * 0.2 + n * 0.1) * 0.03;
-      wCtx.fillStyle = `rgba(18, 9, 4, ${Math.max(0, alpha)})`;
-      wCtx.fillRect(0, y, 512, 1);
-
-      if (y % 8 === 0) {
-        wCtx.fillStyle = `rgba(88, 48, 26, 0.06)`;
-        wCtx.fillRect(0, y + (Math.random() - 0.5) * 3, 512, 2);
-      }
-    }
-    const woodTex = configureTexture(new THREE.CanvasTexture(woodCanvas), {
-      isColor: true,
-      mipmaps: true,
-      anisotropy: 4,
-      wrapS: THREE.RepeatWrapping,
-      wrapT: THREE.RepeatWrapping,
-    });
-
-    // 2. Tejido Textil de Alfombra / Tapicería (Fabric Weave)
-    const rugCanvas = document.createElement("canvas");
-    rugCanvas.width = 256;
-    rugCanvas.height = 256;
-    const rCtx = rugCanvas.getContext("2d");
-    rCtx.fillStyle = "#18202C";
-    rCtx.fillRect(0, 0, 256, 256);
-
-    for (let x = 0; x < 256; x += 4) {
-      for (let y = 0; y < 256; y += 4) {
-        const isWeave = (x + y) % 8 === 0;
-        rCtx.fillStyle = isWeave
-          ? "rgba(40, 56, 76, 0.28)"
-          : "rgba(10, 15, 22, 0.28)";
-        rCtx.fillRect(x, y, 3, 3);
-      }
-    }
-    const rugTex = configureTexture(new THREE.CanvasTexture(rugCanvas), {
-      isColor: true,
-      mipmaps: true,
-      anisotropy: 4,
-      wrapS: THREE.RepeatWrapping,
-      wrapT: THREE.RepeatWrapping,
-    });
-    rugTex.repeat.set(8, 6);
+    // Reutilizamos las texturas PO2 cacheadas del registro compartido para madera y textil
+    const woodTex = this.pbr.deskWoodColorMap;
+    const rugTex = this.pbr.carpetColorMap;
 
     // 3. Malla Acústica de Altavoces (Speaker Grille Micro-Mesh)
     const spkCanvas = document.createElement("canvas");
@@ -271,20 +230,25 @@ export class LoungeArea {
       tvGroup.add(tvFrame, screen);
     }
 
-    // Mueble bajo credenza multimedia en nogal texturizado
+    // Mueble bajo credenza multimedia en roble nórdico cálido
     const benchW = 2.2,
       benchH = 0.44,
       benchD = 0.44,
       benchZ = 0.64;
     const woodMat = new THREE.MeshStandardMaterial({
-      map: this.textures.woodTex,
-      roughness: 0.38,
-      metalness: 0.04,
+      color: "#946840",
+      map: this.pbr.deskWoodColorMap,
+      roughnessMap: this.pbr.deskWoodRoughnessMap,
+      bumpMap: this.pbr.deskWoodBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.72,
+      metalness: 0.03,
     });
     const metalMat = new THREE.MeshStandardMaterial({
-      color: "#11141B",
-      roughness: 0.35,
-      metalness: 0.85,
+      color: "#1E222A",
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      roughness: 0.38,
+      metalness: 0.84,
     });
 
     const benchTop = new THREE.Mesh(
@@ -365,18 +329,42 @@ export class LoungeArea {
       tvGroup.add(spBody, grille);
     });
 
+    // Cuadros nórdicos minimalistas flanqueando el televisor y placa de zona
+    const artLeft = createMinimalWallArt(0, 0.82, 0.62);
+    artLeft.position.set(centerX - 1.48, 1.72, wallFaceZ + 0.018);
+    const artRight = createMinimalWallArt(1, 0.82, 0.62);
+    artRight.position.set(centerX + 1.48, 1.72, wallFaceZ + 0.018);
+    const loungeSign = createZoneSignPlaque("LOUNGE & MEDIA", "CHILL ZONE", 0.9, 0.19);
+    loungeSign.position.set(centerX, 2.24, wallFaceZ + 0.015);
+    tvGroup.add(artLeft, artRight, loungeSign);
+
+    tvGroup.add(
+      createContactShadowDecal(centerX, benchZ, benchW + 0.32, benchD + 0.28, 0.0135),
+      createContactShadowDecal(centerX - benchW / 2 - 0.32, benchZ, 0.46, 0.48, 0.0135),
+      createContactShadowDecal(centerX + benchW / 2 + 0.32, benchZ, 0.46, 0.48, 0.0135),
+    );
+
     this.group.add(tvGroup);
 
-    // Plantas Sansevieria con hojas rayadas texturizadas
+    // Plantas Sansevieria con hojas rayadas texturizadas y Contact AO
     this.createTexturedSnakePlant(centerX - benchW / 2 - 0.75, benchZ);
     this.createTexturedSnakePlant(centerX + benchW / 2 + 0.75, benchZ);
+    this.group.add(
+      createContactShadowDecal(centerX - benchW / 2 - 0.75, benchZ, 0.56, 0.56, 0.0135),
+      createContactShadowDecal(centerX + benchW / 2 + 0.75, benchZ, 0.56, 0.56, 0.0135),
+    );
   }
 
   // --- 2. ALFOMBRA INTERIOR TEXTIL ---
   initInnerRug() {
     const rugMat = new THREE.MeshStandardMaterial({
-      map: this.textures.rugTex,
-      roughness: 0.85,
+      color: "#2C394B",
+      map: this.pbr.carpetColorMap,
+      roughnessMap: this.pbr.carpetRoughnessMap,
+      bumpMap: this.pbr.carpetBumpMap,
+      bumpScale: 0.012,
+      roughness: 0.92,
+      metalness: 0.02,
     });
     const rug = new THREE.Mesh(new THREE.PlaneGeometry(3.6, 2.7), rugMat);
     rug.rotation.x = -Math.PI / 2;
@@ -453,12 +441,22 @@ export class LoungeArea {
       );
     if (!chairSE) this.createProceduralSofa(10.15, 4.95, -Math.PI / 2, 0.88);
 
-    // Puffs otomanos contemporáneos en esquinas libres
-    this.createBeanBagPuff(6.65, 2.45, "#D97706");
-    this.createBeanBagPuff(9.35, 5.75, "#1E3A8A");
+    // Puffs otomanos contemporáneos en tonos nórdicos curados
+    this.createBeanBagPuff(6.65, 2.45, "#C97A57");
+    this.createBeanBagPuff(9.35, 5.75, "#3E566E");
+
+    // Sombras de contacto AO bajo sofás, butacas y puffs
+    this.group.add(
+      createContactShadowDecal(8.0, 5.75, 2.35, 1.05, 0.0135),
+      createContactShadowDecal(5.85, 4.15, 1.05, 1.88, 0.0135),
+      createContactShadowDecal(10.15, 3.35, 1.05, 1.05, 0.0135),
+      createContactShadowDecal(10.15, 4.95, 1.05, 1.05, 0.0135),
+      createContactShadowDecal(6.65, 2.45, 0.84, 0.84, 0.0145),
+      createContactShadowDecal(9.35, 5.75, 0.84, 0.84, 0.0145),
+    );
   }
 
-  // --- 3. MESA DE CENTRO DE NOGAL TEXTURIZADO (ÚNICA Y CENTRADA) ---
+  // --- 3. MESA DE CENTRO DE ROBLE NÓRDICO (ÚNICA Y CENTRADA) ---
   initCentralCoffeeTable() {
     const ctGroup = new THREE.Group();
     const ctX = 8.0,
@@ -469,9 +467,13 @@ export class LoungeArea {
     ctGroup.position.set(ctX, 0, ctZ);
 
     const topMat = new THREE.MeshStandardMaterial({
-      map: this.textures.woodTex,
-      roughness: 0.38,
-      metalness: 0.04,
+      color: "#9B6E46",
+      map: this.pbr.deskWoodColorMap,
+      roughnessMap: this.pbr.deskWoodRoughnessMap,
+      bumpMap: this.pbr.deskWoodBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.72,
+      metalness: 0.03,
     });
     const tableTop = new THREE.Mesh(
       new THREE.BoxGeometry(ctW, 0.035, ctD),
@@ -483,9 +485,10 @@ export class LoungeArea {
     ctGroup.add(tableTop);
 
     const legMat = new THREE.MeshStandardMaterial({
-      color: "#13151B",
-      roughness: 0.35,
-      metalness: 0.85,
+      color: "#1E222A",
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      roughness: 0.38,
+      metalness: 0.84,
     });
     [-ctW / 2 + 0.06, ctW / 2 - 0.06].forEach((lx) => {
       [-ctD / 2 + 0.06, ctD / 2 - 0.06].forEach((lz) => {
@@ -557,18 +560,30 @@ export class LoungeArea {
     mag.rotation.z = -0.25;
     mag.position.set(ctX + 0.3, ctH + 0.018, ctZ + 0.1);
     this.group.add(mag);
+
+    // Portátil minimalista cerrado y Contact AO sobre la alfombra interior
+    this.group.add(
+      createLaptopProp(ctX - 0.02, ctH, ctZ - 0.14, 0.18, false),
+      createContactShadowDecal(ctX, ctZ, ctW + 0.32, ctD + 0.28, 0.0155),
+    );
   }
 
   // --- 4. MESAS AUXILIARES E ILUMINACIÓN ---
   initSideTablesAndLighting() {
     const woodMat = new THREE.MeshStandardMaterial({
-      map: this.textures.woodTex,
-      roughness: 0.38,
+      color: "#946840",
+      map: this.pbr.deskWoodColorMap,
+      roughnessMap: this.pbr.deskWoodRoughnessMap,
+      bumpMap: this.pbr.deskWoodBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.72,
+      metalness: 0.03,
     });
     const metalMat = new THREE.MeshStandardMaterial({
-      color: "#13151B",
-      roughness: 0.35,
-      metalness: 0.85,
+      color: "#1E222A",
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      roughness: 0.38,
+      metalness: 0.84,
     });
 
     // 1. Mesa Auxiliar Cuadrada en la esquina Suroeste (X = 5.85, Z = 5.75)
@@ -670,7 +685,12 @@ export class LoungeArea {
     aShade.userData.noBatch = true;
     aShade.userData.keepMaterialInstance = true;
     arcLamp.add(aBase, aPole, aShade);
-    this.group.add(arcLamp);
+    this.group.add(
+      arcLamp,
+      createContactShadowDecal(5.85, 5.75, 0.72, 0.72, 0.0135),
+      createContactShadowDecal(10.15, 4.15, 0.56, 0.56, 0.0135),
+      createContactShadowDecal(11.25, 5.8, 0.56, 0.56, 0.0135),
+    );
   }
 
   // --- 5. MURO ESTE: APARADOR BAJO EN VENTANAL (X = 11.20) ---
@@ -691,8 +711,12 @@ export class LoungeArea {
       const frame = new THREE.Mesh(
         new THREE.BoxGeometry(1.3, 0.95, 0.4),
         new THREE.MeshStandardMaterial({
-          map: this.textures.woodTex,
-          roughness: 0.4,
+          color: "#8E623B",
+          map: this.pbr.deskWoodColorMap,
+          roughnessMap: this.pbr.deskWoodRoughnessMap,
+          bumpMap: this.pbr.deskWoodBumpMap,
+          bumpScale: 0.008,
+          roughness: 0.72,
         }),
       );
       frame.position.y = 0.475;
@@ -700,7 +724,7 @@ export class LoungeArea {
       cabGroup.add(frame);
 
       const darkMat = new THREE.MeshStandardMaterial({
-        color: "#140D07",
+        color: "#22262E",
         roughness: 0.8,
       });
       [-0.42, 0, 0.42].forEach((cx) => {
@@ -722,6 +746,10 @@ export class LoungeArea {
       { height: 0.45 },
     );
     this.place("trashcan", { x: 4.8, y: 0.0, z: 1.2 }, { height: 0.4 });
+    this.group.add(
+      createContactShadowDecal(wallX, 2.2, 0.68, 1.5, 0.0135),
+      createContactShadowDecal(4.8, 1.2, 0.48, 0.48, 0.0135),
+    );
   }
 
   // --- 6. VEGETACIÓN PERIMETRAL ---
@@ -732,6 +760,10 @@ export class LoungeArea {
       { height: 1.65 },
     );
     this.place("plantFlowerPot", { x: 5.0, y: 0.0, z: 7.1 }, { height: 1.1 });
+    this.group.add(
+      createContactShadowDecal(11.35, 7.1, 0.74, 0.74, 0.0135),
+      createContactShadowDecal(5.0, 7.1, 0.62, 0.62, 0.0135),
+    );
   }
 
   // --- HELPERS PROCEDIMENTALES CON TEXTURA ---
@@ -776,8 +808,11 @@ export class LoungeArea {
       new THREE.SphereGeometry(0.34, 16, 16),
       new THREE.MeshStandardMaterial({
         color: colorHex,
-        map: this.textures.rugTex,
-        roughness: 0.85,
+        map: this.pbr.carpetColorMap,
+        roughnessMap: this.pbr.carpetRoughnessMap,
+        bumpMap: this.pbr.carpetBumpMap,
+        bumpScale: 0.01,
+        roughness: 0.88,
       }),
     );
     puff.scale.set(1.2, 0.65, 1.2);
@@ -792,10 +827,13 @@ export class LoungeArea {
     sofaGroup.rotation.y = rotY;
 
     const fabricMat = new THREE.MeshStandardMaterial({
-      color: "#1E293B",
-      map: this.textures.rugTex,
-      roughness: 0.75,
-      metalness: 0.05,
+      color: "#2C3542",
+      map: this.pbr.carpetColorMap,
+      roughnessMap: this.pbr.carpetRoughnessMap,
+      bumpMap: this.pbr.carpetBumpMap,
+      bumpScale: 0.01,
+      roughness: 0.82,
+      metalness: 0.04,
     });
     const depth = 0.82;
 

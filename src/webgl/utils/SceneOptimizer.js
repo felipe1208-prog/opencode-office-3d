@@ -70,8 +70,18 @@ export class MaterialPool {
       flatShading: Boolean(opts.flatShading),
       emissive: opts.emissive ?? "#000000",
       emissiveIntensity: opts.emissiveIntensity ?? 1.0,
+      envMapIntensity: opts.envMapIntensity ?? 1.0,
+      bumpScale: opts.bumpScale ?? 1.0,
+      polygonOffset: Boolean(opts.polygonOffset),
+      polygonOffsetFactor: opts.polygonOffsetFactor ?? 0,
+      polygonOffsetUnits: opts.polygonOffsetUnits ?? 0,
       map: opts.map || null,
       emissiveMap: opts.emissiveMap || null,
+      roughnessMap: opts.roughnessMap || null,
+      metalnessMap: opts.metalnessMap || null,
+      bumpMap: opts.bumpMap || null,
+      normalMap: opts.normalMap || null,
+      alphaMap: opts.alphaMap || null,
     };
 
     const key = this._key("std", {
@@ -80,6 +90,11 @@ export class MaterialPool {
       emissive: new THREE.Color(normalized.emissive).getHexString(),
       map: normalized.map?.uuid || "none",
       emissiveMap: normalized.emissiveMap?.uuid || "none",
+      roughnessMap: normalized.roughnessMap?.uuid || "none",
+      metalnessMap: normalized.metalnessMap?.uuid || "none",
+      bumpMap: normalized.bumpMap?.uuid || "none",
+      normalMap: normalized.normalMap?.uuid || "none",
+      alphaMap: normalized.alphaMap?.uuid || "none",
     });
 
     if (this.cache.has(key)) {
@@ -97,8 +112,18 @@ export class MaterialPool {
       flatShading: normalized.flatShading,
       emissive: new THREE.Color(normalized.emissive),
       emissiveIntensity: normalized.emissiveIntensity,
+      envMapIntensity: normalized.envMapIntensity,
+      bumpScale: normalized.bumpScale,
+      polygonOffset: normalized.polygonOffset,
+      polygonOffsetFactor: normalized.polygonOffsetFactor,
+      polygonOffsetUnits: normalized.polygonOffsetUnits,
       map: normalized.map,
       emissiveMap: normalized.emissiveMap,
+      roughnessMap: normalized.roughnessMap,
+      metalnessMap: normalized.metalnessMap,
+      bumpMap: normalized.bumpMap,
+      normalMap: normalized.normalMap,
+      alphaMap: normalized.alphaMap,
     });
     this.cache.set(key, mat);
     return mat;
@@ -111,12 +136,17 @@ export class MaterialPool {
       transparent: Boolean(opts.transparent),
       opacity: opts.opacity ?? 1.0,
       depthWrite: opts.depthWrite ?? true,
+      polygonOffset: Boolean(opts.polygonOffset),
+      polygonOffsetFactor: opts.polygonOffsetFactor ?? 0,
+      polygonOffsetUnits: opts.polygonOffsetUnits ?? 0,
       map: opts.map || null,
+      alphaMap: opts.alphaMap || null,
     };
     const key = this._key("basic", {
       ...normalized,
       color: new THREE.Color(normalized.color).getHexString(),
       map: normalized.map?.uuid || "none",
+      alphaMap: normalized.alphaMap?.uuid || "none",
     });
     if (this.cache.has(key)) return this.cache.get(key);
 
@@ -130,14 +160,14 @@ export class MaterialPool {
    */
   getGlass(opts = {}) {
     const normalized = {
-      color: opts.color ?? "#E8F3FA",
-      opacity: opts.opacity ?? 0.28,
-      roughness: opts.roughness ?? 0.05,
+      color: opts.color ?? "#E6F0F5",
+      opacity: opts.opacity ?? 0.24,
+      roughness: opts.roughness ?? 0.04,
       metalness: opts.metalness ?? 0.08,
       clearcoat: opts.clearcoat ?? 1.0,
-      clearcoatRoughness: opts.clearcoatRoughness ?? 0.04,
-      reflectivity: opts.reflectivity ?? 0.9,
-      envMapIntensity: opts.envMapIntensity ?? 1.25,
+      clearcoatRoughness: opts.clearcoatRoughness ?? 0.03,
+      reflectivity: opts.reflectivity ?? 0.92,
+      envMapIntensity: opts.envMapIntensity ?? 1.35,
       side: opts.side ?? THREE.DoubleSide,
       depthWrite: opts.depthWrite ?? false,
     };
@@ -169,11 +199,14 @@ export class MaterialPool {
   getCanonicalForMeshMaterial(mat, { tintable = false } = {}) {
     if (!mat) return null;
 
-    if (mat.isMeshPhysicalMaterial && mat.transmission > 0) {
+    if (mat.isMeshPhysicalMaterial && (mat.transmission > 0 || mat.clearcoat > 0.2)) {
       return this.getGlass({
         color: `#${mat.color.getHexString()}`,
         opacity: mat.transparent ? Math.min(mat.opacity, 0.48) : 0.36,
-        roughness: Math.max(0.04, mat.roughness),
+        roughness: Math.max(0.03, mat.roughness),
+        clearcoat: mat.clearcoat ?? 1.0,
+        clearcoatRoughness: mat.clearcoatRoughness ?? 0.03,
+        envMapIntensity: mat.envMapIntensity ?? 1.35,
         side: mat.side,
       });
     }
@@ -185,7 +218,11 @@ export class MaterialPool {
         transparent: mat.transparent,
         opacity: mat.opacity,
         depthWrite: mat.depthWrite,
+        polygonOffset: Boolean(mat.polygonOffset),
+        polygonOffsetFactor: mat.polygonOffsetFactor ?? 0,
+        polygonOffsetUnits: mat.polygonOffsetUnits ?? 0,
         map: mat.map || null,
+        alphaMap: mat.alphaMap || null,
       });
     }
 
@@ -201,8 +238,18 @@ export class MaterialPool {
         flatShading: Boolean(mat.flatShading),
         emissive: mat.emissive ? `#${mat.emissive.getHexString()}` : "#000000",
         emissiveIntensity: mat.emissiveIntensity ?? 1.0,
+        envMapIntensity: mat.envMapIntensity ?? 1.0,
+        bumpScale: mat.bumpScale ?? 1.0,
+        polygonOffset: Boolean(mat.polygonOffset),
+        polygonOffsetFactor: mat.polygonOffsetFactor ?? 0,
+        polygonOffsetUnits: mat.polygonOffsetUnits ?? 0,
         map: mat.map || null,
         emissiveMap: mat.emissiveMap || null,
+        roughnessMap: mat.roughnessMap || null,
+        metalnessMap: mat.metalnessMap || null,
+        bumpMap: mat.bumpMap || null,
+        normalMap: mat.normalMap || null,
+        alphaMap: mat.alphaMap || null,
       });
     }
 

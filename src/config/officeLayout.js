@@ -90,28 +90,28 @@ export const DIORAMA_CONFIG = {
     },
   },
 
-  // Alfombras unificadas en azul marino profundo
+  // Alfombras unificadas en tonos nórdicos pizarra / gris cálido
   carpets: [
     // Corredor vertical principal
-    { width: 1.8, length: 8.8, x: -3.2, z: 3.2, color: "#16233B" },
+    { width: 1.8, length: 8.8, x: -3.2, z: 3.2, color: "#273447" },
 
     // Corredor horizontal norte
-    { width: 10.4, length: 1.8, x: -1.0, z: -1.8, color: "#16233B" },
+    { width: 10.4, length: 1.8, x: -1.0, z: -1.8, color: "#273447" },
 
     // Sala de Reuniones
-    { width: 6.8, length: 4.8, x: 0.0, z: -6.0, color: "#1B2D4F" },
+    { width: 6.8, length: 4.8, x: 0.0, z: -6.0, color: "#2B3A4E" },
 
     // Pod 1 (Bancada Oeste)
-    { width: 3.2, length: 3.0, x: -9.6, z: 5.2, color: "#182846" },
+    { width: 3.2, length: 3.0, x: -9.6, z: 5.2, color: "#2A3646" },
 
     // Pod 2 (Bancada Central-Sur)
-    { width: 3.2, length: 3.0, x: -6.0, z: 5.2, color: "#182846" },
+    { width: 3.2, length: 3.0, x: -6.0, z: 5.2, color: "#2A3646" },
 
     // Pod 3 (Isla Norte)
-    { width: 2.2, length: 2.8, x: -7.8, z: 1.0, color: "#182846" },
+    { width: 2.2, length: 2.8, x: -7.8, z: 1.0, color: "#2A3646" },
 
     // Lounge
-    { width: 6.4, length: 5.4, x: 8.2, z: 4.6, color: "#16243D" },
+    { width: 6.4, length: 5.4, x: 8.2, z: 4.6, color: "#263344" },
   ],
 };
 

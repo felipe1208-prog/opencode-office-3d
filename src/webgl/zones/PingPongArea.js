@@ -1,6 +1,12 @@
 import * as THREE from "three";
 import { fitModel } from "../utils/modelUtils.js";
 import { configureTexture } from "../utils/SceneOptimizer.js";
+import {
+  createContactShadowDecal,
+  createMinimalWallArt,
+  createZoneSignPlaque,
+  getProceduralPBRTextures,
+} from "../utils/ProceduralTextures.js";
 
 export class PingPongArea {
   constructor(experience) {
@@ -16,6 +22,7 @@ export class PingPongArea {
 
     this.group = new THREE.Group();
     this.group.name = "zone-ping-pong";
+    this.pbr = getProceduralPBRTextures();
 
     // 1. Mesa de Ping-Pong reglamentaria (Eje longitudinal Norte-Sur)
     this.initRotatedPingPongTable();
@@ -71,8 +78,11 @@ export class PingPongArea {
     tableGroup.position.set(tX, 0, tZ);
 
     const topMat = new THREE.MeshStandardMaterial({
-      color: "#1D4ED8",
-      roughness: 0.36,
+      color: "#23487A",
+      roughnessMap: this.pbr.matteMicroRoughnessMap,
+      bumpMap: this.pbr.matteMicroBumpMap,
+      bumpScale: 0.003,
+      roughness: 0.44,
       metalness: 0.04,
     });
     const tableTop = new THREE.Mesh(
@@ -145,11 +155,12 @@ export class PingPongArea {
     });
     tableGroup.add(netMesh);
 
-    // Estructura tubular inferior de acero
+    // Estructura tubular inferior de acero cepillado
     const frameMat = new THREE.MeshStandardMaterial({
-      color: "#E2E8F0",
-      roughness: 0.35,
-      metalness: 0.8,
+      color: "#DCE2EC",
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      roughness: 0.34,
+      metalness: 0.82,
     });
     const legPositions = [
       { x: -tW * 0.42, z: -tL * 0.4 },
@@ -187,7 +198,11 @@ export class PingPongArea {
       frameMat,
     );
     barE_leg.position.set(tW * 0.42, 0.22, 0);
-    tableGroup.add(barW_leg, barE_leg);
+    tableGroup.add(
+      barW_leg,
+      barE_leg,
+      createContactShadowDecal(0, 0, tW + 0.45, tL + 0.45, 0.0135),
+    );
 
     this.group.add(tableGroup);
 
@@ -233,9 +248,10 @@ export class PingPongArea {
     boardGroup.rotation.y = Math.PI / 2;
 
     const frameMat = new THREE.MeshStandardMaterial({
-      color: "#E2E8F0",
+      color: "#DCE2EC",
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
       metalness: 0.85,
-      roughness: 0.2,
+      roughness: 0.24,
     });
     const frame = new THREE.Mesh(
       new THREE.BoxGeometry(1.6, 1.1, 0.03),
@@ -373,6 +389,15 @@ export class PingPongArea {
       { x: 11.35, y: 0.0, z: -0.55 },
       { maxDim: 0.1 },
     );
+
+    // Sombras de contacto AO bajo arcade, taquillas, máquinas vending y papelera
+    this.group.add(
+      createContactShadowDecal(6.2, wallZ, 0.96, 0.96, 0.0135),
+      createContactShadowDecal(7.7, wallZ, 1.48, 0.65, 0.0135),
+      createContactShadowDecal(9.2, wallZ, 1.18, 0.98, 0.0135),
+      createContactShadowDecal(10.45, wallZ, 1.18, 0.98, 0.0135),
+      createContactShadowDecal(11.45, wallZ, 0.56, 0.56, 0.0135),
+    );
   }
 
   // --- 4. MURO NORTE DEPORTIVO (Z = -8.45) ---
@@ -384,8 +409,13 @@ export class PingPongArea {
     trophyCase.position.set(6.2, 0, wallZ + 0.22);
 
     const caseMat = new THREE.MeshStandardMaterial({
-      color: "#2B170B",
-      roughness: 0.45,
+      color: "#8E623B",
+      map: this.pbr.deskWoodColorMap,
+      roughnessMap: this.pbr.deskWoodRoughnessMap,
+      bumpMap: this.pbr.deskWoodBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.72,
+      metalness: 0.03,
     });
     const glassMat = new THREE.MeshPhysicalMaterial({
       color: "#E8F3FA",
@@ -477,33 +507,18 @@ export class PingPongArea {
     gymBag.castShadow = true;
     this.group.add(gymBag);
 
-    // Cartel luminoso "GAME ON"
-    const neonMat = new THREE.MeshStandardMaterial({
-      color: "#06B6D4",
-      emissive: "#0891B2",
-      emissiveIntensity: 0.85,
-      roughness: 0.2,
-    });
-    const neonBox = new THREE.Mesh(
-      new THREE.BoxGeometry(1.5, 0.32, 0.02),
-      new THREE.MeshStandardMaterial({ color: "#0F172A" }),
-    );
-    neonBox.position.set(7.6, 2.75, wallZ + 0.02);
+    // Cartel arquitectónico "GAME ON" con placa gráfica limpia
+    const gameSign = createZoneSignPlaque("GAME ON", "PING-PONG & ARCADE", 1.46, 0.3);
+    gameSign.position.set(7.6, 2.75, wallZ + 0.025);
+    this.group.add(gameSign);
 
-    const neonSign = new THREE.Mesh(
-      new THREE.BoxGeometry(1.42, 0.24, 0.025),
-      neonMat,
-    );
-    neonSign.position.set(7.6, 2.75, wallZ + 0.035);
-    this.group.add(neonBox, neonSign);
-
-    // Tabla decorativa y póster mural
+    // Tabla decorativa y cuadro nórdico minimalista enmarcado
     const board = new THREE.Mesh(
       new THREE.CylinderGeometry(0.18, 0.18, 0.95, 24),
       new THREE.MeshStandardMaterial({
-        color: "#06B6D4",
-        roughness: 0.25,
-        metalness: 0.15,
+        color: "#3E566E",
+        roughness: 0.34,
+        metalness: 0.12,
       }),
     );
     board.scale.set(1.0, 1.0, 0.12);
@@ -511,12 +526,14 @@ export class PingPongArea {
     board.castShadow = true;
     this.group.add(board);
 
-    const poster = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.85, 1.1),
-      new THREE.MeshStandardMaterial({ color: "#F97316", roughness: 0.4 }),
+    const wallArt = createMinimalWallArt(2, 0.88, 1.12);
+    wallArt.position.set(10.6, 2.05, wallZ + 0.02);
+    this.group.add(
+      wallArt,
+      createContactShadowDecal(6.2, wallZ + 0.22, 1.42, 0.65, 0.0135),
+      createContactShadowDecal(8.1, wallZ + 0.25, 1.8, 0.64, 0.0135),
+      createContactShadowDecal(8.1, wallZ + 0.65, 0.66, 0.42, 0.0135),
     );
-    poster.position.set(10.6, 2.05, wallZ + 0.02);
-    this.group.add(poster);
   }
 
   // --- 5. LOUNGE VIP DE ESPECTADORES ---
@@ -526,35 +543,17 @@ export class PingPongArea {
     const rugW = 2.6;
     const rugL = 4.4;
 
-    // Alfombra roja texturizada
-    const canvas = document.createElement("canvas");
-    canvas.width = 256;
-    canvas.height = 256;
-    const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "#881337";
-    ctx.fillRect(0, 0, 256, 256);
-    for (let x = 0; x < 256; x += 4) {
-      for (let y = 0; y < 256; y += 4) {
-        const n = (Math.random() - 0.5) * 35;
-        ctx.fillStyle = `rgba(255, 180, 200, ${Math.max(0, 0.06 + n / 400)})`;
-        ctx.fillRect(x, y, 2, 4);
-      }
-    }
-    const tex = configureTexture(new THREE.CanvasTexture(canvas), {
-      isColor: true,
-      mipmaps: true,
-      anisotropy: 4,
-      wrapS: THREE.RepeatWrapping,
-      wrapT: THREE.RepeatWrapping,
-    });
-    tex.repeat.set(3, 4);
-
+    // Alfombra VIP con textura textil PO2 cacheada en tono burdeos nórdico cálido
     const rugMesh = new THREE.Mesh(
       new THREE.PlaneGeometry(rugW, rugL),
       new THREE.MeshStandardMaterial({
-        color: "#FFFFFF",
-        map: tex,
-        roughness: 0.85,
+        color: "#6E2B36",
+        map: this.pbr.carpetColorMap,
+        roughnessMap: this.pbr.carpetRoughnessMap,
+        bumpMap: this.pbr.carpetBumpMap,
+        bumpScale: 0.012,
+        roughness: 0.92,
+        metalness: 0.02,
       }),
     );
     rugMesh.rotation.x = -Math.PI / 2;
@@ -610,9 +609,9 @@ export class PingPongArea {
       );
     if (!armS) this.createProceduralSofa(10.6, -2.9, Math.PI, 0.88);
 
-    // Puffs Bean Bag contemporáneos
-    this.createBeanBagPuff(9.5, -5.2, "#1E3A8A");
-    this.createBeanBagPuff(9.5, -3.8, "#D97706");
+    // Puffs Bean Bag contemporáneos en paleta nórdica
+    this.createBeanBagPuff(9.5, -5.2, "#3E566E");
+    this.createBeanBagPuff(9.5, -3.8, "#C97A57");
 
     // Mesa de centro rotada 90°
     const coffeeTableGroup = new THREE.Group();
@@ -628,15 +627,24 @@ export class PingPongArea {
     } else {
       const ctTop = new THREE.Mesh(
         new THREE.BoxGeometry(0.95, 0.035, 0.55),
-        new THREE.MeshStandardMaterial({ color: "#2B170B", roughness: 0.45 }),
+        new THREE.MeshStandardMaterial({
+          color: "#946840",
+          map: this.pbr.deskWoodColorMap,
+          roughnessMap: this.pbr.deskWoodRoughnessMap,
+          bumpMap: this.pbr.deskWoodBumpMap,
+          bumpScale: 0.008,
+          roughness: 0.72,
+          metalness: 0.03,
+        }),
       );
       ctTop.position.y = 0.36;
       ctTop.castShadow = true;
 
       const legMat = new THREE.MeshStandardMaterial({
-        color: "#15171F",
-        roughness: 0.3,
-        metalness: 0.85,
+        color: "#1E222A",
+        roughnessMap: this.pbr.brushedMetalRoughnessMap,
+        roughness: 0.36,
+        metalness: 0.84,
       });
       [-0.42, 0.42].forEach((lx) => {
         [-0.22, 0.22].forEach((lz) => {
@@ -667,32 +675,56 @@ export class PingPongArea {
 
     this.group.add(coffeeTableGroup);
 
-    // Lámpara de pie
+    // Lámpara de pie registrada en NightLightingRig para halo cálido nocturno
     const lampGroup = new THREE.Group();
     lampGroup.position.set(11.45, 0.0, -6.4);
     const legMat = new THREE.MeshStandardMaterial({
-      color: "#15171F",
-      roughness: 0.3,
-      metalness: 0.85,
+      color: "#1E222A",
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      roughness: 0.36,
+      metalness: 0.84,
     });
     const lampPole = new THREE.Mesh(
       new THREE.CylinderGeometry(0.015, 0.015, 1.7, 12),
       legMat,
     );
     lampPole.position.y = 0.85;
+    const lampShadeMat = new THREE.MeshStandardMaterial({
+      color: "#F8F2E6",
+      roughness: 0.45,
+    });
+    this.experience?.nightRig?.registerLampShadeMaterial(lampShadeMat);
     const lampShade = new THREE.Mesh(
       new THREE.CylinderGeometry(0.18, 0.26, 0.28, 16),
-      new THREE.MeshStandardMaterial({ color: "#F8FAFC", roughness: 0.3 }),
+      lampShadeMat,
     );
     lampShade.position.y = 1.65;
+    lampShade.userData.noBatch = true;
+    lampShade.userData.keepMaterialInstance = true;
     lampGroup.add(lampPole, lampShade);
-    this.group.add(lampGroup);
+    this.group.add(
+      lampGroup,
+      createContactShadowDecal(11.35, -4.5, 1.05, 2.08, 0.0135),
+      createContactShadowDecal(10.6, -6.1, 1.05, 1.05, 0.0135),
+      createContactShadowDecal(10.6, -2.9, 1.05, 1.05, 0.0135),
+      createContactShadowDecal(10.5, -4.5, 0.78, 1.18, 0.0135),
+      createContactShadowDecal(9.5, -5.2, 0.82, 0.82, 0.0135),
+      createContactShadowDecal(9.5, -3.8, 0.82, 0.82, 0.0135),
+      createContactShadowDecal(11.45, -6.4, 0.56, 0.56, 0.0135),
+    );
   }
 
   createBeanBagPuff(x, z, colorHex) {
     const puff = new THREE.Mesh(
       new THREE.SphereGeometry(0.32, 16, 16),
-      new THREE.MeshStandardMaterial({ color: colorHex, roughness: 0.85 }),
+      new THREE.MeshStandardMaterial({
+        color: colorHex,
+        map: this.pbr.carpetColorMap,
+        roughnessMap: this.pbr.carpetRoughnessMap,
+        bumpMap: this.pbr.carpetBumpMap,
+        bumpScale: 0.01,
+        roughness: 0.88,
+      }),
     );
     puff.scale.set(1.2, 0.65, 1.2);
     puff.position.set(x, 0.2, z);
@@ -716,6 +748,11 @@ export class PingPongArea {
       "plantFiddleLeaf",
       { x: 11.45, y: 0.0, z: -0.5 },
       { height: 1.55 },
+    );
+    this.group.add(
+      createContactShadowDecal(11.45, -8.1, 0.72, 0.72, 0.0135),
+      createContactShadowDecal(4.8, -8.15, 0.62, 0.62, 0.0135),
+      createContactShadowDecal(11.45, -0.5, 0.72, 0.72, 0.0135),
     );
   }
 
@@ -900,14 +937,21 @@ export class PingPongArea {
       d = 0.4;
     const frame = new THREE.Mesh(
       new THREE.BoxGeometry(w, h, d),
-      new THREE.MeshStandardMaterial({ color: "#2B170B", roughness: 0.45 }),
+      new THREE.MeshStandardMaterial({
+        color: "#8E623B",
+        map: this.pbr.deskWoodColorMap,
+        roughnessMap: this.pbr.deskWoodRoughnessMap,
+        bumpMap: this.pbr.deskWoodBumpMap,
+        bumpScale: 0.008,
+        roughness: 0.72,
+      }),
     );
     frame.position.y = h / 2;
     frame.castShadow = true;
     cabGroup.add(frame);
 
     const darkMat = new THREE.MeshStandardMaterial({
-      color: "#140D07",
+      color: "#22262E",
       roughness: 0.8,
     });
     [-0.4, 0, 0.4].forEach((cx) => {
@@ -930,9 +974,13 @@ export class PingPongArea {
     sofaGroup.rotation.y = rotY;
 
     const fabricMat = new THREE.MeshStandardMaterial({
-      color: "#1E293B",
-      roughness: 0.75,
-      metalness: 0.05,
+      color: "#2C3542",
+      map: this.pbr.carpetColorMap,
+      roughnessMap: this.pbr.carpetRoughnessMap,
+      bumpMap: this.pbr.carpetBumpMap,
+      bumpScale: 0.01,
+      roughness: 0.82,
+      metalness: 0.04,
     });
     const depth = 0.78;
 

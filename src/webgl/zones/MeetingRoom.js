@@ -1,5 +1,12 @@
 import * as THREE from "three";
 import { fitModel } from "../utils/modelUtils.js";
+import {
+  createContactShadowDecal,
+  createLaptopProp,
+  createMinimalWallArt,
+  getProceduralPBRTextures,
+  NORDIC_PALETTE,
+} from "../utils/ProceduralTextures.js";
 
 export class MeetingRoom {
   constructor(experience) {
@@ -15,14 +22,15 @@ export class MeetingRoom {
 
     this.group = new THREE.Group();
     this.group.name = "zone-meeting-room";
+    this.pbr = getProceduralPBRTextures();
 
-    // 1. Mobiliario e infraestructura existente (100% Intacto)
+    // 1. Mobiliario e infraestructura existente (100% Intacto en layout)
     this.initConferenceTable();
     this.initChairs();
     this.initTableProps();
     this.initPlantsAndDecor();
 
-    // 2. Muro Norte: Pantalla en negro y pizarra a altura corregida
+    // 2. Muro Norte: Pantalla con halo trasero suave y pizarra Kanban física
     this.initWallTV();
     this.initWhiteboard();
 
@@ -56,9 +64,13 @@ export class MeetingRoom {
     const tThickness = 0.055;
 
     const topMat = new THREE.MeshStandardMaterial({
-      color: "#3B2215",
-      roughness: 0.38,
-      metalness: 0.04,
+      color: "#9A6C45", // Roble nórdico cálido
+      map: this.pbr.deskWoodColorMap,
+      roughnessMap: this.pbr.deskWoodRoughnessMap,
+      bumpMap: this.pbr.deskWoodBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.72,
+      metalness: 0.03,
     });
     const tableTop = new THREE.Mesh(
       new THREE.BoxGeometry(tWidth, tThickness, tDepth),
@@ -70,9 +82,10 @@ export class MeetingRoom {
     tableGroup.add(tableTop);
 
     const grommetMat = new THREE.MeshStandardMaterial({
-      color: "#15171E",
-      roughness: 0.35,
-      metalness: 0.85,
+      color: "#22262E",
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      roughness: 0.4,
+      metalness: 0.84,
     });
     const grommet = new THREE.Mesh(
       new THREE.BoxGeometry(1.4, 0.005, 0.22),
@@ -82,9 +95,10 @@ export class MeetingRoom {
     tableGroup.add(grommet);
 
     const legMat = new THREE.MeshStandardMaterial({
-      color: "#181A20",
-      roughness: 0.45,
-      metalness: 0.8,
+      color: "#232830",
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      roughness: 0.44,
+      metalness: 0.82,
     });
 
     const legGeo = new THREE.CylinderGeometry(
@@ -101,20 +115,25 @@ export class MeetingRoom {
     legR.position.set(1.35, (tableY - tThickness) / 2, -6.0);
     legR.castShadow = true;
 
-    tableGroup.add(legL, legR);
+    // Sombra de contacto AO bajo la mesa de conferencias
+    const tableAO = createContactShadowDecal(0.0, -6.0, 5.0, 2.35, 0.0135);
+    tableGroup.add(legL, legR, tableAO);
     this.group.add(tableGroup);
   }
 
   initChairs() {
     const chairHeight = 1.02;
-    const setupChairMat = (chairMesh) => {
+    const setupChairMat = (chairMesh, idx) => {
       if (!chairMesh) return;
+      const tone =
+        NORDIC_PALETTE.chairsMeeting[idx % NORDIC_PALETTE.chairsMeeting.length];
       chairMesh.traverse((child) => {
         if (child.isMesh && child.material) {
           child.material = child.material.clone();
-          child.material.color.set("#D9DFE8");
-          child.material.roughness = 0.55;
-          child.material.metalness = 0.05;
+          child.material.color.set(tone);
+          child.material.roughnessMap = this.pbr.carpetRoughnessMap;
+          child.material.roughness = 0.78;
+          child.material.metalness = 0.04;
         }
       });
     };
@@ -128,7 +147,7 @@ export class MeetingRoom {
         { height: chairHeight },
         rotJitter,
       );
-      setupChairMat(c);
+      setupChairMat(c, i);
     });
 
     const southX = [-1.35, 0.0, 1.35];
@@ -140,7 +159,7 @@ export class MeetingRoom {
         { height: chairHeight },
         rotJitter,
       );
-      setupChairMat(c);
+      setupChairMat(c, i + 1);
     });
 
     const cWest = this.place(
@@ -149,7 +168,7 @@ export class MeetingRoom {
       { height: chairHeight },
       Math.PI / 2,
     );
-    setupChairMat(cWest);
+    setupChairMat(cWest, 0);
 
     const cEast = this.place(
       "chair",
@@ -157,7 +176,7 @@ export class MeetingRoom {
       { height: chairHeight },
       -Math.PI / 2,
     );
-    setupChairMat(cEast);
+    setupChairMat(cEast, 2);
   }
 
   initTableProps() {
@@ -168,6 +187,10 @@ export class MeetingRoom {
       { x: 0.0, y: tableY, z: -6.0 },
       { height: 0.28 },
     );
+
+    // Portátil abierto para presentación en cabecera oeste + portátil cerrado en plaza norte
+    this.group.add(createLaptopProp(-1.82, tableY, -6.0, Math.PI / 2, true));
+    this.group.add(createLaptopProp(0.0, tableY, -6.48, 0.14, false));
 
     // Control remoto de TV sobre la mesa junto a la bandeja central
     this.place(
@@ -182,16 +205,16 @@ export class MeetingRoom {
       { x: 1.35, z: -6.55 },
       { x: -1.35, z: -5.45 },
       { x: 1.35, z: -5.45 },
-      { x: -2.0, z: -6.0 },
+      { x: -2.0, z: -6.28 },
     ];
     const fallbackGlassGeo = new THREE.CylinderGeometry(0.035, 0.03, 0.1, 16);
     const fallbackGlassMat = new THREE.MeshPhysicalMaterial({
-      color: "#E8F3FA",
+      color: "#E4F0F6",
       transmission: 0,
-      roughness: 0.05,
+      roughness: 0.04,
       clearcoat: 1.0,
       transparent: true,
-      opacity: 0.35,
+      opacity: 0.3,
       depthWrite: false,
     });
     glassPositions.forEach((pos) => {
@@ -207,33 +230,38 @@ export class MeetingRoom {
       }
     });
 
-    const folderMat = new THREE.MeshStandardMaterial({
-      color: "#1A1C23",
-      roughness: 0.55,
-    });
     const paperMat = new THREE.MeshStandardMaterial({
-      color: "#F1F5F9",
+      color: "#F6F3EC",
+      roughnessMap: this.pbr.matteMicroRoughnessMap,
       roughness: 0.9,
     });
     const folderGeo = new THREE.BoxGeometry(0.24, 0.006, 0.32);
     const paperGeo = new THREE.BoxGeometry(0.2, 0.002, 0.28);
 
-    const addFolder = (x, z, rot) => {
+    // Carpetas con variación tonal controlada (setColorAt automático en InstancedMesh)
+    const addFolder = (x, z, rot, idx) => {
+      const folderMat = new THREE.MeshStandardMaterial({
+        color: NORDIC_PALETTE.folders[idx % NORDIC_PALETTE.folders.length],
+        roughnessMap: this.pbr.matteMicroRoughnessMap,
+        roughness: 0.65,
+      });
       const f = new THREE.Mesh(folderGeo, folderMat);
       f.position.set(x, tableY + 0.003, z);
       f.rotation.y = rot;
       f.castShadow = true;
+      f.userData.sharedGeometry = true;
 
       const p = new THREE.Mesh(paperGeo, paperMat);
       p.position.set(x, tableY + 0.007, z);
       p.rotation.y = rot;
+      p.userData.sharedGeometry = true;
       this.group.add(f, p);
     };
 
-    addFolder(-1.35, -6.4, 0);
-    addFolder(1.35, -6.4, 0);
-    addFolder(0.0, -5.6, Math.PI);
-    addFolder(-2.0, -6.0, Math.PI / 2);
+    addFolder(-1.35, -6.36, 0.04, 0);
+    addFolder(1.35, -6.36, -0.05, 1);
+    addFolder(0.0, -5.6, Math.PI, 2);
+    addFolder(1.35, -5.65, Math.PI - 0.08, 3);
   }
 
   initPlantsAndDecor() {
@@ -242,8 +270,17 @@ export class MeetingRoom {
       { x: -3.55, y: 0, z: -8.45 },
       { height: 1.55 },
     );
+    this.group.add(createContactShadowDecal(-3.55, -8.45, 0.95, 0.95, 0.008));
+
     this.place("plantFlowerPot", { x: 3.55, y: 0, z: -8.45 }, { height: 1.15 });
+    this.group.add(createContactShadowDecal(3.55, -8.45, 0.85, 0.85, 0.008));
+
     this.place("trashcan", { x: 3.55, y: 0, z: -3.45 }, { height: 0.4 });
+
+    // Cuadro nórdico discreto en muro norte oeste
+    const art = createMinimalWallArt(1, 0.95, 0.68);
+    art.position.set(-3.45, 2.25, -8.98);
+    this.group.add(art);
   }
 
   initWallTV() {
@@ -253,10 +290,27 @@ export class MeetingRoom {
     const tvY = 2.15;
     const wallZ = -8.99;
 
+    // Plano de halo trasero suave (bias lighting) activo solo en Tarde y Noche
+    const biasMat = new THREE.MeshBasicMaterial({
+      map: this.pbr.tvBiasGlowTexture,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    const biasPlane = new THREE.Mesh(
+      new THREE.PlaneGeometry(tvW + 0.95, tvH + 0.72),
+      biasMat,
+    );
+    biasPlane.position.set(tvX, tvY, wallZ + 0.006);
+    this.group.add(biasPlane);
+    this.experience?.nightRig?.registerTVBiasGlow(biasPlane, 0.54);
+
     const frameGeo = new THREE.BoxGeometry(tvW + 0.04, tvH + 0.04, 0.035);
     const frameMat = new THREE.MeshStandardMaterial({
-      color: "#12141A",
-      roughness: 0.35,
+      color: "#1B2028",
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      roughness: 0.36,
       metalness: 0.85,
     });
     const tvFrame = new THREE.Mesh(frameGeo, frameMat);
@@ -267,8 +321,8 @@ export class MeetingRoom {
     const screenGeo = new THREE.PlaneGeometry(tvW, tvH);
     const screenMat = new THREE.MeshStandardMaterial({
       color: "#07080B",
-      roughness: 0.12,
-      metalness: 0.2,
+      roughness: 0.14,
+      metalness: 0.15,
     });
     const screenMesh = new THREE.Mesh(screenGeo, screenMat);
     screenMesh.position.set(tvX, tvY, wallZ + 0.019);
@@ -277,7 +331,7 @@ export class MeetingRoom {
   }
 
   initWhiteboard() {
-    // Pizarra bajada de Y=2.15 a Y=1.75 a escala ergonómica natural
+    // Pizarra Kanban física a altura ergonómica natural
     const wb = this.place(
       "whiteboard",
       { x: 1.85, y: 1.75, z: -8.99 },
@@ -286,6 +340,7 @@ export class MeetingRoom {
     );
     if (wb) {
       wb.rotation.y = 0;
+      this.experience?.monitorSystem?.registerMeetingWhiteboard(wb);
     }
   }
 }

@@ -82,6 +82,7 @@ export class MonitorScreenSystem {
     this.standbyMaterial = null;
     this.standbyMaterials = [];
     this.meetingScreen = null;
+    this.whiteboardScreen = null;
     this.loungeScreen = null;
     this.nightFactor = -1;
     this.tickCounter = 0;
@@ -313,6 +314,64 @@ export class MonitorScreenSystem {
     this._redrawMeetingTV();
   }
 
+  registerMeetingWhiteboard(boardWrapper) {
+    if (!boardWrapper) return;
+
+    const prevPos = boardWrapper.position.clone();
+    const prevRot = boardWrapper.rotation.clone();
+    boardWrapper.position.set(0, 0, 0);
+    boardWrapper.rotation.set(0, 0, 0);
+    boardWrapper.updateMatrixWorld(true);
+
+    const box = new THREE.Box3().setFromObject(boardWrapper);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    box.getSize(size);
+    box.getCenter(center);
+
+    boardWrapper.position.copy(prevPos);
+    boardWrapper.rotation.copy(prevRot);
+    boardWrapper.updateMatrixWorld(true);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = 1024;
+    canvas.height = 512;
+    const ctx = canvas.getContext("2d");
+
+    const texture = configureTexture(new THREE.CanvasTexture(canvas), {
+      isColor: true,
+      mipmaps: true,
+      anisotropy: 4,
+    });
+
+    const mat = new THREE.MeshStandardMaterial({
+      map: texture,
+      roughness: 0.42,
+      metalness: 0.02,
+    });
+
+    const planeW = Math.max(1.0, size.x * 0.9);
+    const planeH = Math.max(0.6, size.y * 0.78);
+    const plane = new THREE.Mesh(new THREE.PlaneGeometry(planeW, planeH), mat);
+    plane.name = "meeting-kanban-whiteboard-surface";
+    plane.position.set(center.x, center.y + size.y * 0.03, box.max.z + 0.004);
+    plane.castShadow = false;
+    plane.receiveShadow = true;
+    plane.userData.noBatch = true;
+    boardWrapper.add(plane);
+
+    this.whiteboardScreen = {
+      mesh: plane,
+      material: mat,
+      canvas,
+      ctx,
+      texture,
+      lastRenderKey: null,
+    };
+
+    this._redrawMeetingWhiteboard();
+  }
+
   registerLoungeTV(tvWrapper) {
     if (!tvWrapper) return;
 
@@ -399,6 +458,9 @@ export class MonitorScreenSystem {
     if (this.meetingScreen) {
       this._redrawMeetingTV();
     }
+    if (this.whiteboardScreen) {
+      this._redrawMeetingWhiteboard();
+    }
   }
 
   setMeetingState({ active = false, topic = null, presenterName = null } = {}) {
@@ -407,6 +469,7 @@ export class MonitorScreenSystem {
     if (topic) this.meetingScreen.topic = topic;
     if (presenterName) this.meetingScreen.presenterName = presenterName;
     this._redrawMeetingTV();
+    this._redrawMeetingWhiteboard();
   }
 
   syncFromAgentSnapshots(snapshots = {}) {
@@ -440,13 +503,17 @@ export class MonitorScreenSystem {
         partnerName: snap.socialPartnerName || null,
       });
     }
+    if (this.whiteboardScreen) {
+      this._redrawMeetingWhiteboard();
+    }
   }
 
   setDayNightFactor(factor) {
     if (Math.abs(factor - this.nightFactor) < 0.0005) return;
     this.nightFactor = factor;
-    const activeGlow = THREE.MathUtils.lerp(0.28, 0.96, factor);
-    const standbyGlow = THREE.MathUtils.lerp(0.12, 0.36, factor);
+    // Contraste suave en pantallas para Tarde/Noche sin saturación ni halo neón agresivo
+    const activeGlow = THREE.MathUtils.lerp(0.26, 0.64, factor);
+    const standbyGlow = THREE.MathUtils.lerp(0.1, 0.28, factor);
 
     for (const entry of this.stationScreens.values()) {
       const intensity = entry.mode === "AWAY" ? standbyGlow : activeGlow;
@@ -459,15 +526,15 @@ export class MonitorScreenSystem {
     }
     if (this.meetingScreen) {
       this.meetingScreen.material.emissiveIntensity = THREE.MathUtils.lerp(
-        0.28,
-        0.85,
+        0.24,
+        0.58,
         factor,
       );
     }
     if (this.loungeScreen) {
       this.loungeScreen.material.emissiveIntensity = THREE.MathUtils.lerp(
-        0.28,
-        0.82,
+        0.24,
+        0.56,
         factor,
       );
     }
@@ -496,205 +563,211 @@ export class MonitorScreenSystem {
     const snippet = ROLE_SNIPPETS[agentConfig?.id] || ROLE_SNIPPETS.frontend;
     const pulseStep = this.tickCounter % 6;
 
-    // === MONITOR IZQUIERDO (Código / Diff / Estado Principal) ===
-    ctx.fillStyle = "#0B1120";
+    // === MONITOR IZQUIERDO (Código / Diff / Estado Principal en estética nórdica limpia) ===
+    ctx.fillStyle = "#111824";
     ctx.fillRect(0, 0, 512, 320);
 
-    // Barra superior IDE
-    ctx.fillStyle = "#162033";
-    ctx.fillRect(0, 0, 512, 34);
+    // Barra superior IDE minimalista
+    ctx.fillStyle = "#1A2333";
+    ctx.fillRect(0, 0, 512, 36);
     ctx.fillStyle = accent;
-    ctx.fillRect(0, 0, 6, 320);
+    ctx.fillRect(0, 0, 5, 320);
 
-    ctx.fillStyle = "#E2E8F0";
-    ctx.font = "bold 15px monospace";
-    ctx.fillText(entry.taskFile || snippet.file, 18, 22);
+    // Puntos de ventana sobrios
+    ["#64748B", "#64748B", "#64748B"].forEach((dotCol, i) => {
+      ctx.fillStyle = dotCol;
+      ctx.beginPath();
+      ctx.arc(22 + i * 14, 18, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    ctx.fillStyle = "#E5E7EB";
+    ctx.font = "600 14px monospace";
+    ctx.fillText(entry.taskFile || snippet.file, 68, 23);
 
     ctx.fillStyle = "#94A3B8";
-    ctx.font = "13px monospace";
-    ctx.fillText(agentConfig?.name || "Agent", 390, 22);
+    ctx.font = "12px sans-serif";
+    ctx.fillText(agentConfig?.name || "Agent", 402, 23);
 
     if (mode === "AWAY") {
-      ctx.fillStyle = "rgba(15, 23, 42, 0.85)";
-      ctx.fillRect(42, 72, 428, 176);
-      ctx.strokeStyle = "#334155";
-      ctx.lineWidth = 2;
-      ctx.strokeRect(42, 72, 428, 176);
+      ctx.fillStyle = "#162030";
+      ctx.fillRect(46, 74, 420, 174);
+      ctx.strokeStyle = "#2A374C";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(46, 74, 420, 174);
 
       const nowStr = new Date().toLocaleTimeString("es-ES", {
         hour: "2-digit",
         minute: "2-digit",
       });
-      ctx.fillStyle = "#E2E8F0";
-      ctx.font = "bold 52px monospace";
-      ctx.fillText(nowStr, 175, 152);
-      ctx.fillStyle = "#64748B";
-      ctx.font = "17px sans-serif";
-      ctx.fillText(entry.taskLabel || "Fuera del escritorio", 145, 200);
+      ctx.fillStyle = "#F1F5F9";
+      ctx.font = "600 50px monospace";
+      ctx.fillText(nowStr, 178, 152);
+      ctx.fillStyle = "#94A3B8";
+      ctx.font = "16px sans-serif";
+      ctx.fillText(entry.taskLabel || "Fuera del escritorio", 148, 198);
     } else if (mode === "REVIEWING") {
-      ctx.fillStyle = "rgba(56, 189, 248, 0.14)";
-      ctx.fillRect(16, 46, 480, 34);
-      ctx.fillStyle = "#38BDF8";
-      ctx.font = "bold 16px monospace";
+      ctx.fillStyle = "rgba(56, 189, 248, 0.10)";
+      ctx.fillRect(18, 48, 476, 34);
+      ctx.fillStyle = "#7DD3FC";
+      ctx.font = "600 15px monospace";
       ctx.fillText(
         `PAIR REVIEW · ${entry.partnerName || "Compañero"}`,
-        26,
-        69,
+        28,
+        70,
       );
 
       const diffLines = [
         { sign: " ", text: "async function syncAgentRoutes() {", color: "#CBD5E1" },
-        { sign: "-", text: "  const path = legacyWalk(pos);", color: "#FCA5A5", bg: "rgba(239,68,68,0.16)" },
-        { sign: "+", text: "  const path = Pathfinding.findPath(pos);", color: "#86EFAC", bg: "rgba(34,197,94,0.16)" },
-        { sign: "+", text: "  bus.emit('agent:state', { ok: true });", color: "#86EFAC", bg: "rgba(34,197,94,0.16)" },
+        { sign: "-", text: "  const path = legacyWalk(pos);", color: "#FCA5A5", bg: "rgba(239,68,68,0.12)" },
+        { sign: "+", text: "  const path = Pathfinding.findPath(pos);", color: "#86EFAC", bg: "rgba(34,197,94,0.12)" },
+        { sign: "+", text: "  bus.emit('agent:state', { ok: true });", color: "#86EFAC", bg: "rgba(34,197,94,0.12)" },
         { sign: " ", text: "  return checkpointMgr.commit(path);", color: "#CBD5E1" },
         { sign: " ", text: "}", color: "#CBD5E1" },
       ];
       diffLines.forEach((line, idx) => {
-        const y = 96 + idx * 33;
+        const y = 102 + idx * 32;
         if (line.bg) {
           ctx.fillStyle = line.bg;
-          ctx.fillRect(16, y - 20, 480, 28);
+          ctx.fillRect(18, y - 19, 476, 26);
         }
         ctx.fillStyle = line.color;
-        ctx.font = "15px monospace";
-        ctx.fillText(`${line.sign} ${line.text}`, 24, y);
+        ctx.font = "14px monospace";
+        ctx.fillText(`${line.sign} ${line.text}`, 26, y);
       });
     } else if (mode === "SUCCESS") {
-      ctx.fillStyle = "rgba(16, 185, 129, 0.16)";
-      ctx.fillRect(24, 62, 464, 210);
-      ctx.strokeStyle = "#10B981";
-      ctx.lineWidth = 3;
-      ctx.strokeRect(24, 62, 464, 210);
+      ctx.fillStyle = "rgba(16, 185, 129, 0.12)";
+      ctx.fillRect(26, 62, 460, 210);
+      ctx.strokeStyle = "#34D399";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(26, 62, 460, 210);
 
-      ctx.fillStyle = "#34D399";
-      ctx.font = "bold 28px monospace";
-      ctx.fillText("BUILD & TESTS PASSED", 76, 134);
-      ctx.fillStyle = "#E2E8F0";
-      ctx.font = "18px sans-serif";
-      ctx.fillText(entry.taskLabel || "Objetivo completado", 76, 180);
       ctx.fillStyle = "#6EE7B7";
-      ctx.font = "15px monospace";
-      ctx.fillText("✓ 0 errores · 47 checkpoints verificados", 76, 224);
+      ctx.font = "600 26px monospace";
+      ctx.fillText("BUILD & TESTS PASSED", 78, 134);
+      ctx.fillStyle = "#E2E8F0";
+      ctx.font = "17px sans-serif";
+      ctx.fillText(entry.taskLabel || "Objetivo completado", 78, 180);
+      ctx.fillStyle = "#A7F3D0";
+      ctx.font = "14px monospace";
+      ctx.fillText("✓ 0 errores · checkpoints verificados", 78, 224);
     } else if (mode === "ERROR") {
-      ctx.fillStyle = "rgba(239, 68, 68, 0.16)";
-      ctx.fillRect(24, 62, 464, 210);
-      ctx.strokeStyle = "#EF4444";
-      ctx.lineWidth = 3;
-      ctx.strokeRect(24, 62, 464, 210);
+      ctx.fillStyle = "rgba(239, 68, 68, 0.12)";
+      ctx.fillRect(26, 62, 460, 210);
+      ctx.strokeStyle = "#F87171";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(26, 62, 460, 210);
 
-      ctx.fillStyle = "#F87171";
-      ctx.font = "bold 26px monospace";
+      ctx.fillStyle = "#FCA5A5";
+      ctx.font = "600 24px monospace";
       ctx.fillText("CHECK REQUIRES REVIEW", 74, 132);
       ctx.fillStyle = "#FECACA";
-      ctx.font = "16px monospace";
-      ctx.fillText("ERR_ASSERTION: revisar contrato bus", 64, 178);
+      ctx.font = "15px monospace";
+      ctx.fillText("ERR_ASSERTION: revisar contrato bus", 66, 178);
       ctx.fillStyle = "#FDBA74";
       ctx.font = "15px sans-serif";
-      ctx.fillText(entry.taskLabel || "Analizando incidente...", 64, 220);
+      ctx.fillText(entry.taskLabel || "Analizando incidente...", 66, 220);
     } else if (mode === "THINKING") {
-      ctx.fillStyle = "rgba(14, 165, 233, 0.14)";
-      ctx.fillRect(20, 52, 472, 40);
-      ctx.strokeStyle = "rgba(56, 189, 248, 0.45)";
-      ctx.lineWidth = 2;
-      ctx.strokeRect(20, 52, 472, 40);
+      ctx.fillStyle = "rgba(125, 211, 252, 0.10)";
+      ctx.fillRect(22, 52, 468, 38);
+      ctx.strokeStyle = "rgba(125, 211, 252, 0.35)";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(22, 52, 468, 38);
 
-      ctx.fillStyle = "#7DD3FC";
-      ctx.font = "bold 17px monospace";
-      ctx.fillText("RAZONAMIENTO COGNITIVO EN CURSO", 34, 78);
+      ctx.fillStyle = "#BAE6FD";
+      ctx.font = "600 15px monospace";
+      ctx.fillText("RAZONAMIENTO EN CURSO", 36, 76);
 
-      // Ondas de inferencia animadas en el monitor izquierdo
+      // Barras limpias de inferencia
       for (let i = 0; i < 16; i++) {
-        const waveH = 18 + Math.round(Math.abs(Math.sin(i * 0.55 + this.tickCounter * 0.85)) * 56);
-        ctx.fillStyle = i % 2 === 0 ? "rgba(56, 189, 248, 0.72)" : "rgba(125, 211, 252, 0.45)";
-        ctx.fillRect(28 + i * 28, 198 - waveH, 18, waveH);
+        const waveH = 16 + Math.round(Math.abs(Math.sin(i * 0.55 + this.tickCounter * 0.85)) * 52);
+        ctx.fillStyle = i % 2 === 0 ? "rgba(125, 211, 252, 0.58)" : "rgba(186, 230, 253, 0.35)";
+        ctx.fillRect(30 + i * 28, 196 - waveH, 16, waveH);
       }
 
-      ctx.fillStyle = "#0F172A";
-      ctx.fillRect(20, 218, 472, 74);
-      ctx.strokeStyle = "#1E293B";
+      ctx.fillStyle = "#162030";
+      ctx.fillRect(22, 216, 468, 74);
+      ctx.strokeStyle = "#243247";
       ctx.lineWidth = 1.5;
-      ctx.strokeRect(20, 218, 472, 74);
+      ctx.strokeRect(22, 216, 468, 74);
 
       const thoughtText = String(entry.taskLabel || "Pensando...").slice(0, 42);
-      ctx.fillStyle = "#E0F2FE";
-      ctx.font = "bold 16px sans-serif";
-      ctx.fillText(thoughtText, 34, 252);
+      ctx.fillStyle = "#F1F5F9";
+      ctx.font = "600 15px sans-serif";
+      ctx.fillText(thoughtText, 36, 250);
       ctx.fillStyle = "#94A3B8";
-      ctx.font = "13px monospace";
-      ctx.fillText("Analizando contexto antes de ejecutar herramienta", 34, 278);
+      ctx.font = "12px monospace";
+      ctx.fillText("Planificando pasos y contexto técnico", 36, 274);
     } else {
       // WORKING
       snippet.lines.forEach((line, idx) => {
-        const y = 72 + idx * 36;
+        const y = 74 + idx * 36;
         if (idx === pulseStep) {
-          ctx.fillStyle = "rgba(56, 189, 248, 0.12)";
-          ctx.fillRect(14, y - 22, 484, 30);
+          ctx.fillStyle = "rgba(148, 163, 184, 0.12)";
+          ctx.fillRect(16, y - 22, 480, 29);
         }
-        ctx.fillStyle = "#475569";
-        ctx.font = "14px monospace";
-        ctx.fillText(String(idx + 1).padStart(2, "0"), 20, y);
+        ctx.fillStyle = "#64748B";
+        ctx.font = "13px monospace";
+        ctx.fillText(String(idx + 1).padStart(2, "0"), 22, y);
 
-        ctx.fillStyle = idx % 2 === 0 ? "#E2E8F0" : "#7DD3FC";
-        ctx.font = "15px monospace";
+        ctx.fillStyle = idx % 2 === 0 ? "#E5E7EB" : "#93C5FD";
+        ctx.font = "14px monospace";
         ctx.fillText(line, 52, y);
       });
 
-      // Cursor parpadeante
       if (this.tickCounter % 2 === 0) {
         ctx.fillStyle = accent;
-        ctx.fillRect(52, 72 + pulseStep * 36 + 5, 10, 3);
+        ctx.fillRect(52, 74 + pulseStep * 36 + 5, 10, 3);
       }
     }
 
-    // === MONITOR DERECHO (Telemetría / Terminal / Métricas) ===
-    rightCtx.fillStyle = "#080D18";
+    // === MONITOR DERECHO (Telemetría / Terminal / Métricas limpias) ===
+    rightCtx.fillStyle = "#0F1622";
     rightCtx.fillRect(0, 0, 512, 320);
-    rightCtx.fillStyle = "#131C2E";
-    rightCtx.fillRect(0, 0, 512, 34);
+    rightCtx.fillStyle = "#172131";
+    rightCtx.fillRect(0, 0, 512, 36);
     rightCtx.fillStyle = accent;
-    rightCtx.fillRect(0, 0, 6, 320);
+    rightCtx.fillRect(0, 0, 5, 320);
 
-    rightCtx.fillStyle = "#94A3B8";
-    rightCtx.font = "bold 15px monospace";
-    rightCtx.fillText(snippet.metricTitle, 18, 22);
+    rightCtx.fillStyle = "#CBD5E1";
+    rightCtx.font = "600 14px monospace";
+    rightCtx.fillText(snippet.metricTitle, 20, 23);
 
     if (mode === "AWAY") {
-      rightCtx.fillStyle = "#334155";
-      rightCtx.font = "18px monospace";
-      rightCtx.fillText("SESIÓN EN PAUSA", 162, 165);
+      rightCtx.fillStyle = "#475569";
+      rightCtx.font = "17px monospace";
+      rightCtx.fillText("SESIÓN EN PAUSA", 164, 165);
     } else {
-      // Gráfico de barras de actividad / build
       const barColor =
         mode === "ERROR"
-          ? "#EF4444"
+          ? "#F87171"
           : mode === "SUCCESS"
-            ? "#10B981"
+            ? "#34D399"
             : mode === "THINKING"
-              ? "#38BDF8"
+              ? "#7DD3FC"
               : accent;
       for (let i = 0; i < 12; i++) {
-        const val = 28 + ((i * 23 + this.tickCounter * 17) % 86);
-        rightCtx.fillStyle = "rgba(30, 41, 59, 0.9)";
-        rightCtx.fillRect(24 + i * 38, 60, 26, 110);
+        const val = 26 + ((i * 23 + this.tickCounter * 17) % 82);
+        rightCtx.fillStyle = "#192334";
+        rightCtx.fillRect(24 + i * 38, 60, 24, 108);
         rightCtx.fillStyle = barColor;
-        rightCtx.fillRect(24 + i * 38, 170 - val, 26, val);
+        rightCtx.fillRect(24 + i * 38, 168 - val, 24, val);
       }
 
-      rightCtx.fillStyle = "#111A2B";
-      rightCtx.fillRect(20, 192, 472, 104);
-      rightCtx.strokeStyle = "#1E293B";
-      rightCtx.strokeRect(20, 192, 472, 104);
+      rightCtx.fillStyle = "#151F2E";
+      rightCtx.fillRect(20, 190, 472, 104);
+      rightCtx.strokeStyle = "#243247";
+      rightCtx.strokeRect(20, 190, 472, 104);
 
-      rightCtx.fillStyle = "#E2E8F0";
-      rightCtx.font = "bold 16px monospace";
-      rightCtx.fillText(`> ${String(entry.taskLabel || "En progreso").slice(0, 36)}`, 34, 224);
+      rightCtx.fillStyle = "#F1F5F9";
+      rightCtx.font = "600 15px monospace";
+      rightCtx.fillText(`> ${String(entry.taskLabel || "En progreso").slice(0, 36)}`, 34, 222);
 
       rightCtx.fillStyle = "#94A3B8";
-      rightCtx.font = "14px monospace";
-      rightCtx.fillText(snippet.metricSub, 34, 254);
+      rightCtx.font = "13px monospace";
+      rightCtx.fillText(snippet.metricSub, 34, 252);
       rightCtx.fillStyle = barColor;
-      rightCtx.fillText(`STATUS: ${mode}`, 34, 280);
+      rightCtx.fillText(`STATUS: ${mode}`, 34, 278);
     }
 
     entry.texture.needsUpdate = true;
@@ -721,115 +794,244 @@ export class MonitorScreenSystem {
 
     ctx.setTransform(canvas.width / 1024, 0, 0, canvas.height / 576, 0, 0);
 
-    ctx.fillStyle = "#0B1220";
+    ctx.fillStyle = "#101826";
     ctx.fillRect(0, 0, 1024, 576);
 
-    ctx.fillStyle = "#142038";
+    ctx.fillStyle = "#172234";
     ctx.fillRect(0, 0, 1024, 68);
-    ctx.fillStyle = "#38BDF8";
-    ctx.fillRect(0, 0, 1024, 5);
+    ctx.fillStyle = "#B68A56";
+    ctx.fillRect(0, 0, 1024, 4);
 
-    ctx.fillStyle = "#F8FAFC";
-    ctx.font = "bold 26px sans-serif";
+    ctx.fillStyle = "#F3EFE8";
+    ctx.font = "600 25px sans-serif";
     ctx.fillText(
-      mode === "MEETING" ? "REUNIÓN DE EQUIPO EN CURSO" : "OFICINA VIRTUAL · SALA DE REUNIONES",
+      mode === "MEETING" ? "SALA DE REUNIONES · SINCRONIZACIÓN" : "ARQUITECTURA DE ESTUDIO · SPRINT",
       36,
       44,
     );
 
-    ctx.fillStyle = "#94A3B8";
-    ctx.font = "20px monospace";
-    ctx.fillText(
-      mode === "MEETING" ? "LIVE SYNC" : "STANDBY",
-      880,
-      44,
-    );
+    ctx.fillStyle = mode === "MEETING" ? "#FBBF24" : "#94A3B8";
+    ctx.font = "600 18px monospace";
+    ctx.fillText(mode === "MEETING" ? "LIVE SYNC" : "STANDBY", 884, 44);
+
+    // Panel izquierdo: Diagrama de arquitectura limpio y nodos conectados
+    ctx.fillStyle = "#152032";
+    ctx.fillRect(36, 98, 560, 434);
+    ctx.strokeStyle = "#26354C";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(36, 98, 560, 434);
 
     if (mode === "MEETING") {
-      ctx.fillStyle = "#16243F";
-      ctx.fillRect(36, 100, 560, 420);
-      ctx.strokeStyle = "#38BDF8";
-      ctx.lineWidth = 2;
-      ctx.strokeRect(36, 100, 560, 420);
-
-      ctx.fillStyle = "#38BDF8";
-      ctx.font = "bold 22px monospace";
-      ctx.fillText(`PRESENTADOR: ${presenterName.toUpperCase()}`, 64, 148);
+      ctx.fillStyle = "#FBBF24";
+      ctx.font = "600 19px monospace";
+      ctx.fillText(`PRESENTADOR: ${presenterName.toUpperCase()}`, 62, 144);
 
       ctx.fillStyle = "#F8FAFC";
-      ctx.font = "bold 28px sans-serif";
+      ctx.font = "600 26px sans-serif";
       const safeTopic =
         String(topic || "Sincronización").length > 34
           ? `${String(topic).slice(0, 33)}…`
           : String(topic || "Sincronización");
-      ctx.fillText(safeTopic, 64, 200);
-
-      const bullets = [
-        "1. Contrato de OfficeEventBus desacoplado",
-        "2. Feedback diegético en monitores y burbujas",
-        "3. Rutinas colaborativas: Pair Chat & Desk Review",
-        "4. Iluminación nocturna ambiental por zonas",
-      ];
-      bullets.forEach((b, idx) => {
-        ctx.fillStyle = "#CBD5E1";
-        ctx.font = "22px sans-serif";
-        ctx.fillText(b, 64, 266 + idx * 52);
-      });
-
-      // Panel derecho: diagrama sprint
-      ctx.fillStyle = "#111B2E";
-      ctx.fillRect(624, 100, 364, 420);
-      ctx.fillStyle = "#A78BFA";
-      ctx.font = "bold 20px monospace";
-      ctx.fillText("ESTADO DE AGENTES", 652, 144);
-
-      const defaultRoles = [
-        { id: "architect", name: "Tech Lead", color: "#8B5CF6", pct: 0.92 },
-        { id: "frontend", name: "Frontend", color: "#EAB308", pct: 0.85 },
-        { id: "qa", name: "DevOps / QA", color: "#9333EA", pct: 0.88 },
-        { id: "backend", name: "Backend", color: "#0284C7", pct: 0.78 },
-        { id: "systems", name: "Systems", color: "#EA580C", pct: 0.81 },
-      ];
-      const roles = defaultRoles.map((r) => {
-        for (const entry of this.stationScreens.values()) {
-          if (entry.agentConfig?.id === r.id) {
-            return {
-              ...r,
-              name: entry.agentConfig.name,
-              color: entry.agentConfig.color,
-            };
-          }
-        }
-        return r;
-      });
-      roles.forEach((r, i) => {
-        const y = 190 + i * 62;
-        ctx.fillStyle = "#E2E8F0";
-        ctx.font = "18px sans-serif";
-        ctx.fillText(r.name, 652, y);
-        ctx.fillStyle = "#1E293B";
-        ctx.fillRect(652, y + 12, 300, 14);
-        ctx.fillStyle = r.color;
-        ctx.fillRect(652, y + 12, Math.round(300 * r.pct), 14);
-      });
+      ctx.fillText(safeTopic, 62, 188);
     } else {
-      ctx.fillStyle = "#111A2E";
-      ctx.fillRect(80, 140, 864, 320);
-      ctx.strokeStyle = "#1E293B";
-      ctx.lineWidth = 2;
-      ctx.strokeRect(80, 140, 864, 320);
+      ctx.fillStyle = "#93C5FD";
+      ctx.font = "600 18px monospace";
+      ctx.fillText("TOPOLOGÍA MULTI-AGENTE", 62, 144);
 
-      ctx.fillStyle = "#38BDF8";
-      ctx.font = "bold 36px sans-serif";
-      ctx.fillText("SALA DISPONIBLE", 345, 275);
-      ctx.fillStyle = "#94A3B8";
-      ctx.font = "22px monospace";
-      ctx.fillText(
-        "Listo para sincronización de sprint · Pulsa 'Reunión'",
-        205,
-        332,
-      );
+      ctx.fillStyle = "#E2E8F0";
+      ctx.font = "600 22px sans-serif";
+      ctx.fillText("Flujo Coordinado · OpenCode Bridge", 62, 182);
     }
+
+    // Diagrama vectorial limpio de arquitectura (Tech Lead -> Bus -> Workers)
+    ctx.strokeStyle = "#475569";
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(316, 266);
+    ctx.lineTo(316, 316);
+    ctx.moveTo(156, 316);
+    ctx.lineTo(476, 316);
+    ctx.moveTo(156, 316);
+    ctx.lineTo(156, 354);
+    ctx.moveTo(316, 316);
+    ctx.lineTo(316, 354);
+    ctx.moveTo(476, 316);
+    ctx.lineTo(476, 354);
+    ctx.stroke();
+
+    const drawNode = (x, y, w, h, label, sub, accentCol) => {
+      ctx.fillStyle = "#1E293B";
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = accentCol;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillStyle = "#F1F5F9";
+      ctx.font = "600 15px sans-serif";
+      ctx.fillText(label, x + 14, y + 26);
+      ctx.fillStyle = "#94A3B8";
+      ctx.font = "12px monospace";
+      ctx.fillText(sub, x + 14, y + 46);
+    };
+
+    drawNode(206, 212, 220, 56, "Tech Lead", "Planner & Barrier", "#A78BFA");
+    drawNode(76, 354, 152, 60, "Frontend", "UI & WebGL", "#EAB308");
+    drawNode(240, 354, 152, 60, "Backend", "API & Events", "#38BDF8");
+    drawNode(404, 354, 152, 60, "QA / Sys", "Tests & CLI", "#FB923C");
+
+    ctx.fillStyle = "#94A3B8";
+    ctx.font = "15px monospace";
+    ctx.fillText(
+      mode === "MEETING"
+        ? "Barrera de encuentro sincronizada · 4 fases activas"
+        : "Listo para delegación y sincronización de sprint",
+      62,
+      482,
+    );
+
+    // Panel derecho: estado limpio de agentes
+    ctx.fillStyle = "#141E30";
+    ctx.fillRect(624, 98, 364, 434);
+    ctx.strokeStyle = "#243247";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(624, 98, 364, 434);
+
+    ctx.fillStyle = "#CBD5E1";
+    ctx.font = "600 18px monospace";
+    ctx.fillText("ESTADO DEL EQUIPO", 652, 142);
+
+    const defaultRoles = [
+      { id: "architect", name: "Tech Lead", color: "#8B5CF6", pct: 0.92 },
+      { id: "frontend", name: "Frontend", color: "#EAB308", pct: 0.85 },
+      { id: "qa", name: "DevOps / QA", color: "#9333EA", pct: 0.88 },
+      { id: "backend", name: "Backend", color: "#0284C7", pct: 0.78 },
+      { id: "systems", name: "Systems", color: "#EA580C", pct: 0.81 },
+    ];
+    const roles = defaultRoles.map((r) => {
+      for (const entry of this.stationScreens.values()) {
+        if (entry.agentConfig?.id === r.id) {
+          return {
+            ...r,
+            name: entry.agentConfig.name,
+            color: entry.agentConfig.color,
+          };
+        }
+      }
+      return r;
+    });
+    roles.forEach((r, i) => {
+      const y = 188 + i * 64;
+      ctx.fillStyle = "#E5E7EB";
+      ctx.font = "500 18px sans-serif";
+      ctx.fillText(r.name, 652, y);
+      ctx.fillStyle = "#1E293B";
+      ctx.fillRect(652, y + 12, 304, 12);
+      ctx.fillStyle = r.color;
+      ctx.fillRect(652, y + 12, Math.round(304 * r.pct), 12);
+    });
+
+    texture.needsUpdate = true;
+    return true;
+  }
+
+  _redrawMeetingWhiteboard() {
+    if (!this.whiteboardScreen) return false;
+    const { ctx, texture, canvas } = this.whiteboardScreen;
+
+    let stateSig = this.meetingScreen?.mode || "STANDBY";
+    const activeCards = [];
+    for (const entry of this.stationScreens.values()) {
+      if (entry.agentConfig) {
+        stateSig += `|${entry.agentConfig.id}:${entry.mode}:${entry.taskLabel || ""}`;
+        activeCards.push({
+          name: entry.agentConfig.name,
+          color: entry.agentConfig.color || "#3B82F6",
+          mode: entry.mode,
+          label: entry.taskLabel || "En curso",
+        });
+      }
+    }
+
+    if (stateSig === this.whiteboardScreen.lastRenderKey) {
+      return false;
+    }
+    this.whiteboardScreen.lastRenderKey = stateSig;
+
+    ctx.setTransform(canvas.width / 1024, 0, 0, canvas.height / 512, 0, 0);
+
+    // Tablero acrílico mate limpio
+    ctx.fillStyle = "#F8F6F1";
+    ctx.fillRect(0, 0, 1024, 512);
+
+    ctx.fillStyle = "#EAE4DA";
+    ctx.fillRect(0, 0, 1024, 58);
+    ctx.fillStyle = "#2E3540";
+    ctx.font = "bold 24px sans-serif";
+    ctx.fillText("TABLERO SPRINT · KANBAN", 32, 38);
+
+    ctx.fillStyle = "#6B7280";
+    ctx.font = "16px monospace";
+    ctx.fillText(
+      this.meetingScreen?.mode === "MEETING" ? "SYNC EN VIVO" : "FLUJO ACTIVO",
+      850,
+      36,
+    );
+
+    const cols = [
+      { title: "BACKLOG", color: "#64748B" },
+      { title: "EN CURSO", color: "#2563EB" },
+      { title: "REVISIÓN", color: "#D97706" },
+      { title: "HECHO", color: "#059669" },
+    ];
+
+    const colW = 224;
+    cols.forEach((c, idx) => {
+      const x = 30 + idx * 244;
+      ctx.fillStyle = "#EFECE6";
+      ctx.fillRect(x, 76, colW, 408);
+      ctx.fillStyle = c.color;
+      ctx.fillRect(x, 76, colW, 6);
+      ctx.fillStyle = "#1F2937";
+      ctx.font = "bold 16px monospace";
+      ctx.fillText(c.title, x + 14, 106);
+    });
+
+    const buckets = [[], [], [], []];
+    activeCards.forEach((card, i) => {
+      if (card.mode === "SUCCESS") buckets[3].push(card);
+      else if (card.mode === "REVIEWING" || card.mode === "ERROR") buckets[2].push(card);
+      else if (card.mode === "WORKING" || card.mode === "THINKING") buckets[1].push(card);
+      else buckets[i % 2 === 0 ? 0 : 1].push(card);
+    });
+
+    if (buckets[0].length === 0) {
+      buckets[0].push({ name: "Arquitectura", color: "#8B5CF6", label: "PBR & Iluminación" });
+    }
+    if (buckets[3].length === 0) {
+      buckets[3].push({ name: "Core 3D", color: "#059669", label: "Render 60 FPS" });
+    }
+
+    buckets.forEach((cards, colIdx) => {
+      const colX = 42 + colIdx * 244;
+      cards.slice(0, 3).forEach((card, cardIdx) => {
+        const y = 126 + cardIdx * 104;
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fillRect(colX, y, 200, 88);
+        ctx.strokeStyle = "#DCD6CC";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(colX, y, 200, 88);
+
+        ctx.fillStyle = card.color;
+        ctx.fillRect(colX, y, 8, 88);
+
+        ctx.fillStyle = "#111827";
+        ctx.font = "bold 15px sans-serif";
+        ctx.fillText(String(card.name).slice(0, 18), colX + 18, y + 30);
+
+        ctx.fillStyle = "#4B5563";
+        ctx.font = "13px sans-serif";
+        ctx.fillText(String(card.label).slice(0, 22), colX + 18, y + 58);
+      });
+    });
 
     texture.needsUpdate = true;
     return true;
@@ -847,23 +1049,28 @@ export class MonitorScreenSystem {
     ctx.setTransform(canvas.width / 768, 0, 0, canvas.height / 432, 0, 0);
 
     const grad = ctx.createLinearGradient(0, 0, 768, 432);
-    grad.addColorStop(0, "#0F172A");
-    grad.addColorStop(1, "#1E1B4B");
+    grad.addColorStop(0, "#151E2E");
+    grad.addColorStop(1, "#1F293D");
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, 768, 432);
 
-    // Visualizador ambiental suave
+    // Visualizador nórdico suave en tonos ámbar/salvia/pizarra
     for (let i = 0; i < 24; i++) {
-      const h = 36 + Math.abs(Math.sin(i * 0.45 + 0.6)) * 140;
-      ctx.fillStyle = i % 2 === 0 ? "rgba(56, 189, 248, 0.55)" : "rgba(167, 139, 250, 0.55)";
-      ctx.fillRect(64 + i * 27, 290 - h, 16, h);
+      const h = 34 + Math.abs(Math.sin(i * 0.45 + 0.6)) * 130;
+      ctx.fillStyle =
+        i % 3 === 0
+          ? "rgba(251, 191, 36, 0.48)"
+          : i % 3 === 1
+            ? "rgba(125, 211, 252, 0.44)"
+            : "rgba(110, 231, 183, 0.40)";
+      ctx.fillRect(64 + i * 27, 290 - h, 15, h);
     }
 
-    ctx.fillStyle = "#E2E8F0";
-    ctx.font = "bold 24px sans-serif";
+    ctx.fillStyle = "#F1EFE8";
+    ctx.font = "600 23px sans-serif";
     ctx.fillText("LOUNGE STUDIO · AMBIENT VISUALIZER", 64, 72);
     ctx.fillStyle = "#94A3B8";
-    ctx.font = "16px monospace";
+    ctx.font = "15px monospace";
     ctx.fillText("LO-FI TELEMETRY STREAM · PAUSA ACTIVA", 64, 102);
 
     texture.needsUpdate = true;
@@ -889,6 +1096,10 @@ export class MonitorScreenSystem {
     if (this.meetingScreen) {
       this.meetingScreen.texture?.dispose();
       this.meetingScreen.material?.dispose();
+    }
+    if (this.whiteboardScreen) {
+      this.whiteboardScreen.texture?.dispose();
+      this.whiteboardScreen.material?.dispose();
     }
     if (this.loungeScreen) {
       this.loungeScreen.texture?.dispose();

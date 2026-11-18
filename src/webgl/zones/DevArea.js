@@ -1,5 +1,12 @@
 import * as THREE from "three";
 import { fitModel } from "../utils/modelUtils.js";
+import {
+  createContactShadowDecal,
+  createDeskLamp,
+  createLaptopProp,
+  getProceduralPBRTextures,
+  NORDIC_PALETTE,
+} from "../utils/ProceduralTextures.js";
 
 export class DevArea {
   constructor(experience) {
@@ -18,6 +25,7 @@ export class DevArea {
     this._unitBoxGeo = new THREE.BoxGeometry(1, 1, 1);
     this._unitCylGeo = new THREE.CylinderGeometry(1, 1, 1, 8);
     this._unitPlaneGeo = new THREE.PlaneGeometry(1, 1);
+    this.pbr = getProceduralPBRTextures();
 
     // 1. Pod 1: Bancada Oeste (4 puestos)
     this.buildWorkbenchPod({
@@ -77,11 +85,15 @@ export class DevArea {
     const totalW = slotW * pairs;
     const totalD = 1.5;
 
-    // Tablero principal en nogal satinado
+    // Tablero principal en roble nórdico cálido satinado con micro-grano PBR
     const topMat = new THREE.MeshStandardMaterial({
-      color: "#382215",
-      roughness: 0.42,
-      metalness: 0.04,
+      color: "#9B6E46",
+      map: this.pbr.deskWoodColorMap,
+      roughnessMap: this.pbr.deskWoodRoughnessMap,
+      bumpMap: this.pbr.deskWoodBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.74,
+      metalness: 0.03,
     });
     const deskTop = new THREE.Mesh(
       new THREE.BoxGeometry(totalW, tableTopThickness, totalD),
@@ -92,10 +104,29 @@ export class DevArea {
     deskTop.receiveShadow = true;
     podGroup.add(deskTop);
 
-    // Panel divisor acústico central
+    // Sombra de contacto AO bajo cada bancada técnica
+    podGroup.add(
+      createContactShadowDecal(centerX, centerZ, totalW + 0.55, totalD + 0.55, 0.0135),
+    );
+
+    // Lámpara articulada nórdica centrada sobre el divisor de cada pod (1 por pod)
+    podGroup.add(
+      createDeskLamp(
+        centerX + (pairs === 2 ? 0.0 : -0.45),
+        tableH,
+        centerZ - 0.08,
+        0.25,
+        this.experience?.nightRig,
+      ),
+    );
+
+    // Panel divisor acústico en fieltro textil cálido
     const dividerMat = new THREE.MeshStandardMaterial({
-      color: "#20242D",
-      roughness: 0.85,
+      color: "#363D4A",
+      roughnessMap: this.pbr.carpetRoughnessMap,
+      bumpMap: this.pbr.carpetBumpMap,
+      bumpScale: 0.008,
+      roughness: 0.92,
     });
     const divider = new THREE.Mesh(
       new THREE.BoxGeometry(totalW - 0.04, 0.28, 0.025),
@@ -114,11 +145,12 @@ export class DevArea {
       totalW - 0.04,
     );
 
-    // Estructura de patas tubulares
+    // Estructura de patas tubulares en metal cepillado
     const legMat = new THREE.MeshStandardMaterial({
-      color: "#15171F",
-      roughness: 0.38,
-      metalness: 0.85,
+      color: "#22262E",
+      roughnessMap: this.pbr.brushedMetalRoughnessMap,
+      roughness: 0.42,
+      metalness: 0.84,
     });
 
     const legPositionsX =
@@ -172,7 +204,7 @@ export class DevArea {
         slotX: sx,
         centerZ: centerZ,
         isNorth: true,
-        chairTone: idx % 2 === 0 ? "#22262E" : "#2A2F38",
+        chairTone: NORDIC_PALETTE.chairsDev[(seatId) % NORDIC_PALETTE.chairsDev.length],
       });
 
       // Puesto Sur (sentado al sur, mirando al norte)
@@ -182,7 +214,7 @@ export class DevArea {
         slotX: sx,
         centerZ: centerZ,
         isNorth: false,
-        chairTone: idx % 2 === 0 ? "#2A2F38" : "#22262E",
+        chairTone: NORDIC_PALETTE.chairsDev[(seatId + 1) % NORDIC_PALETTE.chairsDev.length],
       });
     });
   }
@@ -290,13 +322,24 @@ export class DevArea {
         0,
       );
 
-      // 4. Hidratación a la izquierda (+X): Taza de café o Botella térmica alternada
+      // 4. Hidratación a la izquierda (+X): Taza de cerámica con variación tonal o Botella térmica
       if (stationIndex % 2 === 0) {
-        this.place(
+        const mug = this.place(
           "coffeeMug",
           { x: slotX + 0.44, y: tableY, z: centerZ - 0.48 },
           { maxDim: 0.1 },
         );
+        if (mug) {
+          const mugTone = NORDIC_PALETTE.mugs[stationIndex % NORDIC_PALETTE.mugs.length];
+          mug.traverse((c) => {
+            if (c.isMesh && c.material) {
+              c.material = c.material.clone();
+              c.material.color.set(mugTone);
+              c.material.roughnessMap = this.pbr.matteMicroRoughnessMap;
+              c.material.roughness = 0.52;
+            }
+          });
+        }
       } else {
         this.createThermalBottle(
           slotX + 0.44,
@@ -340,10 +383,14 @@ export class DevArea {
           if (child.isMesh && child.material) {
             child.material = child.material.clone();
             child.material.color.set(chairTone);
-            child.material.roughness = 0.52;
-            child.material.metalness = 0.05;
+            child.material.roughnessMap = this.pbr.carpetRoughnessMap;
+            child.material.roughness = 0.72;
+            child.material.metalness = 0.04;
           }
         });
+      }
+      if (stationIndex % 5 === 0) {
+        this.group.add(createLaptopProp(slotX - 0.44, tableY, centerZ - 0.24, 0.35, false));
       }
     } else {
       // === PUESTO SUR (Usuario en Z > centerZ, mira al NORTE -Z) ===
@@ -397,13 +444,24 @@ export class DevArea {
         Math.PI,
       );
 
-      // 4. Hidratación a la izquierda (-X): Taza de café o Botella térmica alternada
+      // 4. Hidratación a la izquierda (-X): Taza de cerámica con variación tonal o Botella térmica
       if (stationIndex % 2 === 1) {
-        this.place(
+        const mug = this.place(
           "coffeeMug",
           { x: slotX - 0.44, y: tableY, z: centerZ + 0.48 },
           { maxDim: 0.1 },
         );
+        if (mug) {
+          const mugTone = NORDIC_PALETTE.mugs[stationIndex % NORDIC_PALETTE.mugs.length];
+          mug.traverse((c) => {
+            if (c.isMesh && c.material) {
+              c.material = c.material.clone();
+              c.material.color.set(mugTone);
+              c.material.roughnessMap = this.pbr.matteMicroRoughnessMap;
+              c.material.roughness = 0.52;
+            }
+          });
+        }
       } else {
         this.createThermalBottle(
           slotX - 0.44,
@@ -447,8 +505,9 @@ export class DevArea {
           if (child.isMesh && child.material) {
             child.material = child.material.clone();
             child.material.color.set(chairTone);
-            child.material.roughness = 0.52;
-            child.material.metalness = 0.05;
+            child.material.roughnessMap = this.pbr.carpetRoughnessMap;
+            child.material.roughness = 0.72;
+            child.material.metalness = 0.04;
           }
         });
       }
@@ -707,9 +766,11 @@ export class DevArea {
   initVegetation() {
     // 1. Columna ciega 1 (Muro Oeste, entre Pod 3 y Pod 1)
     this.place("plantFiddleLeaf", { x: -11.45, y: 0, z: 3.2 }, { height: 1.5 });
+    this.group.add(createContactShadowDecal(-11.45, 3.2, 0.95, 0.95, 0.008));
 
     // 2. Columna ciega 2 (Muro Oeste, al sur de Pod 1)
     this.place("plantFlowerPot", { x: -11.45, y: 0, z: 7.2 }, { height: 1.15 });
+    this.group.add(createContactShadowDecal(-11.45, 7.2, 0.85, 0.85, 0.008));
 
     // 3. Esquina frontal libre suroeste
     this.place(
@@ -717,8 +778,10 @@ export class DevArea {
       { x: -11.45, y: 0, z: 8.4 },
       { height: 1.55 },
     );
+    this.group.add(createContactShadowDecal(-11.45, 8.4, 0.95, 0.95, 0.008));
 
     // 4. Cabecera este de la Isla Norte (suaviza la llegada al corredor vertical)
     this.place("plantFlowerPot", { x: -6.7, y: 0, z: 1.0 }, { height: 1.05 });
+    this.group.add(createContactShadowDecal(-6.7, 1.0, 0.82, 0.82, 0.008));
   }
 }
