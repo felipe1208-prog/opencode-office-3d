@@ -875,7 +875,8 @@ export class SimulationDirector {
     this.visualQueue.reset();
     this.activeDelegation = null;
     this.monitorSystem?.setMeetingState({ active: false });
-    for (const agent of this.characterManager.characters) {
+    for (const agent of this.characterManager?.characters || []) {
+      agent?.setHasPendingUserQuestion?.(false);
       const keepCp = agent.currentCheckpointId || agent.targetCheckpointId || null;
       checkpointManager.releaseAllByAgent(agent.config.id, {
         exceptCheckpointId: keepCp,
@@ -920,14 +921,25 @@ export class SimulationDirector {
 
       officeEventBus.on(OFFICE_EVENTS.OPENCODE_QUESTION, (payload) => {
         const attentionAgents = new Set();
-        for (const q of payload?.queue || []) {
+        const entries = Array.isArray(payload)
+          ? payload
+          : (payload?.entries ?? payload?.questions ?? payload?.queue ?? []);
+        for (const entry of Array.isArray(entries) ? entries : []) {
+          if (entry?.agentId) attentionAgents.add(entry.agentId);
+        }
+        for (const q of Array.isArray(payload?.queue) ? payload.queue : []) {
           if (q?.agentId) attentionAgents.add(q.agentId);
         }
-        for (const inq of payload?.inquiries || []) {
+        for (const inq of Array.isArray(payload?.inquiries)
+          ? payload.inquiries
+          : []) {
           if (inq?.agentId) attentionAgents.add(inq.agentId);
         }
-        for (const [id, agent] of this.characterManager.agents.entries()) {
-          agent?.setHasPendingUserQuestion?.(attentionAgents.has(id));
+        for (const agent of this.characterManager?.characters || []) {
+          const id = agent?.config?.id;
+          if (id) {
+            agent.setHasPendingUserQuestion?.(attentionAgents.has(id));
+          }
         }
       }),
 

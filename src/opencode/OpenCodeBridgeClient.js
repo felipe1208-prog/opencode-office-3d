@@ -1099,11 +1099,16 @@ export class OpenCodeBridgeClient {
   }
 
   _emitQuestionsState(added = false, item = null) {
+    const queue = this.getPendingQuestions();
+    const inquiries = this.getPendingInquiries();
+    const entries = [...queue, ...inquiries];
     officeEventBus.emit(
       OFFICE_EVENTS.OPENCODE_QUESTION,
       {
-        queue: this.getPendingQuestions(),
-        inquiries: this.getPendingInquiries(),
+        entries,
+        queue,
+        questions: queue,
+        inquiries,
         added,
         item,
       },
