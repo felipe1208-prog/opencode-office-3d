@@ -21,27 +21,27 @@ export const OPENCODE_JSON_SNIPPET = `{
     "architect": {
       "description": "Tech Lead que coordina arquitectura y delega tareas.",
       "mode": "primary",
-      "prompt": "Eres Tech Lead (architect). Analiza el problema y delega en @frontend, @backend, @qa o @systems usando la herramienta task."
+      "prompt": "Eres Tech Lead (architect). Analiza el problema y delega en @frontend, @backend, @qa o @systems usando la herramienta task. Si hay decisiones de negocio o arquitectura ambiguas, pregunta primero al usuario."
     },
     "frontend": {
       "description": "UI/UX, componentes web y escenas Three.js/WebGL.",
-      "mode": "subagent",
-      "prompt": "Eres Frontend Dev (@frontend). Implementas vistas, estilos y módulos 3D."
+      "mode": "all",
+      "prompt": "Eres Frontend Dev (@frontend). Implementas vistas, estilos y módulos 3D. Cuando recibas una tarea delegada con ambigüedades visuales, de paleta, layout o interacción, detente y haz una pregunta breve y concreta al usuario (usando la herramienta question o un mensaje directo claro) antes de asumir en silencio."
     },
     "qa": {
       "description": "Pruebas automatizadas, auditoría y revisión de código.",
-      "mode": "subagent",
-      "prompt": "Eres DevOps / QA (@qa). Verificas tests, compilación y calidad."
+      "mode": "all",
+      "prompt": "Eres DevOps / QA (@qa). Verificas tests, compilación y calidad. Si falta criterio de aceptación o alcance de pruebas en una tarea delegada, formula una pregunta breve al usuario antes de continuar."
     },
     "backend": {
       "description": "APIs, persistencia y lógica de negocio.",
-      "mode": "subagent",
-      "prompt": "Eres Backend Dev (@backend). Diseñas rutas, validaciones y servicios."
+      "mode": "all",
+      "prompt": "Eres Backend Dev (@backend). Diseñas rutas, validaciones y servicios. Cuando falten definiciones de esquema, endpoints o reglas de negocio en una tarea delegada, detente y pregunta al usuario de forma breve y concreta (mediante question o mensaje directo)."
     },
     "systems": {
       "description": "CLI, scripts, automatización e infraestructura.",
-      "mode": "subagent",
-      "prompt": "Eres Systems Dev (@systems). Construyes scripts CLI y puentes de integración."
+      "mode": "all",
+      "prompt": "Eres Systems Dev (@systems). Construyes scripts CLI y puentes de integración. Si existen dudas sobre rutas, entornos o permisos requeridos, consulta brevemente al usuario antes de ejecutar cambios."
     }
   }
 }`;
@@ -72,7 +72,7 @@ export function buildOpenCodeSetupReport({
   )
     .map((p) => {
       const list = Array.isArray(aliases[p.id]) ? aliases[p.id].join(", ") : p.id;
-      const modeLabel = p.id === "architect" ? "primary" : "subagent";
+      const modeLabel = p.id === "architect" ? "primary" : "all";
       return `| \`${p.id}\` | ${p.name} | ${p.role} | \`${modeLabel}\` | ${list} |`;
     })
     .join("\n");
@@ -89,7 +89,7 @@ Este documento reúne todo lo necesario para configurar los **5 agentes** en tu 
 | :--- | :--- | :--- | :--- | :--- |
 ${agentRows}
 
-> Si en tu OpenCode ya tienes agentes con otros nombres (por ejemplo \`code-reviewer\` o \`ui\`), puedes añadirlos separados por coma en **OpenCode → Mapeo (5 Agentes)** sin modificar el código de OpenCode.
+> Si en tu OpenCode ya tienes agentes con otros nombres (por ejemplo \`code-reviewer\` o \`ui\`), puedes añadirlos separados por coma en **Ajustes → Mapeo de agentes** sin modificar el código de OpenCode.
 
 ---
 
@@ -123,10 +123,12 @@ Si prefieres definir cada agente en su propio archivo Markdown dentro de \`.open
   Eres Tech Lead (architect). Analiza requerimientos y delega tareas especializadas en @frontend, @backend, @qa y @systems mediante la herramienta task.
   \`\`\`
 
-- **\`.opencode/agents/frontend.md\`** (\`mode: subagent\`)
-- **\`.opencode/agents/qa.md\`** (\`mode: subagent\`)
-- **\`.opencode/agents/backend.md\`** (\`mode: subagent\`)
-- **\`.opencode/agents/systems.md\`** (\`mode: subagent\`)
+- **\`.opencode/agents/frontend.md\`** (\`mode: all\` — permite recibir delegaciones y conversar directo con el usuario cuando tenga dudas visuales o funcionales)
+- **\`.opencode/agents/qa.md\`** (\`mode: all\`)
+- **\`.opencode/agents/backend.md\`** (\`mode: all\`)
+- **\`.opencode/agents/systems.md\`** (\`mode: all\`)
+
+> **Importante para consultas proactivas:** incluye en las instrucciones de tus agentes que, ante cualquier ambigüedad visual o funcional en una tarea delegada, detengan un momento y hagan una pregunta breve y concreta al usuario usando \`question\` o un mensaje directo antes de asumir en silencio.
 
 *(Nota: si usas la alternativa Markdown, recuerda mantener el bloque \`"server"\` con \`"cors"\` dentro de \`opencode.json\`).*
 

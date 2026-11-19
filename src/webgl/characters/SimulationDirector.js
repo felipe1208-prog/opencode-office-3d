@@ -890,6 +890,7 @@ export class SimulationDirector {
           label: "Disponible",
           onSeated: () => {
             agent.taskAccentColor = null;
+            agent.setHasPendingUserQuestion?.(false);
             this.monitorSystem?.setAgentScreenState(agent.config.id, {
               mode: "WORKING",
               taskLabel: "En espera",
@@ -914,6 +915,19 @@ export class SimulationDirector {
         }
         if (nextStatus) {
           this._lastOpenCodeStatus = nextStatus;
+        }
+      }),
+
+      officeEventBus.on(OFFICE_EVENTS.OPENCODE_QUESTION, (payload) => {
+        const attentionAgents = new Set();
+        for (const q of payload?.queue || []) {
+          if (q?.agentId) attentionAgents.add(q.agentId);
+        }
+        for (const inq of payload?.inquiries || []) {
+          if (inq?.agentId) attentionAgents.add(inq.agentId);
+        }
+        for (const [id, agent] of this.characterManager.agents.entries()) {
+          agent?.setHasPendingUserQuestion?.(attentionAgents.has(id));
         }
       }),
 

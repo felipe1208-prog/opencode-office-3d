@@ -4,56 +4,85 @@ import { DEFAULT_AGENT_ALIASES } from "./openCodeTemplates.js";
 
 const STORAGE_KEY = "oficina3d:opencode_config:v1";
 const DISMISSED_QUESTIONS_STORAGE_KEY = "oficina3d:opencode_dismissed_questions:v1";
+const DISMISSED_INQUIRIES_STORAGE_KEY = "oficina3d:opencode_dismissed_inquiries:v1";
 const MAX_PERSISTED_DISMISSED_IDS = 250;
 const WATCHDOG_SILENCE_MS = 30000;
 const WATCHDOG_CHECK_INTERVAL_MS = 5000;
 const AGENT_THROTTLE_MS = 250;
 const IDLE_DEBOUNCE_MS = 3000;
 const MAX_SESSION_LOG_ENTRIES = 200;
+const TEAM_AGENT_IDS = ["architect", "frontend", "qa", "backend", "systems"];
 
-function extractReasoningExcerpt(rawText) {
-  const cleaned = String(rawText || "").replace(/\s+/g, " ").trim();
-  if (!cleaned) return "";
-  const segments = cleaned
-    .split(/[.!?\n]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const candidate = segments[segments.length - 1] || cleaned;
-  if (candidate.length <= 28) return candidate;
-  return `…${candidate.slice(-27).trimStart()}`;
+function extractCleanInquiryExcerpt(rawText, maxLen = 135) {
+  const clean = String(rawText || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/[*_~>-]{1,3}/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) return "";
+  if (clean.length <= maxLen) return clean;
+  return `${clean.slice(0, maxLen - 1).trimEnd()}…`;
 }
 
-const TOOL_LABELS_ES = {
-  read: "Leyendo código",
-  view: "Leyendo código",
-  edit: "Editando archivo",
-  multi_edit: "Editando archivos",
-  apply_patch: "Aplicando parche",
-  write: "Escribiendo código",
-  patch: "Aplicando parche",
-  bash: "Ejecutando terminal",
-  shell: "Ejecutando terminal",
-  run: "Ejecutando comando",
-  grep: "Buscando referencias",
-  search: "Buscando código",
-  glob: "Explorando archivos",
-  find: "Explorando archivos",
-  list: "Listando directorio",
-  ls: "Listando directorio",
-  task: "Delegando subtarea",
-  subagent: "Delegando subtarea",
-  question: "Esperando respuesta en CLI",
-  webfetch: "Consultando docs",
-  fetch: "Consultando docs",
-  todowrite: "Actualizando plan",
-  todoread: "Leyendo plan",
-};
+function looksLikeDirectQuestion(rawText) {
+  const clean = extractCleanInquiryExcerpt(rawText, 600);
+  if (!clean) return false;
+  if (/[¿?]/.test(clean)) return true;
+  return /\b(prefieres|quieres que|confirmas|te parece|elige|ind[ií]came|dime si|cu[aá]l prefieres|which option|would you like|do you want|please confirm|let me know)\b/i.test(
+    clean,
+  );
+}
+
+function hashTextShort(text) {
+  const str = String(text || "");
+  let hash = 2166136261;
+  for (let i = 0; i < str.length; i += 1) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function safeReadLruIds(storageKey) {
+  try {
+    if (typeof localStorage === "undefined") return [];
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+      .slice(-MAX_PERSISTED_DISMISSED_IDS);
+  } catch {
+    return [];
+  }
+}
+
+function safeWriteLruIds(storageKey, idSet) {
+  try {
+    if (typeof localStorage === "undefined") return;
+    const list = Array.from(idSet || [])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+      .slice(-MAX_PERSISTED_DISMISSED_IDS);
+    localStorage.setItem(storageKey, JSON.stringify(list));
+  } catch {
+    // Ignorar error de cuota
+  }
+}
 
 function safeReadConfig() {
   try {
     if (typeof localStorage === "undefined") return null;
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
   } catch {
     return null;
   }
@@ -69,32 +98,11 @@ function safeWriteConfig(cfg) {
 }
 
 function safeReadDismissedQuestionIds() {
-  try {
-    if (typeof localStorage === "undefined") return [];
-    const raw = localStorage.getItem(DISMISSED_QUESTIONS_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .map((id) => String(id || "").trim())
-      .filter(Boolean)
-      .slice(-MAX_PERSISTED_DISMISSED_IDS);
-  } catch {
-    return [];
-  }
+  return safeReadLruIds(DISMISSED_QUESTIONS_STORAGE_KEY);
 }
 
 function safeWriteDismissedQuestionIds(idSet) {
-  try {
-    if (typeof localStorage === "undefined") return;
-    const list = Array.from(idSet || [])
-      .map((id) => String(id || "").trim())
-      .filter(Boolean)
-      .slice(-MAX_PERSISTED_DISMISSED_IDS);
-    localStorage.setItem(DISMISSED_QUESTIONS_STORAGE_KEY, JSON.stringify(list));
-  } catch {
-    // Ignorar error de cuota
-  }
+  safeWriteLruIds(DISMISSED_QUESTIONS_STORAGE_KEY, idSet);
 }
 
 function cloneDefaultAliases() {
@@ -186,9 +194,13 @@ export class OpenCodeBridgeClient {
     this.activeAgents = new Set();
     this.pendingPermissions = new Map();
     this.pendingQuestions = new Map();
+    this.pendingInquiries = new Map();
     this.questionCallIdMap = new Map();
     this.dismissedQuestionIds = new Set(safeReadDismissedQuestionIds());
+    this.dismissedInquiryIds = new Set(safeReadLruIds(DISMISSED_INQUIRIES_STORAGE_KEY));
     this.dismissedSignatureExpiresAt = new Map();
+    this.agentPreferredSessionMap = new Map();
+    this.currentlyViewedThread = { agentId: null, sessionId: null, chatOpen: false };
     this.questionSyncInFlight = new Map();
     this.questionSyncLastAt = new Map();
     this.liveTaskMeta = new Map(); // externalKey -> { title, file }
@@ -683,6 +695,7 @@ export class OpenCodeBridgeClient {
     if (resolvedChildAgent) {
       this.taskCallsByChildSession.set(childSessionId, resolvedChildAgent);
       this.sessionAgentMap.set(childSessionId, resolvedChildAgent);
+      this._trackAgentSession(resolvedChildAgent, childSessionId, { forcePreferred: true });
     }
 
     const parentLogs = this.sessionLogsById.get(parentSessionId);
@@ -742,6 +755,74 @@ export class OpenCodeBridgeClient {
     );
   }
 
+  _trackAgentSession(agentId, sessionId, { forcePreferred = false } = {}) {
+    if (!agentId || !sessionId) return;
+    const canonical = this.resolveAgentId(agentId);
+    if (!canonical || !TEAM_AGENT_IDS.includes(canonical)) return;
+    const prevSid = this.agentPreferredSessionMap.get(canonical);
+    if (forcePreferred || !prevSid || !this.sessionsById.has(prevSid)) {
+      this.agentPreferredSessionMap.set(canonical, sessionId);
+    }
+  }
+
+  getPreferredSessionForAgent(agentId) {
+    const canonical = this.resolveAgentId(agentId) || agentId;
+    if (!canonical) return null;
+    const tracked = this.agentPreferredSessionMap.get(canonical);
+    if (tracked && this.sessionsById.has(tracked)) {
+      return tracked;
+    }
+
+    const sessions = this.getSessions();
+    const match = sessions.find((s) => {
+      const resolved =
+        this.taskCallsByChildSession.get(s.id) ||
+        this.resolveAgentId(this.sessionAgentMap.get(s.id)) ||
+        this.resolveAgentId(s.agent) ||
+        this._inferSubagentFromText(s.title);
+      if (canonical === "architect") {
+        return !s.parentID && (!resolved || resolved === "architect");
+      }
+      return resolved === canonical;
+    });
+    if (match?.id) {
+      this.agentPreferredSessionMap.set(canonical, match.id);
+      return match.id;
+    }
+    return null;
+  }
+
+  getPendingInquiries() {
+    return Array.from(this.pendingInquiries.values()).sort(
+      (a, b) => (b.createdAt || 0) - (a.createdAt || 0),
+    );
+  }
+
+  getAgentThreadsSnapshot() {
+    const questions = this.getPendingQuestions();
+    const inquiries = this.getPendingInquiries();
+    const threads = {};
+
+    for (const agentId of TEAM_AGENT_IDS) {
+      const sid = this.getPreferredSessionForAgent(agentId);
+      const qCount = questions.filter((q) => q.agentId === agentId).length;
+      const inqCount = inquiries.filter((i) => i.agentId === agentId).length;
+      const isBusy =
+        Boolean(sid && this.busySessions.has(sid)) ||
+        Array.from(this.busySessions.values()).includes(agentId);
+
+      threads[agentId] = {
+        agentId,
+        sessionId: sid,
+        isBusy,
+        pendingQuestionsCount: qCount,
+        pendingInquiriesCount: inqCount,
+        hasAttention: qCount + inqCount > 0,
+      };
+    }
+    return threads;
+  }
+
   getSnapshot() {
     return {
       status: this.status,
@@ -756,6 +837,8 @@ export class OpenCodeBridgeClient {
       sessions: this.getSessions(),
       pendingPermissions: this.getPendingPermissions(),
       pendingQuestions: this.getPendingQuestions(),
+      pendingInquiries: this.getPendingInquiries(),
+      agentThreads: this.getAgentThreadsSnapshot(),
       sessionHistoryStates: Object.fromEntries(this.sessionHistoryState.entries()),
       childSessionsByParent: Object.fromEntries(
         Array.from(this.childSessionsByParent.entries()).map(([k, set]) => [
@@ -1020,12 +1103,128 @@ export class OpenCodeBridgeClient {
       OFFICE_EVENTS.OPENCODE_QUESTION,
       {
         queue: this.getPendingQuestions(),
+        inquiries: this.getPendingInquiries(),
         added,
         item,
       },
       "opencode-sse",
     );
     this._emitConnectionState();
+  }
+
+  _markInquiryDismissedLru(inquiryId) {
+    const clean = String(inquiryId || "").trim();
+    if (!clean) return;
+    if (this.dismissedInquiryIds.has(clean)) {
+      this.dismissedInquiryIds.delete(clean);
+    }
+    this.dismissedInquiryIds.add(clean);
+    while (this.dismissedInquiryIds.size > MAX_PERSISTED_DISMISSED_IDS) {
+      const oldest = this.dismissedInquiryIds.values().next().value;
+      if (!oldest) break;
+      this.dismissedInquiryIds.delete(oldest);
+    }
+    safeWriteLruIds(DISMISSED_INQUIRIES_STORAGE_KEY, this.dismissedInquiryIds);
+  }
+
+  setViewedThread({ agentId = null, sessionId = null, chatOpen = false } = {}) {
+    this.currentlyViewedThread = {
+      agentId: agentId ? this.resolveAgentId(agentId) || agentId : null,
+      sessionId: sessionId || null,
+      chatOpen: Boolean(chatOpen),
+    };
+    if (this.currentlyViewedThread.chatOpen && this.currentlyViewedThread.agentId) {
+      this.markAgentThreadViewed(
+        this.currentlyViewedThread.agentId,
+        this.currentlyViewedThread.sessionId,
+      );
+    }
+  }
+
+  markAgentThreadViewed(agentId, sessionId = null) {
+    const canonical = this.resolveAgentId(agentId) || agentId;
+    if (!canonical && !sessionId) return 0;
+    let removedCount = 0;
+    for (const [id, inq] of Array.from(this.pendingInquiries.entries())) {
+      const matchesAgent = canonical && inq.agentId === canonical;
+      const matchesSession = sessionId && inq.sessionID === sessionId;
+      if (matchesAgent || matchesSession) {
+        this._markInquiryDismissedLru(id);
+        this.pendingInquiries.delete(id);
+        removedCount += 1;
+      }
+    }
+    if (removedCount > 0) {
+      this._emitQuestionsState(false, null);
+    }
+    return removedCount;
+  }
+
+  dismissInquiry(inquiryId) {
+    const clean = String(inquiryId || "").trim();
+    if (!clean) return { ok: true, dismissed: false };
+    this._markInquiryDismissedLru(clean);
+    const existed = this.pendingInquiries.delete(clean);
+    if (existed) {
+      this._emitQuestionsState(false, null);
+    }
+    return { ok: true, dismissed: existed };
+  }
+
+  _maybeRegisterSpecialistInquiry({
+    sessionId = null,
+    agentId = null,
+    messageId = null,
+    text = "",
+    onlyIfQuestion = false,
+  } = {}) {
+    const canonical = this.resolveAgentId(agentId) || agentId;
+    if (!canonical || canonical === "architect") return null;
+    if (!sessionId || !text) return null;
+
+    const excerpt = extractCleanInquiryExcerpt(text, 140);
+    if (!excerpt) return null;
+
+    const isQuestion = looksLikeDirectQuestion(text);
+    if (onlyIfQuestion && !isQuestion) return null;
+
+    // Si el usuario ya tiene una pregunta estructurada (question/form) activa en esa sesión, no duplicar aviso libre
+    for (const q of this.pendingQuestions.values()) {
+      if (q.sessionID === sessionId || q.agentId === canonical) {
+        return null;
+      }
+    }
+
+    const fingerprint = `inq_${sessionId}_${messageId ? String(messageId) : hashTextShort(excerpt)}`;
+    if (this.dismissedInquiryIds.has(fingerprint)) return null;
+
+    // Si el usuario ya está mirando exactamente el chat abierto de este agente o sesión, marcar visto sin notificar
+    const viewed = this.currentlyViewedThread;
+    if (
+      viewed.chatOpen &&
+      (viewed.agentId === canonical || (viewed.sessionId && viewed.sessionId === sessionId))
+    ) {
+      this._markInquiryDismissedLru(fingerprint);
+      return null;
+    }
+
+    if (this.pendingInquiries.has(fingerprint)) {
+      return this.pendingInquiries.get(fingerprint);
+    }
+
+    const inquiry = {
+      id: fingerprint,
+      sessionID: sessionId,
+      agentId: canonical,
+      excerpt,
+      fullText: String(text),
+      isQuestionText: isQuestion,
+      createdAt: Date.now(),
+    };
+    this.pendingInquiries.set(fingerprint, inquiry);
+    this._trackAgentSession(canonical, sessionId, { forcePreferred: true });
+    this._emitQuestionsState(true, inquiry);
+    return inquiry;
   }
 
   _parseJsonSafe(val) {
@@ -1585,6 +1784,20 @@ export class OpenCodeBridgeClient {
       });
     }
 
+    if (this.pendingInquiries.size > 0) {
+      for (const [inqId, inq] of Array.from(this.pendingInquiries.entries())) {
+        const inqSid = inq?.sessionID || null;
+        if (
+          !sessionId ||
+          inqSid === sessionId ||
+          Boolean(childSet?.has(inqSid))
+        ) {
+          this._markInquiryDismissedLru(inqId);
+          this.pendingInquiries.delete(inqId);
+        }
+      }
+    }
+
     this._emitQuestionsState(false, removedItems[removedItems.length - 1]);
     return removedItems;
   }
@@ -1623,6 +1836,22 @@ export class OpenCodeBridgeClient {
     if (sessionId) {
       this._cancelSessionIdleTimer(sessionId);
       this.busySessions.delete(sessionId);
+    }
+    if (status === "passed" && sessionId && agentId && agentId !== "architect") {
+      const logs = this.sessionLogsById.get(sessionId) || [];
+      for (let i = logs.length - 1; i >= 0; i -= 1) {
+        const entry = logs[i];
+        if (entry?.kind === "text" && entry.content && entry.agentId === agentId) {
+          this._maybeRegisterSpecialistInquiry({
+            sessionId,
+            agentId,
+            messageId: entry.sourceKey || entry.id,
+            text: entry.content,
+            onlyIfQuestion: false,
+          });
+          break;
+        }
+      }
     }
     if (agentId) {
       this._emitLiveKanbanSync({
@@ -1703,6 +1932,7 @@ export class OpenCodeBridgeClient {
       if (partMeta.sessionId) {
         this.taskCallsByChildSession.set(partMeta.sessionId, tier1Resolved);
         this.sessionAgentMap.set(partMeta.sessionId, tier1Resolved);
+        this._trackAgentSession(tier1Resolved, partMeta.sessionId, { forcePreferred: true });
       }
       if (sessionId && part?.agent && !isDelegation) {
         this.sessionAgentMap.set(sessionId, part.agent);
@@ -1804,6 +2034,9 @@ export class OpenCodeBridgeClient {
 
     if (agentHint) {
       this.sessionAgentMap.set(sessionObj.id, agentHint);
+      if (!parentID) {
+        this._trackAgentSession(agentHint, sessionObj.id);
+      }
     }
 
     if (parentID) {
@@ -2252,6 +2485,24 @@ export class OpenCodeBridgeClient {
           fullText: chunk || undefined,
           status: "done",
         });
+        if (agentId !== "architect") {
+          const logs = this.sessionLogsById.get(sid) || [];
+          const doneEntry = logs.find(
+            (e) =>
+              e.kind === "text" &&
+              ((sourceKey && e.sourceKey === sourceKey) || e.streamKey === streamId),
+          );
+          const fullText = doneEntry?.content || chunk;
+          if (fullText) {
+            this._maybeRegisterSpecialistInquiry({
+              sessionId: sid,
+              agentId,
+              messageId: sourceKey || streamId,
+              text: fullText,
+              onlyIfQuestion: true,
+            });
+          }
+        }
       }
 
       this._emitLiveKanbanSync({
@@ -2719,6 +2970,24 @@ export class OpenCodeBridgeClient {
             status: isDone ? "done" : "running",
             replaceContent: Boolean(partText),
           });
+          if (isDone && agentId !== "architect") {
+            const logs = this.sessionLogsById.get(sid) || [];
+            const doneEntry = logs.find(
+              (e) =>
+                e.kind === "text" &&
+                ((sourceKey && e.sourceKey === sourceKey) || e.streamKey === streamId),
+            );
+            const fullText = doneEntry?.content || partText;
+            if (fullText) {
+              this._maybeRegisterSpecialistInquiry({
+                sessionId: sid,
+                agentId,
+                messageId: sourceKey || streamId,
+                text: fullText,
+                onlyIfQuestion: true,
+              });
+            }
+          }
           this._emitLiveKanbanSync({
             sessionId: sid,
             agentId,
@@ -3951,7 +4220,16 @@ export class OpenCodeBridgeClient {
             ) {
               continue;
             }
-            const added = this._addPendingQuestion(q, sessionId);
+            const resolvedSessionAgent =
+              sessionId &&
+              (this.taskCallsByChildSession.get(sessionId) ||
+                this.resolveAgentId(this.sessionAgentMap.get(sessionId)) ||
+                this.resolveAgentId(this.sessionsById.get(sessionId)?.agent));
+            const enrichedQuestion =
+              resolvedSessionAgent && !q.agentId && !q.agent
+                ? { ...q, agentId: resolvedSessionAgent }
+                : q;
+            const added = this._addPendingQuestion(enrichedQuestion, sessionId);
             if (added) addedAny = true;
           }
           if (addedAny) break;
@@ -3969,6 +4247,33 @@ export class OpenCodeBridgeClient {
     } finally {
       this.questionSyncInFlight.delete(syncKey);
     }
+  }
+
+  async syncAllActiveSessionsQuestions(signal, { force = false } = {}) {
+    const candidateSids = new Set();
+    if (this.activeSessionId) candidateSids.add(this.activeSessionId);
+    for (const sid of this.busySessions.keys()) {
+      if (sid) candidateSids.add(sid);
+    }
+    for (const childSet of this.childSessionsByParent.values()) {
+      for (const cid of childSet) {
+        if (cid) candidateSids.add(cid);
+      }
+    }
+    for (const sid of this.agentPreferredSessionMap.values()) {
+      if (sid) candidateSids.add(sid);
+    }
+
+    const targets = Array.from(candidateSids).slice(0, 8);
+    if (targets.length === 0) {
+      return this.syncPendingQuestions(null, signal, { force });
+    }
+    await Promise.all(
+      targets.map((sid) =>
+        this.syncPendingQuestions(sid, signal, { force }).catch(() => []),
+      ),
+    );
+    return this.getPendingQuestions();
   }
 
   _normalizeHistoryMessages(rawList, sessionId) {
@@ -4367,7 +4672,7 @@ export class OpenCodeBridgeClient {
     return promise;
   }
 
-  async createSession({ title = "", agent = "architect" } = {}) {
+  async createSession({ title = "", agent = "architect", purgeOthers = false } = {}) {
     const baseUrl = this.getActiveBaseUrl();
     const caps =
       this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
@@ -4436,15 +4741,22 @@ export class OpenCodeBridgeClient {
       const rawJson = await resp.json();
       const session = this._unwrapResponseData(rawJson);
       if (session?.id) {
-        this._purgePendingQuestions({
-          exceptSessionId: session.id,
-          reason: "new_session",
-          kanbanLabel: "Sesión anterior cerrada",
-          taskLabel: "Nueva sesión activa",
-        });
-        if (agent) this.sessionAgentMap.set(session.id, agent);
+        if (purgeOthers) {
+          this._purgePendingQuestions({
+            exceptSessionId: session.id,
+            reason: "new_session",
+            kanbanLabel: "Sesión anterior cerrada",
+            taskLabel: "Nueva sesión activa",
+          });
+        }
+        if (agent) {
+          this.sessionAgentMap.set(session.id, agent);
+          this._trackAgentSession(agent, session.id, { forcePreferred: true });
+        }
         this._upsertSessionRecord({ ...session, agent: session.agent || agent });
-        this.activeSessionId = session.id;
+        if (!agent || agent === "architect" || !this.activeSessionId) {
+          this.activeSessionId = session.id;
+        }
         this._emitConnectionState();
         return session;
       }
@@ -4551,7 +4863,12 @@ export class OpenCodeBridgeClient {
     return candidates;
   }
 
-  async sendPrompt({ sessionId = null, agent = "architect", text = "" } = {}) {
+  async sendPrompt({
+    sessionId = null,
+    agent = "architect",
+    text = "",
+    useActiveFallback = true,
+  } = {}) {
     const cleanText = String(text || "").trim();
     if (!cleanText) {
       return { ok: false, error: "Escribe una instrucción antes de enviar." };
@@ -4561,12 +4878,14 @@ export class OpenCodeBridgeClient {
     const caps =
       this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
 
-    let targetSessionId = sessionId || this.activeSessionId;
+    let targetSessionId =
+      sessionId || (useActiveFallback ? this.activeSessionId : null);
     if (!targetSessionId) {
       try {
         const created = await this.createSession({
           title: cleanText.slice(0, 36),
           agent,
+          purgeOthers: false,
         });
         targetSessionId = created?.id;
       } catch (createErr) {
@@ -4581,9 +4900,13 @@ export class OpenCodeBridgeClient {
       return { ok: false, error: "No se pudo obtener una sesión activa." };
     }
 
-    this.activeSessionId = targetSessionId;
+    if (!this.activeSessionId || agent === "architect") {
+      this.activeSessionId = targetSessionId;
+    }
     if (agent) {
       this.sessionAgentMap.set(targetSessionId, agent);
+      this._trackAgentSession(agent, targetSessionId, { forcePreferred: true });
+      this.markAgentThreadViewed(agent, targetSessionId);
       this._upsertSessionRecord({
         id: targetSessionId,
         agent,
@@ -5032,6 +5355,9 @@ export class OpenCodeBridgeClient {
       }
       this._removePendingQuestion(targetId);
       this._removePendingQuestion(requestId);
+      if (item.agentId || item.sessionID) {
+        this.markAgentThreadViewed(item.agentId, item.sessionID);
+      }
       if (item.sessionID) {
         this._markQuestionToolEntryDone(item.sessionID, item.callID);
         if (appendPromptLog) {
@@ -5445,12 +5771,12 @@ export class OpenCodeBridgeClient {
         }
       }
 
-      // Sincronizar solo permisos/preguntas activos sin hidratar automáticamente el historial de chats viejos
+      // Sincronizar permisos/preguntas activos en raíz y subsesiones hijas sin hidratar chats viejos completos
       await Promise.all([
         this.activeSessionId
           ? this.syncSessionPermissions(this.activeSessionId, signal).catch(() => [])
           : Promise.resolve([]),
-        this.syncPendingQuestions(this.activeSessionId || null, signal).catch(() => []),
+        this.syncAllActiveSessionsQuestions(signal).catch(() => []),
       ]);
       this._emitConnectionState();
     } catch (err) {
@@ -5653,6 +5979,8 @@ export class OpenCodeBridgeClient {
     this.busySessions.clear();
     this.pendingPermissions.clear();
     this.pendingQuestions.clear();
+    this.pendingInquiries.clear();
+    this.agentPreferredSessionMap.clear();
     this.questionCallIdMap.clear();
     this.questionSyncInFlight.clear();
     this.questionSyncLastAt.clear();

@@ -102,30 +102,74 @@ const profileMap = computed(() =>
   Object.fromEntries(profiles.value.map((p) => [p.id, p])),
 );
 
-const activePermission = computed(
-  () => openCodeState.value.pendingPermissions?.[0] || null,
+const pendingPermissions = computed(
+  () => openCodeState.value.pendingPermissions || [],
 );
 
-const activeQuestion = computed(
-  () => openCodeState.value.pendingQuestions?.[0] || null,
+const pendingQuestions = computed(
+  () => openCodeState.value.pendingQuestions || [],
 );
+
+const pendingInquiries = computed(
+  () => openCodeState.value.pendingInquiries || [],
+);
+
+const activePermission = computed(() => pendingPermissions.value[0] || null);
+
+const activeLogSessionId = computed(() => {
+  if (commandForm.sessionId) return commandForm.sessionId;
+  const preferred =
+    openCodeState.value.agentThreads?.[commandForm.agent]?.sessionId;
+  if (preferred) return preferred;
+  if (commandForm.agent === "architect") {
+    return openCodeState.value.activeSessionId || "";
+  }
+  return "";
+});
+
+const currentThreadQuestion = computed(() => {
+  const currentAgent = commandForm.agent || "architect";
+  const sid = activeLogSessionId.value;
+  return (
+    pendingQuestions.value.find(
+      (q) => q.agentId === currentAgent || (sid && q.sessionID === sid),
+    ) || null
+  );
+});
+
+const toastQuestion = computed(() => {
+  if (!pendingQuestions.value.length) return null;
+  if (!isChatOpen.value) return pendingQuestions.value[0];
+  const currentAgent = commandForm.agent || "architect";
+  return pendingQuestions.value.find((q) => q.agentId !== currentAgent) || null;
+});
+
+const toastInquiry = computed(() => {
+  if (!pendingInquiries.value.length) return null;
+  const currentAgent = commandForm.agent || "architect";
+  const blockedAgent = toastQuestion.value?.agentId || null;
+  return (
+    pendingInquiries.value.find((inq) => {
+      if (blockedAgent && inq.agentId === blockedAgent) return false;
+      if (!isChatOpen.value) return true;
+      return inq.agentId !== currentAgent;
+    }) || null
+  );
+});
 
 const pendingAttentionCount = computed(
   () =>
-    (openCodeState.value.pendingPermissions?.length || 0) +
-    (openCodeState.value.pendingQuestions?.length || 0),
+    pendingPermissions.value.length +
+    pendingQuestions.value.length +
+    pendingInquiries.value.length,
 );
 
 const blockedCliAlerts = computed(() => {
   const permSessions = new Set(
-    (openCodeState.value.pendingPermissions || [])
-      .map((p) => p.sessionID)
-      .filter(Boolean),
+    pendingPermissions.value.map((p) => p.sessionID).filter(Boolean),
   );
   const questionSessions = new Set(
-    (openCodeState.value.pendingQuestions || [])
-      .map((q) => q.sessionID)
-      .filter(Boolean),
+    pendingQuestions.value.map((q) => q.sessionID).filter(Boolean),
   );
   return tasks.value
     .filter(
@@ -138,10 +182,6 @@ const blockedCliAlerts = computed(() => {
     )
     .slice(0, 2);
 });
-
-const activeLogSessionId = computed(
-  () => commandForm.sessionId || openCodeState.value.activeSessionId || "",
-);
 
 const activeHistoryState = computed(() => {
   const sid = activeLogSessionId.value;
@@ -168,6 +208,12 @@ const isChatBusy = computed(() => {
   if (isSendingPrompt.value || isInterrupting.value) return true;
   const sid = activeLogSessionId.value;
   if (sid && openCodeState.value && openCodeBridge.busySessions?.has(sid)) {
+    return true;
+  }
+  if (
+    openCodeState.value.agentThreads?.[commandForm.agent]?.isBusy &&
+    (!sid || openCodeState.value.agentThreads?.[commandForm.agent]?.sessionId === sid)
+  ) {
     return true;
   }
   if (
@@ -255,15 +301,51 @@ function getAgentChipStyle(agent) {
   return {};
 }
 
+function getAgentThreadInfo(agentId) {
+  return (
+    openCodeState.value.agentThreads?.[agentId] || {
+      agentId,
+      sessionId: null,
+      isBusy: false,
+      pendingQuestionsCount: 0,
+      pendingInquiriesCount: 0,
+      hasAttention: false,
+    }
+  );
+}
+
+function hasAgentAttention(agentId) {
+  if (!agentId) return false;
+  if (getAgentThreadInfo(agentId).hasAttention) return true;
+  if (pendingPermissions.value.some((p) => p.agentId === agentId)) {
+    return true;
+  }
+  return false;
+}
+
+function formatMemberOptionLabel(agent) {
+  if (!agent) return "";
+  if (hasAgentAttention(agent.id)) {
+    return `${agent.name} · consulta`;
+  }
+  if (
+    getAgentThreadInfo(agent.id).isBusy ||
+    openCodeState.value.activeAgents.includes(agent.id)
+  ) {
+    return `${agent.name} · trabajando`;
+  }
+  return agent.name;
+}
+
 function formatHumanAgentState(snap) {
   if (!snap) return "Disponible";
 
-  const hasQuestion = (openCodeState.value.pendingQuestions || []).some(
-    (q) => q.agentId === snap.id,
-  );
+  const hasQuestion =
+    pendingQuestions.value.some((q) => q.agentId === snap.id) ||
+    pendingInquiries.value.some((inq) => inq.agentId === snap.id);
   if (hasQuestion) return "Esperando tu respuesta";
 
-  const hasPermission = (openCodeState.value.pendingPermissions || []).some(
+  const hasPermission = pendingPermissions.value.some(
     (p) => p.agentId === snap.id,
   );
   if (hasPermission) return "Esperando autorización";
@@ -318,11 +400,16 @@ function formatHumanAgentState(snap) {
 function getAgentHumanTaskSummary(snap) {
   if (!snap) return "Disponible";
 
-  const pendingQ = (openCodeState.value.pendingQuestions || []).find(
-    (q) => q.agentId === snap.id,
-  );
+  const pendingQ = pendingQuestions.value.find((q) => q.agentId === snap.id);
   if (pendingQ?.questions?.[0]?.question) {
     return pendingQ.questions[0].question;
+  }
+
+  const pendingInq = pendingInquiries.value.find(
+    (inq) => inq.agentId === snap.id,
+  );
+  if (pendingInq?.excerpt) {
+    return pendingInq.excerpt;
   }
 
   const taskText = String(snap.taskTitle || "").trim();
@@ -356,14 +443,6 @@ function getAgentHumanTaskSummary(snap) {
   }
 
   return "Disponible";
-}
-
-function formatSessionOptionLabel(sess, index) {
-  const rawTitle = String(sess?.title || "").trim();
-  if (rawTitle && !rawTitle.startsWith("ses_")) {
-    return rawTitle.length > 36 ? `${rawTitle.slice(0, 35)}…` : rawTitle;
-  }
-  return `Conversación ${index + 1}`;
 }
 
 function formatDelegationTitle(entry) {
@@ -413,15 +492,30 @@ function initQuestionDraft(item, prevId = null) {
 
 watch(
   () => [
-    activeQuestion.value?.id,
-    activeQuestion.value?.questions?.length || 0,
+    currentThreadQuestion.value?.id,
+    currentThreadQuestion.value?.questions?.length || 0,
   ],
   ([newId], [oldId] = []) => {
-    const item = activeQuestion.value;
+    const item = currentThreadQuestion.value;
     if (item && newId) {
       initQuestionDraft(item, oldId && oldId !== newId ? oldId : null);
     } else {
       questionError.value = null;
+    }
+  },
+  { immediate: true },
+);
+
+watch(
+  [isChatOpen, () => commandForm.agent, activeLogSessionId],
+  ([chatOpen, agentId, sessionId]) => {
+    openCodeBridge.setViewedThread({
+      agentId,
+      sessionId: sessionId || null,
+      chatOpen,
+    });
+    if (chatOpen) {
+      nextTick(() => scrollLogToBottom(true));
     }
   },
   { immediate: true },
@@ -450,8 +544,16 @@ function syncSessionLogView() {
   }
 }
 
-watch(activeLogSessionId, () => {
+watch(activeLogSessionId, (sid) => {
   syncSessionLogView();
+  if (sid && openCodeState.value.status === "connected") {
+    const histStatus =
+      openCodeState.value.sessionHistoryStates?.[sid]?.status;
+    if (!histStatus || histStatus === "idle") {
+      openCodeBridge.hydrateSessionHistory(sid);
+    }
+    openCodeBridge.syncPendingQuestions(sid);
+  }
   nextTick(() => scrollLogToBottom(true));
 });
 
@@ -506,6 +608,13 @@ onMounted(() => {
     const availableIds = new Set((snap.sessions || []).map((s) => s.id));
     if (commandForm.sessionId && !availableIds.has(commandForm.sessionId)) {
       commandForm.sessionId = "";
+    }
+
+    if (!commandForm.sessionId) {
+      const preferredSid = snap.agentThreads?.[commandForm.agent]?.sessionId;
+      if (preferredSid && availableIds.has(preferredSid)) {
+        commandForm.sessionId = preferredSid;
+      }
     }
 
     if ((snap.pendingPermissions || []).length === 0) {
@@ -592,8 +701,52 @@ onMounted(() => {
   resources.startLoading();
 });
 
+function selectChatAgent(
+  agentId,
+  { focus3d = false, openDrawer = false } = {},
+) {
+  const targetAgent = agentId || "architect";
+  questionError.value = null;
+  replyingQuestionId.value = null;
+  commandFeedback.value = null;
+  commandForm.agent = targetAgent;
+
+  const preferredSid =
+    openCodeBridge.getPreferredSessionForAgent(targetAgent) || "";
+  commandForm.sessionId = preferredSid;
+
+  if (targetAgent === "architect" && preferredSid) {
+    openCodeBridge.setActiveSession(preferredSid);
+  }
+
+  const willBeOpen = openDrawer || isChatOpen.value;
+  openCodeBridge.setViewedThread({
+    agentId: targetAgent,
+    sessionId: preferredSid || null,
+    chatOpen: willBeOpen,
+  });
+
+  if (preferredSid && openCodeState.value.status === "connected") {
+    openCodeBridge.hydrateSessionHistory(preferredSid);
+    openCodeBridge.syncPendingQuestions(preferredSid);
+  }
+
+  if (openDrawer) {
+    isChatOpen.value = true;
+    nextTick(() => scrollLogToBottom(true));
+  }
+
+  if (focus3d && experience) {
+    experience.handleStationSelect(targetAgent, { focusCamera: true });
+  }
+}
+
 function selectAgentFromDock(agentId) {
   if (!experience) return;
+  if (hasAgentAttention(agentId)) {
+    selectChatAgent(agentId, { focus3d: true, openDrawer: true });
+    return;
+  }
   if (selectedAgentId.value === agentId) {
     experience.focusAgent(agentId);
   } else {
@@ -613,30 +766,14 @@ function toggleChatPanel() {
   }
 }
 
-function openChatDrawer() {
-  isChatOpen.value = true;
-  nextTick(() => scrollLogToBottom(true));
+function handleDismissInquiry(inquiry) {
+  if (!inquiry?.id) return;
+  openCodeBridge.dismissInquiry(inquiry.id);
 }
 
 function openSettingsModal(tab = "connection") {
   settingsTab.value = tab;
   isSettingsModalOpen.value = true;
-}
-
-function handleSessionSelectChange() {
-  questionError.value = null;
-  replyingQuestionId.value = null;
-  const sid = commandForm.sessionId || "";
-  if (!sid) {
-    openCodeBridge.setActiveSession(null);
-    sessionLogEntries.value = [];
-    return;
-  }
-  openCodeBridge.setActiveSession(sid);
-  if (openCodeState.value.status === "connected") {
-    openCodeBridge.hydrateSessionHistory(sid);
-    openCodeBridge.syncPendingQuestions(sid);
-  }
 }
 
 function dismissBlockedAlert(task) {
@@ -747,11 +884,21 @@ async function handleCreateOpenCodeSession() {
   questionError.value = null;
   replyingQuestionId.value = null;
   try {
+    const targetAgent = commandForm.agent || "architect";
     const session = await openCodeBridge.createSession({
-      agent: commandForm.agent,
+      agent: targetAgent,
+      purgeOthers: false,
     });
     if (session?.id) {
       commandForm.sessionId = session.id;
+      if (targetAgent === "architect") {
+        openCodeBridge.setActiveSession(session.id);
+      }
+      openCodeBridge.setViewedThread({
+        agentId: targetAgent,
+        sessionId: session.id,
+        chatOpen: isChatOpen.value,
+      });
     }
   } catch (err) {
     commandFeedback.value = {
@@ -775,10 +922,12 @@ async function handleSendOpenCodePrompt() {
   isSendingPrompt.value = true;
   commandFeedback.value = null;
   const targetAgent = commandForm.agent || "architect";
+  const targetSid = activeLogSessionId.value || null;
   const res = await openCodeBridge.sendPrompt({
-    sessionId: commandForm.sessionId || null,
+    sessionId: targetSid,
     agent: targetAgent,
     text: commandForm.prompt,
+    useActiveFallback: false,
   });
   isSendingPrompt.value = false;
 
@@ -801,7 +950,7 @@ async function handleInterruptOpenCode() {
   questionError.value = null;
   replyingQuestionId.value = null;
   const res = await openCodeBridge.interruptSession(
-    commandForm.sessionId || openCodeState.value.activeSessionId,
+    activeLogSessionId.value || openCodeState.value.activeSessionId,
   );
   isInterrupting.value = false;
   if (!res.ok) {
@@ -1061,9 +1210,10 @@ onBeforeUnmount(() => {
           <span>Chat</span>
           <span
             v-if="pendingAttentionCount > 0"
-            class="px-1.5 py-0.5 rounded-full bg-[#E09F5A] text-[10px] font-semibold text-[#1B1714] tabular-nums leading-none"
+            class="px-1.5 py-0.5 rounded-full bg-[#F59E0B] text-[10px] font-semibold text-[#1B1714] tabular-nums leading-none flex items-center gap-1"
           >
-            {{ pendingAttentionCount }}
+            <span class="w-1.5 h-1.5 rounded-full bg-[#1B1714] animate-pulse"></span>
+            <span>{{ pendingAttentionCount }}</span>
           </span>
         </button>
       </div>
@@ -1072,79 +1222,107 @@ onBeforeUnmount(() => {
       <div
         v-if="
           activePermission ||
-          (activeQuestion && !isChatOpen) ||
+          (!isChatOpen && (toastQuestion || toastInquiry)) ||
           blockedCliAlerts.length > 0
         "
-        class="w-[min(370px,92vw)] flex flex-col gap-2 pointer-events-auto"
+        class="w-[min(368px,92vw)] flex flex-col gap-2 pointer-events-auto"
       >
-        <!-- Toast de pregunta interactiva -->
+        <!-- Toast compacto (máx. 2 líneas) de pregunta interactiva pendiente -->
         <div
-          v-if="activeQuestion && !isChatOpen"
-          class="hud-glass-elevated rounded-2xl p-3.5 space-y-2.5"
+          v-if="!isChatOpen && toastQuestion"
+          class="hud-glass-elevated rounded-2xl px-3.5 py-2.5 space-y-1.5"
         >
           <div class="flex items-center justify-between gap-2">
-            <div class="flex items-center gap-2 text-xs font-semibold text-[#F6EFE6]">
+            <div class="flex items-center gap-2 text-xs font-semibold text-[#F6EFE6] min-w-0 truncate">
               <span
                 class="w-2 h-2 rounded-full shrink-0"
                 :style="{
                   backgroundColor:
-                    profileMap[activeQuestion.agentId]?.color || '#E09F5A',
+                    profileMap[toastQuestion.agentId]?.color || '#E09F5A',
                 }"
               ></span>
-              <span>
+              <span class="truncate">
                 {{
-                  profileMap[activeQuestion.agentId]?.name ||
-                  "Pregunta del equipo"
-                }}
+                  profileMap[toastQuestion.agentId]?.name || "Equipo"
+                }} te hace una consulta
               </span>
             </div>
             <button
               type="button"
-              @click="handleDismissQuestion(activeQuestion)"
+              @click="handleDismissQuestion(toastQuestion)"
               title="Descartar"
-              aria-label="Descartar pregunta"
-              class="p-1 rounded-lg text-[#B5AEA4] hover:text-[#FFFDF9] hover:bg-white/[0.06] cursor-pointer"
+              aria-label="Descartar consulta"
+              class="p-0.5 rounded-lg text-[#B5AEA4] hover:text-[#FFFDF9] hover:bg-white/[0.06] cursor-pointer shrink-0"
             >
               <X class="w-3.5 h-3.5" />
             </button>
           </div>
 
-          <div class="text-xs text-[#EAE4DC] leading-relaxed">
-            {{ activeQuestion.questions[0]?.question }}
-          </div>
-
-          <div v-if="questionError" class="text-[11px] text-[#FDA4AF]">
-            {{ questionError }}
-          </div>
-
-          <div class="flex flex-wrap items-center gap-1.5">
-            <template
-              v-if="
-                activeQuestion.questions.length === 1 &&
-                !activeQuestion.questions[0]?.multiple &&
-                activeQuestion.questions[0]?.options?.length > 0
-              "
-            >
-              <button
-                v-for="(opt, optIdx) in activeQuestion.questions[0].options.slice(
-                  0,
-                  3,
-                )"
-                :key="`${opt.label}_${optIdx}`"
-                type="button"
-                :disabled="replyingQuestionId === activeQuestion.id"
-                @click="handleQuickQuestionOption(activeQuestion, opt.label)"
-                class="px-2.5 py-1.5 rounded-lg bg-white/[0.07] hover:bg-white/[0.12] border border-white/[0.1] text-xs font-medium text-[#F3EFE8] cursor-pointer whitespace-nowrap disabled:opacity-50"
-              >
-                {{ opt.label }}
-              </button>
-            </template>
+          <div class="flex items-center justify-between gap-2.5">
+            <p class="text-xs text-[#C8C0B5] truncate flex-1 min-w-0">
+              {{ toastQuestion.questions[0]?.question }}
+            </p>
             <button
               type="button"
-              @click="openChatDrawer"
-              class="px-3 py-1.5 rounded-lg bg-[#E09F5A] hover:bg-[#E7AF72] text-xs font-semibold text-[#1B1714] cursor-pointer whitespace-nowrap"
+              @click="
+                selectChatAgent(toastQuestion.agentId, {
+                  focus3d: true,
+                  openDrawer: true,
+                })
+              "
+              class="px-2.5 py-1 rounded-lg bg-[#E09F5A] hover:bg-[#E7AF72] text-[11px] font-semibold text-[#1B1714] cursor-pointer whitespace-nowrap shrink-0"
             >
-              Responder en el chat
+              Responder
+            </button>
+          </div>
+        </div>
+
+        <!-- Toast compacto (máx. 2 líneas) de consulta proactiva de especialista -->
+        <div
+          v-if="!isChatOpen && toastInquiry"
+          class="hud-glass-elevated rounded-2xl px-3.5 py-2.5 space-y-1.5"
+        >
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2 text-xs font-semibold text-[#F6EFE6] min-w-0 truncate">
+              <span
+                class="w-2 h-2 rounded-full shrink-0"
+                :style="{
+                  backgroundColor:
+                    profileMap[toastInquiry.agentId]?.color || '#E09F5A',
+                }"
+              ></span>
+              <span class="truncate">
+                {{
+                  profileMap[toastInquiry.agentId]?.name || toastInquiry.agentId
+                }} te hace una consulta
+              </span>
+            </div>
+            <button
+              type="button"
+              @click="handleDismissInquiry(toastInquiry)"
+              title="Descartar"
+              aria-label="Descartar consulta"
+              class="p-0.5 rounded-lg text-[#B5AEA4] hover:text-[#FFFDF9] hover:bg-white/[0.06] cursor-pointer shrink-0"
+            >
+              <X class="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <div class="flex items-center justify-between gap-2.5">
+            <p class="text-xs text-[#C8C0B5] truncate flex-1 min-w-0">
+              {{ toastInquiry.excerpt }}
+            </p>
+            <button
+              type="button"
+              @click="
+                selectChatAgent(toastInquiry.agentId, {
+                  focus3d: true,
+                  openDrawer: true,
+                })
+              "
+              class="px-2.5 py-1 rounded-lg bg-[#E09F5A] hover:bg-[#E7AF72] text-[11px] font-semibold text-[#1B1714] cursor-pointer whitespace-nowrap shrink-0"
+            >
+              Responder
             </button>
           </div>
         </div>
@@ -1236,7 +1414,12 @@ onBeforeUnmount(() => {
             </span>
             <button
               type="button"
-              @click="openChatDrawer"
+              @click="
+                selectChatAgent(alert.assigneeId || 'architect', {
+                  focus3d: true,
+                  openDrawer: true,
+                })
+              "
               class="px-2.5 py-1 rounded-lg bg-white/[0.08] hover:bg-white/[0.14] text-[11px] font-medium text-[#F3EFE8] cursor-pointer whitespace-nowrap shrink-0"
             >
               Abrir chat
@@ -1331,11 +1514,18 @@ onBeforeUnmount(() => {
           type="button"
           @click="selectAgentFromDock(agent.id)"
           :style="getAgentChipStyle(agent)"
+          :title="
+            hasAgentAttention(agent.id)
+              ? `${agent.name} tiene una consulta pendiente`
+              : agent.name
+          "
           :class="[
             'px-3 py-1.5 rounded-xl text-xs font-medium transition-transform duration-150 active:scale-95 cursor-pointer flex items-center gap-2 whitespace-nowrap border',
             selectedAgentId === agent.id
               ? 'text-[#FFFDF9]'
-              : 'bg-white/[0.04] border-white/[0.07] text-[#DDD6CD] hover:bg-white/[0.09] hover:text-[#FFFDF9]',
+              : hasAgentAttention(agent.id)
+                ? 'bg-[#F59E0B]/[0.09] border-[#F59E0B]/40 text-[#FFFDF9] hover:bg-[#F59E0B]/[0.15]'
+                : 'bg-white/[0.04] border-white/[0.07] text-[#DDD6CD] hover:bg-white/[0.09] hover:text-[#FFFDF9]',
           ]"
         >
           <span
@@ -1344,7 +1534,15 @@ onBeforeUnmount(() => {
           ></span>
           <span>{{ agent.name }}</span>
           <span
-            v-if="openCodeState.activeAgents.includes(agent.id)"
+            v-if="hasAgentAttention(agent.id)"
+            class="w-2 h-2 rounded-full bg-[#F59E0B] animate-pulse shrink-0"
+            title="Consulta pendiente"
+          ></span>
+          <span
+            v-else-if="
+              getAgentThreadInfo(agent.id).isBusy ||
+              openCodeState.activeAgents.includes(agent.id)
+            "
             class="w-1.5 h-1.5 rounded-full bg-[#34D399] shrink-0"
             title="Trabajando ahora"
           ></span>
@@ -1393,58 +1591,95 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
-        <!-- Selector de conversación y destinatario -->
+        <!-- Selector unificado por miembro del equipo -->
         <div
           v-if="
             openCodeState.status === 'connected' ||
             openCodeState.sessions.length > 0
           "
-          class="px-4 py-2.5 border-b border-white/[0.07] space-y-2 shrink-0"
+          class="px-4 py-2.5 border-b border-white/[0.07] flex items-center gap-2 shrink-0"
         >
-          <div class="flex items-center gap-1.5">
-            <select
-              v-model="commandForm.sessionId"
-              @change="handleSessionSelectChange"
-              aria-label="Conversación"
-              class="flex-1 min-w-0 px-2.5 py-1.5 rounded-xl bg-black/25 border border-white/[0.08] text-xs text-[#F3EFE8] focus:outline-none focus:border-[#E09F5A]/60"
-            >
-              <option value="">Nueva conversación</option>
-              <option
-                v-for="(sess, idx) in openCodeState.sessions"
-                :key="sess.id"
-                :value="sess.id"
-              >
-                {{ formatSessionOptionLabel(sess, idx) }}
-              </option>
-            </select>
+          <span
+            class="w-2.5 h-2.5 rounded-full shrink-0"
+            :style="{
+              backgroundColor:
+                profileMap[commandForm.agent]?.color || '#E09F5A',
+            }"
+          ></span>
+          <select
+            v-model="commandForm.agent"
+            @change="selectChatAgent(commandForm.agent)"
+            aria-label="Miembro del equipo"
+            class="flex-1 min-w-0 px-2.5 py-1.5 rounded-xl bg-black/25 border border-white/[0.08] text-xs font-medium text-[#F3EFE8] focus:outline-none focus:border-[#E09F5A]/60"
+          >
+            <option v-for="ag in agentList" :key="ag.id" :value="ag.id">
+              {{ formatMemberOptionLabel(ag) }}
+            </option>
+          </select>
+          <button
+            type="button"
+            :disabled="isCreatingSession || openCodeState.status !== 'connected'"
+            @click="handleCreateOpenCodeSession"
+            title="Iniciar nueva conversación con este miembro"
+            class="px-2.5 py-1.5 rounded-xl bg-white/[0.06] hover:bg-white/[0.11] border border-white/[0.08] text-xs font-medium text-[#F3EFE8] flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-45"
+          >
+            <Plus class="w-3.5 h-3.5" />
+            <span>{{ isCreatingSession ? "Creando..." : "Nueva" }}</span>
+          </button>
+        </div>
+
+        <!-- Aviso discreto cuando otro miembro hace una consulta mientras el chat está abierto -->
+        <div
+          v-if="toastQuestion || toastInquiry"
+          class="px-4 py-2 border-b border-[#F59E0B]/25 bg-[#F59E0B]/[0.08] flex items-center justify-between gap-2 shrink-0"
+        >
+          <div class="flex items-center gap-2 min-w-0 text-xs text-[#F6EFE6]">
+            <span
+              class="w-2 h-2 rounded-full shrink-0 animate-pulse"
+              :style="{
+                backgroundColor:
+                  profileMap[(toastQuestion || toastInquiry).agentId]?.color ||
+                  '#F59E0B',
+              }"
+            ></span>
+            <span class="truncate">
+              {{
+                profileMap[(toastQuestion || toastInquiry).agentId]?.name ||
+                (toastQuestion || toastInquiry).agentId
+              }} te hace una consulta
+            </span>
+          </div>
+          <div class="flex items-center gap-1.5 shrink-0">
             <button
               type="button"
-              :disabled="isCreatingSession || openCodeState.status !== 'connected'"
-              @click="handleCreateOpenCodeSession"
-              class="px-2.5 py-1.5 rounded-xl bg-white/[0.06] hover:bg-white/[0.11] border border-white/[0.08] text-xs font-medium text-[#F3EFE8] flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-45"
+              @click="
+                selectChatAgent((toastQuestion || toastInquiry).agentId, {
+                  focus3d: true,
+                  openDrawer: true,
+                })
+              "
+              class="px-2.5 py-1 rounded-lg bg-[#E09F5A] hover:bg-[#E7AF72] text-[11px] font-semibold text-[#1B1714] cursor-pointer whitespace-nowrap"
             >
-              <Plus class="w-3.5 h-3.5" />
-              <span>{{ isCreatingSession ? "Creando..." : "Nueva" }}</span>
+              Responder
             </button>
-          </div>
-
-          <div class="flex items-center gap-2 text-xs">
-            <span class="text-[#B5AEA4] shrink-0">Para:</span>
-            <select
-              v-model="commandForm.agent"
-              aria-label="Destinatario"
-              class="flex-1 min-w-0 px-2.5 py-1 rounded-xl bg-black/25 border border-white/[0.08] text-xs text-[#F3EFE8] focus:outline-none focus:border-[#E09F5A]/60"
+            <button
+              type="button"
+              @click="
+                toastQuestion
+                  ? handleDismissQuestion(toastQuestion)
+                  : handleDismissInquiry(toastInquiry)
+              "
+              aria-label="Descartar consulta"
+              class="p-0.5 rounded-lg text-[#B5AEA4] hover:text-[#FFFDF9] cursor-pointer"
             >
-              <option v-for="ag in agentList" :key="ag.id" :value="ag.id">
-                {{ ag.name }}
-              </option>
-            </select>
+              <X class="w-3.5 h-3.5" />
+            </button>
           </div>
         </div>
 
-        <!-- Pregunta interactiva en línea dentro del chat -->
+        <!-- Pregunta interactiva en línea dentro del hilo actual -->
         <div
-          v-if="activeQuestion"
+          v-if="currentThreadQuestion"
           class="px-4 py-3 border-b border-[#E09F5A]/30 bg-[#E09F5A]/[0.07] space-y-2.5 shrink-0 max-h-[40vh] overflow-y-auto"
         >
           <div class="flex items-center justify-between gap-2 text-xs">
@@ -1453,19 +1688,19 @@ onBeforeUnmount(() => {
                 class="w-2 h-2 rounded-full shrink-0"
                 :style="{
                   backgroundColor:
-                    profileMap[activeQuestion.agentId]?.color || '#E09F5A',
+                    profileMap[currentThreadQuestion.agentId]?.color || '#E09F5A',
                 }"
               ></span>
               <span>
                 {{
-                  profileMap[activeQuestion.agentId]?.name ||
-                  "Pregunta del equipo"
+                  profileMap[currentThreadQuestion.agentId]?.name ||
+                  "Consulta del equipo"
                 }}
               </span>
             </span>
             <button
               type="button"
-              @click="handleDismissQuestion(activeQuestion)"
+              @click="handleDismissQuestion(currentThreadQuestion)"
               title="Descartar"
               aria-label="Descartar pregunta"
               class="p-1 rounded-lg text-[#B5AEA4] hover:text-[#FFFDF9] hover:bg-white/[0.07] cursor-pointer"
@@ -1475,8 +1710,8 @@ onBeforeUnmount(() => {
           </div>
 
           <div
-            v-for="(q, qIdx) in activeQuestion.questions"
-            :key="`${activeQuestion.id}_${qIdx}`"
+            v-for="(q, qIdx) in currentThreadQuestion.questions"
+            :key="`${currentThreadQuestion.id}_${qIdx}`"
             class="space-y-1.5"
           >
             <div class="text-xs text-[#F3EFE8] leading-relaxed select-text">
@@ -1488,11 +1723,13 @@ onBeforeUnmount(() => {
                 v-for="(opt, optIdx) in q.options"
                 :key="`${opt.label}_${optIdx}`"
                 type="button"
-                :disabled="replyingQuestionId === activeQuestion.id"
-                @click="toggleQuestionOption(activeQuestion, qIdx, opt.label)"
+                :disabled="replyingQuestionId === currentThreadQuestion.id"
+                @click="
+                  toggleQuestionOption(currentThreadQuestion, qIdx, opt.label)
+                "
                 :class="[
                   'w-full text-left px-2.5 py-1.5 rounded-xl border text-xs cursor-pointer flex items-start justify-between gap-2 disabled:opacity-50',
-                  isOptionSelected(activeQuestion, qIdx, opt.label)
+                  isOptionSelected(currentThreadQuestion, qIdx, opt.label)
                     ? 'bg-[#E09F5A]/20 border-[#E09F5A]/55 text-[#FFFDF9]'
                     : 'bg-black/25 border-white/[0.08] text-[#DDD6CD] hover:bg-white/[0.06]',
                 ]"
@@ -1507,7 +1744,7 @@ onBeforeUnmount(() => {
                   </span>
                 </span>
                 <Check
-                  v-if="isOptionSelected(activeQuestion, qIdx, opt.label)"
+                  v-if="isOptionSelected(currentThreadQuestion, qIdx, opt.label)"
                   class="w-3.5 h-3.5 text-[#E09F5A] shrink-0 mt-0.5"
                 />
               </button>
@@ -1515,14 +1752,18 @@ onBeforeUnmount(() => {
 
             <input
               v-if="q.custom !== false"
-              :value="getQuestionCustomText(activeQuestion, qIdx)"
+              :value="getQuestionCustomText(currentThreadQuestion, qIdx)"
               @input="
-                setQuestionCustomText(activeQuestion, qIdx, $event.target.value)
+                setQuestionCustomText(
+                  currentThreadQuestion,
+                  qIdx,
+                  $event.target.value,
+                )
               "
               type="text"
               @keydown.enter.prevent="
-                canSubmitQuestion(activeQuestion) &&
-                handleSubmitQuestion(activeQuestion)
+                canSubmitQuestion(currentThreadQuestion) &&
+                handleSubmitQuestion(currentThreadQuestion)
               "
               :placeholder="
                 q.options.length > 0
@@ -1540,8 +1781,8 @@ onBeforeUnmount(() => {
           <div class="flex items-center justify-between gap-2 pt-0.5">
             <button
               type="button"
-              :disabled="replyingQuestionId === activeQuestion.id"
-              @click="handleRejectQuestion(activeQuestion)"
+              :disabled="replyingQuestionId === currentThreadQuestion.id"
+              @click="handleRejectQuestion(currentThreadQuestion)"
               class="px-2.5 py-1.5 rounded-lg bg-white/[0.06] hover:bg-white/[0.11] text-[11px] font-medium text-[#C8C0B5] cursor-pointer whitespace-nowrap disabled:opacity-50"
             >
               Omitir
@@ -1549,15 +1790,15 @@ onBeforeUnmount(() => {
             <button
               type="button"
               :disabled="
-                replyingQuestionId === activeQuestion.id ||
-                !canSubmitQuestion(activeQuestion)
+                replyingQuestionId === currentThreadQuestion.id ||
+                !canSubmitQuestion(currentThreadQuestion)
               "
-              @click="handleSubmitQuestion(activeQuestion)"
+              @click="handleSubmitQuestion(currentThreadQuestion)"
               class="px-3 py-1.5 rounded-lg bg-[#E09F5A] hover:bg-[#E7AF72] text-[11px] font-semibold text-[#1B1714] flex items-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-45"
             >
               <Send class="w-3 h-3" />
               <span>{{
-                replyingQuestionId === activeQuestion.id
+                replyingQuestionId === currentThreadQuestion.id
                   ? "Enviando..."
                   : "Enviar respuesta"
               }}</span>
@@ -1608,9 +1849,9 @@ onBeforeUnmount(() => {
             v-else-if="visibleChatEntries.length === 0"
             class="h-full flex items-center justify-center text-center px-4 py-8"
           >
-            <p class="text-xs text-[#A39B90] leading-relaxed max-w-[250px]">
-              Escribe un mensaje abajo para hablar con
-              {{ profileMap[commandForm.agent]?.name || "el equipo" }}.
+            <p class="text-xs text-[#A39B90] leading-relaxed max-w-[260px]">
+              Escribe un mensaje abajo para hablar directamente con
+              {{ profileMap[commandForm.agent]?.name || "este miembro" }}.
             </p>
           </div>
 
@@ -1710,10 +1951,16 @@ onBeforeUnmount(() => {
                     class="w-2 h-2 rounded-full shrink-0"
                     :style="{
                       backgroundColor:
-                        profileMap[entry.agentId]?.color || '#E09F5A',
+                        profileMap[entry.agentId]?.color ||
+                        profileMap[commandForm.agent]?.color ||
+                        '#E09F5A',
                     }"
                   ></span>
-                  <span>{{ profileMap[entry.agentId]?.name || entry.agentId }}</span>
+                  <span>{{
+                    profileMap[entry.agentId]?.name ||
+                    profileMap[commandForm.agent]?.name ||
+                    entry.agentId
+                  }}</span>
                 </div>
                 <span
                   v-if="entry.status === 'running'"
@@ -1760,7 +2007,7 @@ onBeforeUnmount(() => {
             @keydown="handleComposerKeydown"
             :placeholder="
               openCodeState.status === 'connected'
-                ? 'Escribe un mensaje para el equipo... (Enter para enviar)'
+                ? `Escribe a ${profileMap[commandForm.agent]?.name || 'este miembro'}... (Enter para enviar)`
                 : 'Conecta el servidor para escribir al equipo...'
             "
             class="w-full px-3 py-2 rounded-xl bg-black/25 border border-white/[0.08] text-xs text-[#F3EFE8] placeholder:text-[#8C847A] focus:outline-none focus:border-[#E09F5A]/60 resize-none disabled:opacity-50"

@@ -45,6 +45,7 @@ export class AgentCharacter {
     this.pendingStationOnSeated = null;
     this.isTransitioningSeat = false;
     this.bubblesEnabled = true;
+    this.hasPendingUserQuestion = false;
 
     this.pendingTimers = new Set();
 
@@ -127,6 +128,13 @@ export class AgentCharacter {
     this.syncBubble();
   }
 
+  setHasPendingUserQuestion(pending) {
+    const next = Boolean(pending);
+    if (this.hasPendingUserQuestion === next) return;
+    this.hasPendingUserQuestion = next;
+    this.syncBubble();
+  }
+
   updateProfile(profile) {
     if (!profile) return;
     if (profile.name) this.config.name = profile.name;
@@ -157,7 +165,10 @@ export class AgentCharacter {
     const rawLabel = String(this.currentActionLabel || "").trim();
     const rawTask = String(this.taskTitle || "").trim();
 
-    if (this.socialMode === "PAIR_CHAT" && this.socialPartnerName) {
+    if (this.hasPendingUserQuestion) {
+      text = "Tiene una pregunta para ti";
+      color = "#FCD34D";
+    } else if (this.socialMode === "PAIR_CHAT" && this.socialPartnerName) {
       if (this.state === "TRAVELING") {
         text = `Yendo a charlar con ${this.socialPartnerName}`;
       } else if (this.socialPhase === "APPROACHING") {
@@ -208,7 +219,7 @@ export class AgentCharacter {
         text = "Revisando un inconveniente";
         color = "#FB7185";
       } else {
-        text = "Esperando tu respuesta";
+        text = "Tiene una pregunta para ti";
         color = "#FCD34D";
       }
     }
