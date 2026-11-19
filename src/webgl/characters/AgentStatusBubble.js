@@ -8,7 +8,7 @@ export class AgentStatusBubble {
   constructor(model, agentConfig) {
     this.model = model;
     this.agentConfig = agentConfig;
-    this.visible = true;
+    this.visible = false;
     this.targetY = SEATED_LOCAL_Y;
 
     this.canvas = document.createElement("canvas");
@@ -35,16 +35,17 @@ export class AgentStatusBubble {
     // Escala compensada respecto al model.scale = 1.14
     this.sprite.scale.set(1.08, 0.27, 1);
     this.sprite.position.set(0, SEATED_LOCAL_Y, 0);
+    this.sprite.visible = false;
 
     this.lastText = "";
-    this.lastStatusLabel = "Tecleando código";
+    this.lastStatusLabel = "Disponible";
     this.lastBadgeColor = agentConfig.color;
 
     if (this.model) {
       this.model.add(this.sprite);
     }
 
-    this.setStatus("Tecleando código", agentConfig.color);
+    this.setStatus("Disponible", agentConfig.color);
   }
 
   updateProfile(profile) {
@@ -55,7 +56,7 @@ export class AgentStatusBubble {
   }
 
   setStatus(text, accentColor = this.agentConfig.color, badgeTag = null) {
-    const raw = String(text || "Activo").replace(/\s+/g, " ").trim();
+    const raw = String(text || "Disponible").replace(/\s+/g, " ").trim();
     const cleanText = raw.length > 44 ? `${raw.slice(0, 43)}…` : raw;
     const badgeColor = accentColor || this.agentConfig.color;
     this.lastStatusLabel = cleanText;
@@ -73,14 +74,14 @@ export class AgentStatusBubble {
     ctx.clearRect(0, 0, cw, ch);
     ctx.setTransform(cw / w, 0, 0, ch / h, 0, 0);
 
-    // Fondo compacto con esquinas suaves
+    // Fondo piedra oscura cálida translúcida con esquinas suaves
     const x = 10;
     const y = 8;
     const rw = w - 20;
     const rh = h - 24;
     const r = 16;
 
-    ctx.fillStyle = "rgba(9, 14, 26, 0.9)";
+    ctx.fillStyle = "rgba(26, 23, 20, 0.9)";
     ctx.beginPath();
     ctx.moveTo(x + r, y);
     ctx.lineTo(x + rw - r, y);
@@ -94,12 +95,12 @@ export class AgentStatusBubble {
     ctx.closePath();
     ctx.fill();
 
-    ctx.strokeStyle = "rgba(148, 163, 184, 0.32)";
-    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = "rgba(245, 239, 230, 0.16)";
+    ctx.lineWidth = 2;
     ctx.stroke();
 
     // Puntero sutil inferior hacia la cabeza
-    ctx.fillStyle = "rgba(9, 14, 26, 0.9)";
+    ctx.fillStyle = "rgba(26, 23, 20, 0.9)";
     ctx.beginPath();
     ctx.moveTo(w / 2 - 9, y + rh);
     ctx.lineTo(w / 2 + 9, y + rh);
@@ -107,19 +108,19 @@ export class AgentStatusBubble {
     ctx.closePath();
     ctx.fill();
 
-    // Barra de identidad cromática izquierda
+    // Marcador de identidad cromática izquierda
     ctx.fillStyle = badgeColor;
     ctx.beginPath();
-    ctx.arc(38, y + rh / 2, 9, 0, Math.PI * 2);
+    ctx.arc(38, y + rh / 2, 8.5, 0, Math.PI * 2);
     ctx.fill();
 
-    // Texto principal
-    ctx.fillStyle = "#F8FAFC";
+    // Nombre del agente
+    ctx.fillStyle = "#F5F1EA";
     ctx.font = "600 22px 'Plus Jakarta Sans', system-ui, sans-serif";
     ctx.textBaseline = "middle";
     ctx.fillText(this.agentConfig.name, 60, y + 24);
 
-    // Subtítulo adaptativo para acomodar "Pensando · <extracto>" sin recorte abrupto
+    // Subtítulo humano adaptativo
     const maxTextWidth = w - 82;
     let fontSize = 20;
     ctx.font = `500 ${fontSize}px 'Plus Jakarta Sans', system-ui, sans-serif`;
@@ -139,7 +140,10 @@ export class AgentStatusBubble {
       renderedText = `${renderedText.trimEnd()}…`;
     }
 
-    ctx.fillStyle = cleanText.startsWith("Pensando") ? "#7DD3FC" : "#CBD5E1";
+    ctx.fillStyle =
+      cleanText.startsWith("Esperando") || cleanText.startsWith("Necesita")
+        ? "#FCD34D"
+        : "#D8D1C7";
     ctx.fillText(renderedText, 60, y + 54);
 
     this.texture.needsUpdate = true;

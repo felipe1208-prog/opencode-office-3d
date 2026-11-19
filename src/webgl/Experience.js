@@ -128,6 +128,7 @@ export class Experience {
       this.onSelect = opts.onSelect || null;
       this.onAgentUpdate = opts.onAgentUpdate || null;
       this.onDirectorChange = opts.onDirectorChange || null;
+      this.onCameraViewChanged = opts.onCameraViewChanged || null;
     }
 
     this.selectedAgentId = null;
@@ -137,7 +138,11 @@ export class Experience {
     this.scene.fog = new THREE.FogExp2(DAY_BG.getHex(), 0.0068);
 
     this.sizes = new Sizes(this.canvas.parentElement);
-    this.camera = new Camera(this);
+    this.camera = new Camera(this, {
+      onViewChange: (atOverview) => {
+        this.onCameraViewChanged?.(atOverview);
+      },
+    });
     this.renderer = new Renderer(this);
     if (this.camera?.controls) {
       this.camera.controls.enableDamping = !this.renderer.isSoftwareGl;
@@ -147,7 +152,7 @@ export class Experience {
 
     this.dayNightCycle = 0.0;
     this.targetDayNight = 0.0;
-    this.isAutoCycle = false;
+    this.isAutoCycle = true;
     this.autoClock = 0;
     this.lightingAppliedOnce = false;
     this._lastShadowSunPos = DAY_SUN_POS.clone();

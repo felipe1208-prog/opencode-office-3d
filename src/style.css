@@ -3,11 +3,11 @@
 @theme {
   --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
-  --color-surface-base: #111318;
-  --color-surface-panel: #181b22;
-  --color-surface-elevated: #1f232d;
-  --color-accent-opencode: #4f6ef7;
-  --color-accent-opencode-tint: #1e243b;
+  --color-surface-base: #161412;
+  --color-surface-panel: #1e1b18;
+  --color-surface-elevated: #282420;
+  --color-accent-warm: #e09f5a;
+  --color-accent-opencode: #6b8afd;
 }
 
 html,
@@ -18,9 +18,10 @@ body,
   margin: 0;
   padding: 0;
   overflow: hidden;
-  background-color: #111318;
+  background-color: #161412;
   font-family: var(--font-sans);
-  color: #f3f4f6;
+  color: #f3efe8;
+  -webkit-font-smoothing: antialiased;
 }
 
 code,
@@ -31,26 +32,50 @@ samp {
   font-variant-numeric: tabular-nums;
 }
 
-/* Scrollbar editorial mate oscura */
+/* Superficies translúcidas cálidas (60 FPS, sin sombras ni filtros pesados animados) */
+.hud-glass {
+  background-color: rgba(25, 22, 20, 0.72);
+  backdrop-filter: blur(14px) saturate(118%);
+  -webkit-backdrop-filter: blur(14px) saturate(118%);
+  border: 1px solid rgba(245, 239, 230, 0.1);
+}
+
+.hud-glass-elevated {
+  background-color: rgba(31, 28, 25, 0.82);
+  backdrop-filter: blur(14px) saturate(120%);
+  -webkit-backdrop-filter: blur(14px) saturate(120%);
+  border: 1px solid rgba(245, 239, 230, 0.12);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
+/* Scrollbar cálida discreta */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #2a303d #14171f;
+  scrollbar-color: rgba(245, 239, 230, 0.18) transparent;
 }
 
 *::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
 }
 
 *::-webkit-scrollbar-track {
-  background: #14171f;
+  background: transparent;
 }
 
 *::-webkit-scrollbar-thumb {
-  background: #2a303d;
-  border-radius: 3px;
+  background: rgba(245, 239, 230, 0.18);
+  border-radius: 9999px;
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background: #373f50;
+  background: rgba(245, 239, 230, 0.3);
 }

@@ -7,11 +7,12 @@ const _offsetDir = new THREE.Vector3();
 const _desiredCamPos = new THREE.Vector3();
 
 export class Camera {
-  constructor(experience) {
+  constructor(experience, { onViewChange = null } = {}) {
     this.experience = experience;
     this.sizes = experience.sizes;
     this.scene = experience.scene;
     this.canvas = experience.canvas;
+    this.onViewChange = onViewChange;
 
     this.followAgentRef = null;
     this.transitionTarget = new THREE.Vector3();
@@ -19,9 +20,25 @@ export class Camera {
     this.hasTransitionTarget = false;
     this.hasTransitionCamPos = false;
     this.isTransitioning = false;
+    this._lastAtOverview = true;
 
     this.setInstance();
     this.setControls();
+  }
+
+  isAtOverview() {
+    if (this.followAgentRef) return false;
+    const camDistSq = this.instance.position.distanceToSquared(DEFAULT_CAM_POS);
+    const targetDistSq = this.controls.target.distanceToSquared(DEFAULT_TARGET);
+    return camDistSq < 0.35 && targetDistSq < 0.25;
+  }
+
+  _notifyViewStateIfChanged(forceValue = null) {
+    const atOverview = forceValue !== null ? Boolean(forceValue) : this.isAtOverview();
+    if (atOverview !== this._lastAtOverview) {
+      this._lastAtOverview = atOverview;
+      this.onViewChange?.(atOverview);
+    }
   }
 
   setInstance() {
@@ -49,8 +66,15 @@ export class Camera {
       // Ceder el control al usuario inmediatamente cuando interactúa
       this.isTransitioning = false;
       this.followAgentRef = null;
+      this._notifyViewStateIfChanged(false);
+    };
+    this.onControlsChange = () => {
+      if (!this.isTransitioning && !this.followAgentRef) {
+        this._notifyViewStateIfChanged();
+      }
     };
     this.controls.addEventListener("start", this.onControlsStart);
+    this.controls.addEventListener("change", this.onControlsChange);
   }
 
   focusOnAgent(agent, desiredDistance = 12.5) {
@@ -76,6 +100,7 @@ export class Camera {
     this.hasTransitionCamPos = true;
 
     this.isTransitioning = true;
+    this._notifyViewStateIfChanged(false);
   }
 
   resetView() {
@@ -85,6 +110,7 @@ export class Camera {
     this.hasTransitionTarget = true;
     this.hasTransitionCamPos = true;
     this.isTransitioning = true;
+    this._notifyViewStateIfChanged(true);
   }
 
   resize() {
@@ -166,6 +192,7 @@ export class Camera {
 
   destroy() {
     this.controls.removeEventListener("start", this.onControlsStart);
+    this.controls.removeEventListener("change", this.onControlsChange);
     this.controls.dispose();
   }
 }

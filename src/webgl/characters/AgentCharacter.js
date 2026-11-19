@@ -44,6 +44,7 @@ export class AgentCharacter {
     this.pendingLiveArrival = null;
     this.pendingStationOnSeated = null;
     this.isTransitioningSeat = false;
+    this.bubblesEnabled = true;
 
     this.pendingTimers = new Set();
 
@@ -122,7 +123,8 @@ export class AgentCharacter {
   }
 
   setBubbleVisible(visible) {
-    this.bubble?.setVisible(visible);
+    this.bubblesEnabled = Boolean(visible);
+    this.syncBubble();
   }
 
   updateProfile(profile) {
@@ -150,48 +152,72 @@ export class AgentCharacter {
     if (!this.bubble) return;
     this.bubble.setSeated(this.isSeated);
 
-    let text = this.currentActionLabel;
+    let text = null;
     let color = this.taskAccentColor || this.config.color;
+    const rawLabel = String(this.currentActionLabel || "").trim();
+    const rawTask = String(this.taskTitle || "").trim();
 
     if (this.socialMode === "PAIR_CHAT" && this.socialPartnerName) {
       if (this.state === "TRAVELING") {
-        text = `Yendo con ${this.socialPartnerName}`;
+        text = `Yendo a charlar con ${this.socialPartnerName}`;
       } else if (this.socialPhase === "APPROACHING") {
         text = `Esperando a ${this.socialPartnerName}`;
       } else {
-        text = `Charla · ${this.socialPartnerName}`;
+        text = `Conversando con ${this.socialPartnerName}`;
       }
     } else if (this.socialMode === "DESK_REVIEW" && this.socialPartnerName) {
       if (this.state === "TRAVELING") {
-        text = `Revisión · ${this.socialPartnerName}`;
+        text = `Yendo a revisar con ${this.socialPartnerName}`;
       } else if (this.socialPhase === "APPROACHING") {
-        text = `Esperando revisión · ${this.socialPartnerName}`;
+        text = `Esperando a ${this.socialPartnerName}`;
       } else {
-        text = `Revisando · ${this.socialPartnerName}`;
+        text = `Revisando con ${this.socialPartnerName}`;
       }
-      color = "#38BDF8";
+      color = "#7DD3FC";
     } else if (this.socialMode === "MEETING") {
       if (this.state === "TRAVELING") {
-        text = "Yendo a reunión";
+        text = "Yendo a la sala";
       } else if (this.socialPhase === "APPROACHING") {
         text = this.socialPartnerName
-          ? `Esperando · ${this.socialPartnerName}`
-          : "Esperando en sala";
+          ? `Reuniéndose con ${this.socialPartnerName}`
+          : "Reuniéndose con el equipo";
       } else {
         text =
-          this.taskTitle ||
+          rawTask ||
           (this.socialPartnerName
-            ? `Reunión · ${this.socialPartnerName}`
-            : "En reunión");
+            ? `Coordinando con ${this.socialPartnerName}`
+            : "En reunión de equipo");
       }
     } else if (
-      this.taskTitle &&
-      (this.state === "WORKING" || this.state === "THINKING")
+      this.currentActionKey === "talking" ||
+      this.currentActionKey === "sittingTalking"
     ) {
-      text = this.taskTitle;
+      text = "Comentando con el equipo";
+    } else if (
+      /esperando respuesta|permiso|pregunta|confirmación|delegando|fallo/i.test(
+        `${rawTask} ${rawLabel}`,
+      ) ||
+      this.taskAccentColor === "#E11D48" ||
+      this.taskAccentColor === "#D97706"
+    ) {
+      if (/delegando/i.test(`${rawTask} ${rawLabel}`)) {
+        text = "Delegando tarea al equipo";
+      } else if (/permiso/i.test(`${rawTask} ${rawLabel}`)) {
+        text = "Necesita tu permiso";
+      } else if (/fallo/i.test(`${rawTask} ${rawLabel}`)) {
+        text = "Revisando un inconveniente";
+        color = "#FB7185";
+      } else {
+        text = "Esperando tu respuesta";
+        color = "#FCD34D";
+      }
     }
 
-    this.bubble.setStatus(text, color);
+    const shouldShow = Boolean(this.bubblesEnabled && text);
+    this.bubble.setVisible(shouldShow);
+    if (shouldShow) {
+      this.bubble.setStatus(text, color);
+    }
   }
 
   setSocialContext({
