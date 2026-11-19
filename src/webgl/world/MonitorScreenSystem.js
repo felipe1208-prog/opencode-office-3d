@@ -83,6 +83,7 @@ export class MonitorScreenSystem {
     this.standbyMaterials = [];
     this.meetingScreen = null;
     this.whiteboardScreen = null;
+    this.whiteboardNotes = [];
     this.loungeScreen = null;
     this.nightFactor = -1;
     this.tickCounter = 0;
@@ -461,6 +462,57 @@ export class MonitorScreenSystem {
     if (this.whiteboardScreen) {
       this._redrawMeetingWhiteboard();
     }
+  }
+
+  getWhiteboardNotes() {
+    return this.whiteboardNotes.map((n) => ({ ...n }));
+  }
+
+  _normalizeWhiteboardNote(raw = {}) {
+    const text = String(raw.text || raw.note || "").trim();
+    if (!text) return null;
+    const createdAt = Number(raw.createdAt) || Date.now();
+    const id =
+      String(raw.id || "").trim() ||
+      `wb_${createdAt}_${text.slice(0, 16).replace(/\s+/g, "_")}`;
+    return {
+      id,
+      agentId: raw.agentId || "architect",
+      agentName: String(raw.agentName || raw.author || "Tech Lead"),
+      color: raw.color || "#8B5CF6",
+      text: text.slice(0, 220),
+      createdAt,
+    };
+  }
+
+  setWhiteboardNotes(notes = []) {
+    const byId = new Map();
+    for (const raw of Array.isArray(notes) ? notes : []) {
+      const normalized = this._normalizeWhiteboardNote(raw);
+      if (normalized && !byId.has(normalized.id)) {
+        byId.set(normalized.id, normalized);
+      }
+    }
+    this.whiteboardNotes = Array.from(byId.values())
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .slice(0, 8);
+    if (this.whiteboardScreen) {
+      this._redrawMeetingWhiteboard();
+    }
+    return this.getWhiteboardNotes();
+  }
+
+  addWhiteboardNote(raw = {}) {
+    const normalized = this._normalizeWhiteboardNote(raw);
+    if (!normalized) return null;
+    const filtered = this.whiteboardNotes.filter((n) => n.id !== normalized.id);
+    this.whiteboardNotes = [normalized, ...filtered]
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .slice(0, 8);
+    if (this.whiteboardScreen) {
+      this._redrawMeetingWhiteboard();
+    }
+    return normalized;
   }
 
   setMeetingState({ active = false, topic = null, presenterName = null } = {}) {
@@ -933,11 +985,45 @@ export class MonitorScreenSystem {
     return true;
   }
 
+  _wrapCanvasLines(ctx, rawText, maxWidth, maxLines = 3) {
+    const words = String(rawText || "").trim().split(/\s+/).filter(Boolean);
+    if (words.length === 0) return [];
+    const lines = [];
+    let current = "";
+    for (let i = 0; i < words.length; i += 1) {
+      const word = words[i];
+      const test = current ? `${current} ${word}` : word;
+      if (ctx.measureText(test).width <= maxWidth) {
+        current = test;
+      } else {
+        if (current) {
+          lines.push(current);
+          current = word;
+        } else {
+          lines.push(word.slice(0, 28));
+          current = "";
+        }
+        if (lines.length === maxLines) {
+          const last = lines[maxLines - 1];
+          lines[maxLines - 1] = last.length > 3 ? `${last.slice(0, -1)}…` : last;
+          return lines;
+        }
+      }
+    }
+    if (current && lines.length < maxLines) {
+      lines.push(current);
+    }
+    return lines;
+  }
+
   _redrawMeetingWhiteboard() {
     if (!this.whiteboardScreen) return false;
     const { ctx, texture, canvas } = this.whiteboardScreen;
 
-    let stateSig = this.meetingScreen?.mode || "STANDBY";
+    const notesSig = this.whiteboardNotes
+      .map((n) => `${n.id}:${n.createdAt}:${n.text}`)
+      .join(";");
+    let stateSig = `${this.meetingScreen?.mode || "STANDBY"}#${notesSig}`;
     const activeCards = [];
     for (const entry of this.stationScreens.values()) {
       if (entry.agentConfig) {
@@ -963,18 +1049,80 @@ export class MonitorScreenSystem {
     ctx.fillRect(0, 0, 1024, 512);
 
     ctx.fillStyle = "#EAE4DA";
-    ctx.fillRect(0, 0, 1024, 58);
+    ctx.fillRect(0, 0, 1024, 60);
     ctx.fillStyle = "#2E3540";
     ctx.font = "bold 24px sans-serif";
-    ctx.fillText("TABLERO SPRINT · KANBAN", 32, 38);
+    ctx.fillText("PIZARRA DE ARQUITECTURA", 32, 39);
 
     ctx.fillStyle = "#6B7280";
-    ctx.font = "16px monospace";
-    ctx.fillText(
-      this.meetingScreen?.mode === "MEETING" ? "SYNC EN VIVO" : "FLUJO ACTIVO",
-      850,
-      36,
-    );
+    ctx.font = "bold 15px monospace";
+    const rightBadge =
+      this.whiteboardNotes.length > 0
+        ? `${this.whiteboardNotes.length} NOTAS RECIENTES`
+        : this.meetingScreen?.mode === "MEETING"
+          ? "SYNC EN VIVO"
+          : "FLUJO ACTIVO";
+    ctx.fillText(rightBadge, 818, 37);
+
+    if (this.whiteboardNotes.length > 0) {
+      const visibleNotes = this.whiteboardNotes.slice(0, 6);
+      const colW = 468;
+      const rowH = 122;
+
+      visibleNotes.forEach((note, idx) => {
+        const col = idx % 2;
+        const row = Math.floor(idx / 2);
+        const x = 32 + col * 492;
+        const y = 78 + row * 134;
+
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fillRect(x, y, colW, rowH);
+        ctx.strokeStyle = "#DCD6CC";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x, y, colW, rowH);
+
+        ctx.fillStyle = note.color || "#8B5CF6";
+        ctx.fillRect(x, y, 8, rowH);
+
+        const timeLabel = new Date(note.createdAt || Date.now()).toLocaleTimeString(
+          "es-ES",
+          { hour: "2-digit", minute: "2-digit" },
+        );
+
+        ctx.fillStyle = "#1F2937";
+        ctx.font = "bold 16px sans-serif";
+        ctx.fillText(String(note.agentName || "Equipo").slice(0, 22), x + 20, y + 26);
+
+        ctx.fillStyle = "#6B7280";
+        ctx.font = "13px monospace";
+        ctx.fillText(timeLabel, x + colW - 58, y + 25);
+
+        ctx.fillStyle = "#374151";
+        ctx.font = "15px sans-serif";
+        const lines = this._wrapCanvasLines(ctx, note.text, colW - 36, 3);
+        lines.forEach((line, lIdx) => {
+          ctx.fillText(line, x + 20, y + 54 + lIdx * 22);
+        });
+      });
+
+      // Pie limpio de contexto del equipo
+      ctx.fillStyle = "#EFECE6";
+      ctx.fillRect(32, 480, 960, 22);
+      ctx.fillStyle = "#4B5563";
+      ctx.font = "13px sans-serif";
+      const summary = activeCards
+        .slice(0, 5)
+        .map((c) => `${c.name}: ${String(c.label).slice(0, 18)}`)
+        .join("   ·   ");
+      ctx.fillText(
+        summary || "Notas sincronizadas con OpenCode MCP",
+        44,
+        496,
+      );
+
+      texture.needsUpdate = true;
+      return true;
+    }
 
     const cols = [
       { title: "BACKLOG", color: "#64748B" },

@@ -259,6 +259,14 @@ export class Experience {
     return this.world?.characters?.getAllSnapshots() || {};
   }
 
+  getSpatialSnapshot() {
+    return this.world?.spatialService?.computeSnapshot()?.snapshot || null;
+  }
+
+  executeSpatialCommand(command) {
+    return this.world?.spatialService?.executeSpatialCommand(command) || false;
+  }
+
   setAgentStatus(agentId, status) {
     const agent = this.world?.characters?.getAgent(agentId);
     if (agent) {

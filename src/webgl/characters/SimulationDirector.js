@@ -89,6 +89,8 @@ export class SimulationDirector {
     this.speedMultiplier = 1; // 1 | 1.5 | 2
     this.agentTimers = new Map();
     this.liveOwnership = new Map(); // agentId -> { active: boolean, idleCooldown: number }
+    this.spatialHoldUntil = new Map(); // agentId -> timestamp ms
+    this.spatialService = null;
     this.activeDelegation = null; // { hostAgentId, participants: Set }
     this._lastOpenCodeStatus = null;
     this.visualQueue = new VisualActionQueue({
@@ -118,11 +120,34 @@ export class SimulationDirector {
     }
   }
 
+  setSpatialService(service) {
+    this.spatialService = service || null;
+  }
+
+  holdAgentForSpatialIntent(agentId, durationMs = 20000) {
+    if (!agentId) return;
+    if (!durationMs || durationMs <= 0) {
+      this.spatialHoldUntil.delete(agentId);
+      return;
+    }
+    this.spatialHoldUntil.set(agentId, Date.now() + durationMs);
+  }
+
+  hasActiveSpatialHold(agentId) {
+    const until = this.spatialHoldUntil.get(agentId) || 0;
+    if (until <= Date.now()) {
+      if (until > 0) this.spatialHoldUntil.delete(agentId);
+      return false;
+    }
+    return true;
+  }
+
   isAgentLiveBusy(agentId) {
     const live = this.liveOwnership.get(agentId);
     return Boolean(
       (live && (live.active || live.idleCooldown > 0)) ||
-        this.visualQueue.hasActiveChoreography(agentId),
+        this.visualQueue.hasActiveChoreography(agentId) ||
+        this.hasActiveSpatialHold(agentId),
     );
   }
 
@@ -825,6 +850,10 @@ export class SimulationDirector {
       timer.waitCooldown = 0;
     }
 
+    if (this.hasActiveSpatialHold(agentId)) {
+      return true;
+    }
+
     this.visualQueue.enqueueWork(
       agentId,
       {
@@ -850,6 +879,18 @@ export class SimulationDirector {
       status === "failed" &&
       /permiso|respuesta en cli|fallo/i.test(String(label || ""));
 
+    if (!isUrgent && this.hasActiveSpatialHold(agentId)) {
+      const remainingSec = Math.max(
+        4,
+        Math.ceil((this.spatialHoldUntil.get(agentId) - Date.now()) / 1000),
+      );
+      this.liveOwnership.set(agentId, {
+        active: false,
+        idleCooldown: remainingSec,
+      });
+      return true;
+    }
+
     this.liveOwnership.set(agentId, {
       active: !isUrgent,
       idleCooldown: isUrgent ? Math.max(4, Number(idleCooldownSec) || 15) : 0,
@@ -872,6 +913,7 @@ export class SimulationDirector {
 
   clearAllLiveClaims() {
     this.liveOwnership.clear();
+    this.spatialHoldUntil.clear();
     this.visualQueue.reset();
     this.activeDelegation = null;
     this.monitorSystem?.setMeetingState({ active: false });
@@ -1005,6 +1047,18 @@ export class SimulationDirector {
 
       officeEventBus.on(OFFICE_EVENTS.OFFICE_MEETING, (payload) => {
         this._executeTeamMeeting(payload);
+      }),
+
+      officeEventBus.on(OFFICE_EVENTS.OFFICE_SPATIAL_COMMAND, (payload) => {
+        this.spatialService?.executeSpatialCommand(payload);
+      }),
+
+      officeEventBus.on(OFFICE_EVENTS.OFFICE_WHITEBOARD_UPDATED, (payload) => {
+        if (Array.isArray(payload?.notes)) {
+          this.monitorSystem?.setWhiteboardNotes(payload.notes);
+        } else if (payload?.note) {
+          this.monitorSystem?.addWhiteboardNote(payload.note);
+        }
       }),
     );
   }
@@ -1496,6 +1550,9 @@ export class SimulationDirector {
           }
         }
       } else if (agent.state === "INTERACTING") {
+        if (this.hasActiveSpatialHold(agentId)) {
+          continue;
+        }
         timer.interactCooldown -= scaledDelta;
         if (timer.interactCooldown <= 0) {
           timer.workCooldown = 12 + Math.random() * 10;

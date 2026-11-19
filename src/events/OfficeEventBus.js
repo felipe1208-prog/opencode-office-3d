@@ -14,6 +14,9 @@ export const OFFICE_EVENTS = {
   OPENCODE_SESSION_LOG: "opencode:session_log",
   OPENCODE_DELEGATION: "opencode:delegation",
   OPENCODE_QUESTION: "opencode:question",
+  OFFICE_SPATIAL_STATE: "office:spatial_state",
+  OFFICE_SPATIAL_COMMAND: "office:spatial_command",
+  OFFICE_WHITEBOARD_UPDATED: "office:whiteboard_updated",
 };
 
 const MAX_HISTORY = 30;

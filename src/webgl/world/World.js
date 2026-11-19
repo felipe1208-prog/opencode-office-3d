@@ -13,7 +13,9 @@ import { CharacterManager } from "../characters/CharacterManager.js";
 import { SimulationDirector } from "../characters/SimulationDirector.js";
 import { MonitorScreenSystem } from "./MonitorScreenSystem.js";
 import { NightLightingRig } from "./NightLightingRig.js";
+import { SpatialAwarenessService } from "./SpatialAwarenessService.js";
 import { MaterialPool, batchStaticZones } from "../utils/SceneOptimizer.js";
+import { officeEventBus, OFFICE_EVENTS } from "../../events/OfficeEventBus.js";
 
 export class World {
   constructor(experience, { onAgentUpdate = null, onDirectorChange = null } = {}) {
@@ -60,7 +62,7 @@ export class World {
       { materialPool: this.materialPool },
     );
 
-    // 3. Personajes, Sockets, Burbujas y Mock Director conectado al Event Bus
+    // 3. Personajes, Sockets, Burbujas y Director conectado al Event Bus
     this.characters = new CharacterManager(this.experience, (agentId, snap) => {
       this.monitorSystem.syncFromAgentSnapshots({ [agentId]: snap });
       if (onAgentUpdate) onAgentUpdate(agentId, snap);
@@ -69,6 +71,21 @@ export class World {
       onDirectorChange,
       monitorSystem: this.monitorSystem,
     });
+
+    // 4. Servicio ligero de conciencia espacial (<= 2 Hz, fuera del bucle rAF)
+    this.spatialService = new SpatialAwarenessService({
+      characterManager: this.characters,
+      director: this.director,
+      monitorSystem: this.monitorSystem,
+      onSync: (snapshot) => {
+        officeEventBus.emit(
+          OFFICE_EVENTS.OFFICE_SPATIAL_STATE,
+          snapshot,
+          "spatial-3d",
+        );
+      },
+    });
+    this.director.setSpatialService(this.spatialService);
   }
 
   setDayNightFactor(factor) {
@@ -83,6 +100,7 @@ export class World {
   }
 
   destroy() {
+    this.spatialService?.destroy();
     this.director?.destroy();
     this.characters?.destroy();
     this.monitorSystem?.dispose();

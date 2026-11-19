@@ -223,6 +223,23 @@ export class OpenCodeBridgeClient {
     this.lastAgentEmitAt = new Map();
     this.pendingAgentBuffer = new Map();
     this.pendingFlushTimers = new Map();
+
+    // Sincronización espacial 3D <-> puente local (:4097) para MCP
+    this.lastSpatialSnapshot = null;
+    this.spatialPollTimer = null;
+    this.spatialBridgeBackoffUntil = 0;
+    this.spatialSyncInFlight = false;
+    this.spatialPollInFlight = false;
+    this.lastWhiteboardSig = "";
+    this.spatialUnsub = officeEventBus.on(
+      OFFICE_EVENTS.OFFICE_SPATIAL_STATE,
+      (snapshot) => {
+        this.syncSpatialState(snapshot);
+      },
+    );
+    if (typeof window !== "undefined") {
+      this._startSpatialPolling();
+    }
   }
 
   _loadConfig() {
@@ -2071,6 +2088,19 @@ export class OpenCodeBridgeClient {
     this.lastEventAt = Date.now();
 
     if (eventType === "server.connected" || eventType === "server.heartbeat") {
+      return null;
+    }
+
+    if (eventType === "office.spatial.command") {
+      const command = props?.command && typeof props.command === "object" ? props.command : props;
+      const whiteboard = props?.whiteboard;
+      if (whiteboard && Array.isArray(whiteboard.notes)) {
+        this._syncWhiteboardFromBridge(whiteboard.notes);
+      }
+      if (command && command.type && (command.agentId || command.agente)) {
+        officeEventBus.emit(OFFICE_EVENTS.OFFICE_SPATIAL_COMMAND, command, "opencode-sse");
+        return command.agentId || command.agente || null;
+      }
       return null;
     }
 
@@ -5873,6 +5903,11 @@ export class OpenCodeBridgeClient {
       this.lastError = null;
       this._emitConnectionState();
       this._startWatchdog(controller);
+      this.spatialBridgeBackoffUntil = 0;
+      this._startSpatialPolling();
+      if (this.lastSpatialSnapshot) {
+        this.syncSpatialState(this.lastSpatialSnapshot, { force: true });
+      }
 
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
@@ -6014,7 +6049,124 @@ export class OpenCodeBridgeClient {
     this._emitPermissionsState(false, null);
   }
 
+  _getSpatialBridgeUrl() {
+    if (this.config.mode === "bridge" && this.config.bridgeUrl) {
+      return this.config.bridgeUrl.replace(/\/+$/, "");
+    }
+    return (this.config.bridgeUrl || "http://127.0.0.1:4097").replace(/\/+$/, "");
+  }
+
+  _syncWhiteboardFromBridge(notes) {
+    if (!Array.isArray(notes)) return;
+    const sig = notes.map((n) => `${n.id}:${n.createdAt || 0}`).join("|");
+    if (sig === this.lastWhiteboardSig) return;
+    this.lastWhiteboardSig = sig;
+    officeEventBus.emit(
+      OFFICE_EVENTS.OFFICE_WHITEBOARD_UPDATED,
+      { notes },
+      "spatial-bridge",
+    );
+  }
+
+  _startSpatialPolling() {
+    if (this.spatialPollTimer || typeof window === "undefined") return;
+    this.spatialPollTimer = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      this.pollSpatialCommands();
+    }, 1500);
+  }
+
+  _stopSpatialPolling() {
+    if (this.spatialPollTimer) {
+      clearInterval(this.spatialPollTimer);
+      this.spatialPollTimer = null;
+    }
+  }
+
+  async syncSpatialState(snapshot, { force = false } = {}) {
+    if (!snapshot || typeof snapshot !== "object") return;
+    this.lastSpatialSnapshot = snapshot;
+
+    const now = Date.now();
+    if (!force && now < this.spatialBridgeBackoffUntil) return;
+    if (this.spatialSyncInFlight) return;
+
+    const bridgeUrl = this._getSpatialBridgeUrl();
+    if (!bridgeUrl) return;
+
+    this.spatialSyncInFlight = true;
+    try {
+      const resp = await fetch(`${bridgeUrl}/api/office/spatial-state`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(snapshot),
+        signal: AbortSignal.timeout(2000),
+      });
+      if (!resp.ok) {
+        this.spatialBridgeBackoffUntil = Date.now() + 15000;
+        return;
+      }
+      this.spatialBridgeBackoffUntil = 0;
+      const data = await resp.json().catch(() => null);
+      if (Array.isArray(data?.whiteboard?.notes)) {
+        this._syncWhiteboardFromBridge(data.whiteboard.notes);
+      }
+      if (Number(data?.pendingCommandsCount) > 0) {
+        this.pollSpatialCommands({ force: true });
+      }
+    } catch {
+      this.spatialBridgeBackoffUntil = Date.now() + 15000;
+    } finally {
+      this.spatialSyncInFlight = false;
+    }
+  }
+
+  async pollSpatialCommands({ force = false } = {}) {
+    const now = Date.now();
+    if (!force && now < this.spatialBridgeBackoffUntil) return;
+    if (this.spatialPollInFlight) return;
+
+    const bridgeUrl = this._getSpatialBridgeUrl();
+    if (!bridgeUrl) return;
+
+    this.spatialPollInFlight = true;
+    try {
+      const resp = await fetch(`${bridgeUrl}/api/office/spatial-command`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(2000),
+      });
+      if (!resp.ok) {
+        this.spatialBridgeBackoffUntil = Date.now() + 15000;
+        return;
+      }
+      this.spatialBridgeBackoffUntil = 0;
+      const data = await resp.json().catch(() => null);
+      if (Array.isArray(data?.whiteboard?.notes)) {
+        this._syncWhiteboardFromBridge(data.whiteboard.notes);
+      }
+      const commands = Array.isArray(data?.commands) ? data.commands : [];
+      for (const cmd of commands) {
+        if (cmd && cmd.type) {
+          officeEventBus.emit(OFFICE_EVENTS.OFFICE_SPATIAL_COMMAND, cmd, "spatial-bridge");
+        }
+      }
+    } catch {
+      this.spatialBridgeBackoffUntil = Date.now() + 15000;
+    } finally {
+      this.spatialPollInFlight = false;
+    }
+  }
+
   dispose() {
+    this._stopSpatialPolling();
+    if (this.spatialUnsub) {
+      this.spatialUnsub();
+      this.spatialUnsub = null;
+    }
     this.disconnect();
   }
 }

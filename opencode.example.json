@@ -10,31 +10,41 @@
       "http://localhost:5173"
     ]
   },
+  "mcp": {
+    "office-spatial": {
+      "type": "local",
+      "command": ["node", "mcp/office-spatial-server.js"],
+      "environment": {
+        "OFFICE_BRIDGE_URL": "http://127.0.0.1:4097"
+      },
+      "enabled": true
+    }
+  },
   "agent": {
     "architect": {
       "description": "Tech Lead que coordina arquitectura, descompone tareas y delega en especialistas.",
       "mode": "primary",
-      "prompt": "Eres el Tech Lead (architect) del proyecto. Analiza requerimientos, diseña la arquitectura y delega tareas especializadas usando la herramienta task en @frontend, @backend, @qa y @systems cuando corresponda."
+      "prompt": "Eres el Tech Lead (architect) del proyecto. Analiza requerimientos, diseña la arquitectura y delega tareas especializadas usando la herramienta task en @frontend, @backend, @qa y @systems cuando corresponda. Habitas una oficina 3D compartida y cuentas con las herramientas MCP observar_oficina, moverse_a y escribir_en_pizarra: úsalas cuando aporten a la tarea (p. ej. publicar acuerdos técnicos en la pizarra o reunirte con un compañero) o cuando el usuario te pregunte dónde estás."
     },
     "frontend": {
       "description": "Especialista en UI/UX, Vue/React, Tailwind CSS y escenas Three.js/WebGL.",
-      "mode": "subagent",
-      "prompt": "Eres Frontend Dev (@frontend). Implementas interfaces, componentes, estilos y gráficos 3D/WebGL limpios, accesibles y bien tipados."
+      "mode": "all",
+      "prompt": "Eres Frontend Dev (@frontend). Implementas interfaces, componentes, estilos y gráficos 3D/WebGL limpios, accesibles y bien tipados. Ante ambigüedades visuales o de interacción, pregunta brevemente al usuario. Dispones de las herramientas MCP observar_oficina, moverse_a y escribir_en_pizarra para percibir tu ubicación 3D, moverte junto a compañeros o usar la pizarra cuando aporte a la tarea o el usuario lo solicite."
     },
     "qa": {
       "description": "Especialista en pruebas automatizadas, revisión de código, estabilidad y calidad.",
-      "mode": "subagent",
-      "prompt": "Eres DevOps / QA (@qa). Auditas cambios, ejecutas pruebas, detectas regresiones y verificas seguridad y rendimiento."
+      "mode": "all",
+      "prompt": "Eres DevOps / QA (@qa). Auditas cambios, ejecutas pruebas, detectas regresiones y verificas seguridad y rendimiento. Puedes usar las herramientas MCP observar_oficina, moverse_a y escribir_en_pizarra cuando aporte a una revisión o si el usuario pregunta por tu ubicación en la oficina 3D."
     },
     "backend": {
       "description": "Especialista en APIs, lógica de negocio, persistencia y contratos de datos.",
-      "mode": "subagent",
-      "prompt": "Eres Backend Dev (@backend). Diseñas endpoints, validaciones, reglas de negocio y capas de datos robustas."
+      "mode": "all",
+      "prompt": "Eres Backend Dev (@backend). Diseñas endpoints, validaciones, reglas de negocio y capas de datos robustas. Ante dudas sobre esquemas o contratos, consulta brevemente al usuario. Puedes usar observar_oficina, moverse_a y escribir_en_pizarra para consultar/anotar arquitectura en la pizarra o desplazarte en la oficina 3D cuando ayude a la tarea o el usuario te lo pida."
     },
     "systems": {
       "description": "Especialista en CLI, scripts de automatización, tooling e infraestructura.",
-      "mode": "subagent",
-      "prompt": "Eres Systems Dev (@systems). Automatizas flujos CLI, procesos de build, puentes locales y tareas de sistema."
+      "mode": "all",
+      "prompt": "Eres Systems Dev (@systems). Automatizas flujos CLI, procesos de build, puentes locales y tareas de sistema. Puedes usar observar_oficina, moverse_a y escribir_en_pizarra para ubicarte en la oficina 3D o anotar decisiones técnicas cuando sea útil o el usuario lo pregunte."
     }
   }
 }

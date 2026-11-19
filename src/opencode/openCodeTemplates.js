@@ -17,31 +17,41 @@ export const OPENCODE_JSON_SNIPPET = `{
       "http://127.0.0.1:3000"
     ]
   },
+  "mcp": {
+    "office-spatial": {
+      "type": "local",
+      "command": ["node", "mcp/office-spatial-server.js"],
+      "environment": {
+        "OFFICE_BRIDGE_URL": "http://127.0.0.1:4097"
+      },
+      "enabled": true
+    }
+  },
   "agent": {
     "architect": {
       "description": "Tech Lead que coordina arquitectura y delega tareas.",
       "mode": "primary",
-      "prompt": "Eres Tech Lead (architect). Analiza el problema y delega en @frontend, @backend, @qa o @systems usando la herramienta task. Si hay decisiones de negocio o arquitectura ambiguas, pregunta primero al usuario."
+      "prompt": "Eres Tech Lead (architect). Analiza el problema y delega en @frontend, @backend, @qa o @systems usando la herramienta task. Si hay decisiones de negocio o arquitectura ambiguas, pregunta primero al usuario. Habitas una oficina 3D compartida y dispones de las herramientas MCP observar_oficina, moverse_a y escribir_en_pizarra: úsalas cuando aporten valor real (ej. anotar acuerdos técnicos en la pizarra, acercarte a un compañero o a la sala de reuniones) o cuando el usuario te pregunte dónde estás o qué hay alrededor."
     },
     "frontend": {
       "description": "UI/UX, componentes web y escenas Three.js/WebGL.",
       "mode": "all",
-      "prompt": "Eres Frontend Dev (@frontend). Implementas vistas, estilos y módulos 3D. Cuando recibas una tarea delegada con ambigüedades visuales, de paleta, layout o interacción, detente y haz una pregunta breve y concreta al usuario (usando la herramienta question o un mensaje directo claro) antes de asumir en silencio."
+      "prompt": "Eres Frontend Dev (@frontend). Implementas vistas, estilos y módulos 3D. Cuando recibas una tarea delegada con ambigüedades visuales, de paleta, layout o interacción, detente y haz una pregunta breve y concreta al usuario (usando la herramienta question o un mensaje directo claro) antes de asumir en silencio. Dispones de las herramientas MCP observar_oficina, moverse_a y escribir_en_pizarra para percibir tu entorno en la oficina 3D, desplazarte junto a un compañero o consultar/anotar en la pizarra cuando aporte a la tarea o el usuario lo pida."
     },
     "qa": {
       "description": "Pruebas automatizadas, auditoría y revisión de código.",
       "mode": "all",
-      "prompt": "Eres DevOps / QA (@qa). Verificas tests, compilación y calidad. Si falta criterio de aceptación o alcance de pruebas en una tarea delegada, formula una pregunta breve al usuario antes de continuar."
+      "prompt": "Eres DevOps / QA (@qa). Verificas tests, compilación y calidad. Si falta criterio de aceptación o alcance de pruebas en una tarea delegada, formula una pregunta breve al usuario antes de continuar. Puedes usar observar_oficina, moverse_a y escribir_en_pizarra cuando aporte valor durante revisiones con el equipo o si el usuario pregunta por tu ubicación en la oficina 3D."
     },
     "backend": {
       "description": "APIs, persistencia y lógica de negocio.",
       "mode": "all",
-      "prompt": "Eres Backend Dev (@backend). Diseñas rutas, validaciones y servicios. Cuando falten definiciones de esquema, endpoints o reglas de negocio en una tarea delegada, detente y pregunta al usuario de forma breve y concreta (mediante question o mensaje directo)."
+      "prompt": "Eres Backend Dev (@backend). Diseñas rutas, validaciones y servicios. Cuando falten definiciones de esquema, endpoints o reglas de negocio en una tarea delegada, detente y pregunta al usuario de forma breve y concreta (mediante question o mensaje directo). Puedes usar observar_oficina, moverse_a y escribir_en_pizarra para consultar acuerdos de arquitectura en la pizarra, acercarte a compañeros o ubicarte en la oficina 3D cuando sea útil o el usuario lo solicite."
     },
     "systems": {
       "description": "CLI, scripts, automatización e infraestructura.",
       "mode": "all",
-      "prompt": "Eres Systems Dev (@systems). Construyes scripts CLI y puentes de integración. Si existen dudas sobre rutas, entornos o permisos requeridos, consulta brevemente al usuario antes de ejecutar cambios."
+      "prompt": "Eres Systems Dev (@systems). Construyes scripts CLI y puentes de integración. Si existen dudas sobre rutas, entornos o permisos requeridos, consulta brevemente al usuario antes de ejecutar cambios. Puedes usar observar_oficina, moverse_a y escribir_en_pizarra para orientarte en la oficina 3D o coordinar notas técnicas en la pizarra cuando aporte a la tarea o el usuario te lo pida."
     }
   }
 }`;
@@ -130,11 +140,22 @@ Si prefieres definir cada agente en su propio archivo Markdown dentro de \`.open
 
 > **Importante para consultas proactivas:** incluye en las instrucciones de tus agentes que, ante cualquier ambigüedad visual o funcional en una tarea delegada, detengan un momento y hagan una pregunta breve y concreta al usuario usando \`question\` o un mensaje directo antes de asumir en silencio.
 
-*(Nota: si usas la alternativa Markdown, recuerda mantener el bloque \`"server"\` con \`"cors"\` dentro de \`opencode.json\`).*
+*(Nota: si usas la alternativa Markdown, recuerda mantener los bloques \`"server"\` y \`"mcp"\` dentro de \`opencode.json\`).*
 
 ---
 
-## 4. Cómo arrancar y conectar la Oficina Virtual 3D
+## 4. Conciencia Espacial 3D (MCP \`office-spatial\`)
+
+El bloque \`"mcp"\` incluido arriba registra \`mcp/office-spatial-server.js\` (servidor MCP local por \`stdio\` sin dependencias externas) conectado al puente local \`http://127.0.0.1:4097\`.
+
+Herramientas disponibles para los 5 agentes:
+- \`observar_oficina(agente)\`: consulta zona actual en la oficina 3D, coordenadas \`(x, z)\`, postura, objetos cercanos (\`<= 2.5m\`), compañeros próximos y notas visibles en la pizarra.
+- \`moverse_a(agente, destino, motivo)\`: camina hacia \`escritorio\`, \`pizarra\`, \`sala_reuniones\`, \`cafe\`, \`lounge\`, \`ping_pong\`, \`arcade\`, o junto a otro compañero (\`frontend\`, \`backend\`, \`qa\`, \`systems\`, \`architect\`).
+- \`escribir_en_pizarra(agente, nota)\`: camina a la Sala de Reuniones y publica una nota técnica en la **Pizarra de Arquitectura 3D** compartida.
+
+---
+
+## 5. Cómo arrancar y conectar la Oficina Virtual 3D
 
 ### Opción A — Conexión directa (\`opencode serve\` en puerto 4096)
 
@@ -150,8 +171,9 @@ Si prefieres definir cada agente en su propio archivo Markdown dentro de \`.open
    \`\`\`
 
 3. En la **Oficina Virtual 3D**, pulsa el botón **OpenCode**, selecciona **Directo :4096**, pulsa **Probar conexión** y luego **Conectar**.
+   *(Opcional: inicia también \`${OPENCODE_CLI_COMMANDS.runBridge}\` en otra terminal si quieres que los agentes usen las herramientas MCP espaciales en vivo).*
 
-### Opción B — Mediante Puente Local Node (puerto 4097, recomendado si hay CORS o Basic Auth)
+### Opción B — Mediante Puente Local Node (puerto 4097, recomendado para CORS, Basic Auth y MCP Espacial)
 
 1. Inicia \`opencode serve\` (opcionalmente protegido con \`OPENCODE_SERVER_USERNAME\` y \`OPENCODE_SERVER_PASSWORD\`):
    \`\`\`bash
@@ -165,7 +187,7 @@ Si prefieres definir cada agente en su propio archivo Markdown dentro de \`.open
 
 ---
 
-## 5. Cómo funciona el Modo Híbrido y la delegación de subagentes
+## 6. Cómo funciona el Modo Híbrido y la delegación de subagentes
 
 - **Configuración activa detectada al generar este reporte:** modo \`${mode}\` · URL \`${url}\`.
 - Cuando \`architect\` ejecuta una llamada con la herramienta \`task\` (o abre una sesión hija con \`parentID\`) invocando a \`@frontend\`, \`@backend\`, \`@qa\` o \`@systems\`:
@@ -176,10 +198,11 @@ Si prefieres definir cada agente en su propio archivo Markdown dentro de \`.open
 
 ---
 
-## 6. Verificación rápida y solución de problemas
+## 7. Verificación rápida y solución de problemas
 
 - **No responde \`Probar conexión\`:** verifica que \`opencode serve\` esté escuchando en el puerto \`4096\` y que hayas iniciado con \`--cors\` incluyendo tu origen exacto (o usa \`npm run opencode:bridge\`).
 - **Error \`401 Unauthorized\`:** introduce el mismo usuario y contraseña de \`OPENCODE_SERVER_USERNAME\` / \`OPENCODE_SERVER_PASSWORD\` en el panel **OpenCode**.
 - **Los eventos llegan todos al mismo avatar:** revisa que tus subagentes usen los IDs \`frontend\`, \`qa\`, \`backend\`, \`systems\` o agrega los nombres reales de tus agentes en **OpenCode → Mapeo (5 Agentes)**.
+- **Las herramientas MCP espaciales dicen puente sin conexión:** ejecuta \`npm run opencode:bridge\` desde la carpeta del proyecto para activar \`http://127.0.0.1:4097\`.
 `;
 }

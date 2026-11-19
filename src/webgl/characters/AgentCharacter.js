@@ -46,6 +46,8 @@ export class AgentCharacter {
     this.isTransitioningSeat = false;
     this.bubblesEnabled = true;
     this.hasPendingUserQuestion = false;
+    this.contextualBubble = null;
+    this._contextualBubbleTimer = null;
 
     this.pendingTimers = new Set();
 
@@ -135,6 +137,41 @@ export class AgentCharacter {
     this.syncBubble();
   }
 
+  clearContextualBubble() {
+    if (this._contextualBubbleTimer) {
+      clearTimeout(this._contextualBubbleTimer);
+      this._contextualBubbleTimer = null;
+    }
+    if (!this.contextualBubble) return;
+    this.contextualBubble = null;
+    this.syncBubble();
+  }
+
+  setContextualBubble(text, { color = null, durationMs = 3600 } = {}) {
+    if (this._contextualBubbleTimer) {
+      clearTimeout(this._contextualBubbleTimer);
+      this._contextualBubbleTimer = null;
+    }
+    const clean = String(text || "").trim();
+    if (!clean) {
+      this.contextualBubble = null;
+      this.syncBubble();
+      return;
+    }
+    const safeDuration = Math.max(800, Number(durationMs) || 3600);
+    this.contextualBubble = {
+      text: clean.length > 42 ? `${clean.slice(0, 41)}…` : clean,
+      color: color || this.config.color,
+      expiresAt: Date.now() + safeDuration,
+    };
+    this.syncBubble();
+    this._contextualBubbleTimer = setTimeout(() => {
+      this._contextualBubbleTimer = null;
+      this.contextualBubble = null;
+      this.syncBubble();
+    }, safeDuration);
+  }
+
   updateProfile(profile) {
     if (!profile) return;
     if (profile.name) this.config.name = profile.name;
@@ -168,6 +205,13 @@ export class AgentCharacter {
     if (this.hasPendingUserQuestion) {
       text = "Tiene una pregunta para ti";
       color = "#FCD34D";
+    } else if (
+      this.contextualBubble &&
+      this.contextualBubble.text &&
+      Date.now() < this.contextualBubble.expiresAt
+    ) {
+      text = this.contextualBubble.text;
+      color = this.contextualBubble.color || color;
     } else if (this.socialMode === "PAIR_CHAT" && this.socialPartnerName) {
       if (this.state === "TRAVELING") {
         text = `Yendo a charlar con ${this.socialPartnerName}`;
@@ -898,6 +942,10 @@ export class AgentCharacter {
   }
 
   destroy() {
+    if (this._contextualBubbleTimer) {
+      clearTimeout(this._contextualBubbleTimer);
+      this._contextualBubbleTimer = null;
+    }
     this.clearTimers();
     this.bubble?.dispose();
     this.propSockets.dispose();
