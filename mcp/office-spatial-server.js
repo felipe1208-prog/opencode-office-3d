@@ -9,8 +9,6 @@
  *   - escribir_en_pizarra(agente, nota)
  */
 
-import readline from "node:readline";
-
 const BRIDGE_URL = (process.env.OFFICE_BRIDGE_URL || "http://127.0.0.1:4097").replace(/\/+$/, "");
 const SERVER_INFO = {
   name: "office-spatial",
@@ -134,8 +132,16 @@ const TOOLS = [
   },
 ];
 
+let detectedContentLengthFraming = false;
+
 function sendMessage(payload) {
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
+  const json = JSON.stringify(payload);
+  if (detectedContentLengthFraming) {
+    const byteLen = Buffer.byteLength(json, "utf8");
+    process.stdout.write(`Content-Length: ${byteLen}\r\n\r\n${json}`);
+    return;
+  }
+  process.stdout.write(`${json}\n`);
 }
 
 function sendResult(id, result) {
@@ -454,15 +460,9 @@ async function handleRequest(msg) {
   }
 }
 
-const rl = readline.createInterface({
-  input: process.stdin,
-  crlfDelay: Infinity,
-});
-
-rl.on("line", (line) => {
-  const trimmed = line.trim();
+function dispatchRawJson(rawJson) {
+  const trimmed = rawJson.trim();
   if (!trimmed) return;
-
   let msg = null;
   try {
     msg = JSON.parse(trimmed);
@@ -477,4 +477,70 @@ rl.on("line", (line) => {
       sendError(msg.id, -32603, err?.message || "Error interno en servidor MCP");
     }
   });
+}
+
+let inputBuffer = Buffer.alloc(0);
+
+function drainInputBuffer() {
+  while (inputBuffer.length > 0) {
+    // Detectar framing Content-Length (estilo LSP) si el cliente lo usa
+    const headPreview = inputBuffer.subarray(0, 64).toString("utf8");
+    if (/^\s*Content-Length:/i.test(headPreview)) {
+      const headerEndCrlf = inputBuffer.indexOf("\r\n\r\n");
+      const headerEndLf = inputBuffer.indexOf("\n\n");
+      let headerEnd = -1;
+      let sepLen = 0;
+      if (headerEndCrlf !== -1 && (headerEndLf === -1 || headerEndCrlf < headerEndLf)) {
+        headerEnd = headerEndCrlf;
+        sepLen = 4;
+      } else if (headerEndLf !== -1) {
+        headerEnd = headerEndLf;
+        sepLen = 2;
+      }
+      if (headerEnd === -1) return;
+
+      const headerStr = inputBuffer.subarray(0, headerEnd).toString("utf8");
+      const match = headerStr.match(/Content-Length:\s*(\d+)/i);
+      if (!match) {
+        inputBuffer = inputBuffer.subarray(headerEnd + sepLen);
+        continue;
+      }
+      const bodyLen = Number(match[1]);
+      const totalNeeded = headerEnd + sepLen + bodyLen;
+      if (inputBuffer.length < totalNeeded) return;
+
+      detectedContentLengthFraming = true;
+      const bodyStr = inputBuffer.subarray(headerEnd + sepLen, totalNeeded).toString("utf8");
+      inputBuffer = inputBuffer.subarray(totalNeeded);
+      dispatchRawJson(bodyStr);
+      continue;
+    }
+
+    // Framing estándar MCP: NDJSON por línea (\n)
+    const nlIndex = inputBuffer.indexOf(10);
+    if (nlIndex === -1) return;
+    const line = inputBuffer.subarray(0, nlIndex).toString("utf8");
+    inputBuffer = inputBuffer.subarray(nlIndex + 1);
+    if (line.trim()) {
+      dispatchRawJson(line);
+    }
+  }
+}
+
+process.stdin.on("data", (chunk) => {
+  const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
+  inputBuffer = Buffer.concat([inputBuffer, buf]);
+  drainInputBuffer();
+});
+
+process.stdin.on("end", () => {
+  if (inputBuffer.length > 0) {
+    const rest = inputBuffer.toString("utf8").trim();
+    if (rest.startsWith("{")) dispatchRawJson(rest);
+  }
+  setTimeout(() => process.exit(0), 25);
+});
+
+process.stdout.on("error", (err) => {
+  if (err?.code === "EPIPE") process.exit(0);
 });

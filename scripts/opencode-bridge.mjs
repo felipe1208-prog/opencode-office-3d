@@ -481,9 +481,11 @@ async function proxyHttp(req, res, targetUrl) {
     });
 
     const contentType = upstreamResp.headers.get("content-type") || "application/json";
+    const isSse = contentType.includes("text/event-stream");
     res.writeHead(upstreamResp.status, {
       "Content-Type": contentType,
       "Cache-Control": "no-cache",
+      ...(isSse ? { Connection: "keep-alive", "X-Accel-Buffering": "no" } : {}),
     });
 
     if (!upstreamResp.body) {
@@ -492,7 +494,6 @@ async function proxyHttp(req, res, targetUrl) {
     }
 
     const reader = upstreamResp.body.getReader();
-    const isSse = contentType.includes("text/event-stream");
     if (isSse) {
       sseClients.add(res);
     }
@@ -507,13 +508,34 @@ async function proxyHttp(req, res, targetUrl) {
         }, 15000)
       : null;
 
+    const decoder = isSse ? new TextDecoder() : null;
+    let sseBuffer = "";
+
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (!res.writableEnded) {
+        if (res.writableEnded) continue;
+
+        if (!isSse) {
           res.write(value);
+          continue;
         }
+
+        // Emitir frames SSE completos por delimitador \n\n para que broadcastCustomEvent
+        // nunca se intercale a mitad de un frame JSON fragmentado entre chunks TCP.
+        sseBuffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        let boundaryIdx;
+        while ((boundaryIdx = sseBuffer.indexOf("\n\n")) !== -1) {
+          const completeFrame = sseBuffer.slice(0, boundaryIdx + 2);
+          sseBuffer = sseBuffer.slice(boundaryIdx + 2);
+          if (completeFrame) {
+            res.write(completeFrame);
+          }
+        }
+      }
+      if (isSse && sseBuffer && !res.writableEnded) {
+        res.write(sseBuffer.endsWith("\n\n") ? sseBuffer : `${sseBuffer}\n\n`);
       }
     } finally {
       if (heartbeat) clearInterval(heartbeat);

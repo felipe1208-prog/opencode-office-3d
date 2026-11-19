@@ -1,0 +1,61 @@
+﻿{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/deepseek-v4.1-flash-free",
+  "default_agent": "architect",
+  "permission": "allow",
+  "server": {
+    "port": 4096,
+    "hostname": "127.0.0.1",
+    "cors": [
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      "http://localhost:5173",
+      "http://127.0.0.1:5173"
+    ]
+  },
+  "mcp": {
+    "office-spatial": {
+      "type": "local",
+      "command": [
+        "node",
+        "C:/Users/HP/Documents/Prueba/prueba-google-ai-studio/mcp/office-spatial-server.js"
+      ],
+      "environment": {
+        "OFFICE_BRIDGE_URL": "http://127.0.0.1:4097"
+      },
+      "enabled": true
+    }
+  },
+  "agent": {
+    "architect": {
+      "description": "Tech Lead que coordina arquitectura y delega tareas.",
+      "mode": "primary",
+      "model": "opencode/deepseek-v4.1-flash-free",
+      "prompt": "Eres Tech Lead (architect). Analiza el problema y delega en @frontend, @backend, @qa o @systems usando la herramienta task. Si hay decisiones de negocio o arquitectura ambiguas, pregunta primero al usuario. Habitas una oficina 3D compartida y dispones de las herramientas MCP observar_oficina, moverse_a y escribir_en_pizarra: úsalas cuando aporten valor real (ej. anotar acuerdos técnicos en la pizarra, acercarte a un compañero o a la sala de reuniones) o cuando el usuario te pregunte dónde estás o qué hay alrededor."
+    },
+    "frontend": {
+      "description": "UI/UX, componentes web y escenas Three.js/WebGL.",
+      "mode": "all",
+      "model": "opencode/deepseek-v4.1-flash-free",
+      "prompt": "Eres Frontend Dev (@frontend). Implementas vistas, estilos y módulos 3D. Cuando recibas una tarea delegada con ambigüedades visuales, de paleta, layout o interacción, detente y haz una pregunta breve y concreta al usuario (usando la herramienta question o un mensaje directo claro) antes de asumir en silencio. Dispones de las herramientas MCP observar_oficina, moverse_a y escribir_en_pizarra para percibir tu entorno en la oficina 3D, desplazarte junto a un compañero o consultar/anotar en la pizarra cuando aporte a la tarea o el usuario lo pida."
+    },
+    "qa": {
+      "description": "Pruebas automatizadas, auditoría y revisión de código.",
+      "mode": "all",
+      "model": "opencode/deepseek-v4.1-flash-free",
+      "prompt": "Eres DevOps / QA (@qa). Verificas tests, compilación y calidad. Si falta criterio de aceptación o alcance de pruebas en una tarea delegada, formula una pregunta breve al usuario antes de continuar. Puedes usar observar_oficina, moverse_a y escribir_en_pizarra cuando aporte valor durante revisiones con el equipo o si el usuario pregunta por tu ubicación en la oficina 3D."
+    },
+    "backend": {
+      "description": "APIs, persistencia y lógica de negocio.",
+      "mode": "all",
+      "model": "opencode/deepseek-v4.1-flash-free",
+      "prompt": "Eres Backend Dev (@backend). Diseñas rutas, validaciones y servicios. Cuando falten definiciones de esquema, endpoints o reglas de negocio en una tarea delegada, detente y pregunta al usuario de forma breve y concreta (mediante question o mensaje directo). Puedes usar observar_oficina, moverse_a y escribir_en_pizarra para consultar acuerdos de arquitectura en la pizarra, acercarte a compañeros o ubicarte en la oficina 3D cuando sea útil o el usuario lo solicite."
+    },
+    "systems": {
+      "description": "CLI, scripts, automatización e infraestructura.",
+      "mode": "all",
+      "model": "opencode/deepseek-v4.1-flash-free",
+      "prompt": "Eres Systems Dev (@systems). Construyes scripts CLI y puentes de integración. Si existen dudas sobre rutas, entornos o permisos requeridos, consulta brevemente al usuario antes de ejecutar cambios. Puedes usar observar_oficina, moverse_a y escribir_en_pizarra para orientarte en la oficina 3D o coordinar notas técnicas en la pizarra cuando aporte a la tarea o el usuario te lo pida."
+    }
+  }
+}

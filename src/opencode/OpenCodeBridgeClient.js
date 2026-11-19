@@ -13,6 +13,55 @@ const IDLE_DEBOUNCE_MS = 3000;
 const MAX_SESSION_LOG_ENTRIES = 200;
 const TEAM_AGENT_IDS = ["architect", "frontend", "qa", "backend", "systems"];
 
+const TOOL_LABELS_ES = {
+  read: "Leyendo archivo",
+  view: "Leyendo archivo",
+  write: "Escribiendo archivo",
+  edit: "Editando archivo",
+  multiedit: "Editando archivos",
+  apply_patch: "Aplicando cambios",
+  bash: "Ejecutando comando",
+  shell: "Ejecutando comando",
+  grep: "Buscando en código",
+  glob: "Explorando archivos",
+  find: "Explorando archivos",
+  list: "Listando carpeta",
+  ls: "Listando carpeta",
+  task: "Delegando subtarea",
+  subagent: "Delegando subtarea",
+  question: "Esperando respuesta",
+  webfetch: "Consultando web",
+  websearch: "Buscando en web",
+  todowrite: "Actualizando plan",
+  todoread: "Revisando plan",
+  observar_oficina: "Observando oficina",
+  moverse_a: "Caminando en oficina",
+  escribir_en_pizarra: "Escribiendo en pizarra",
+};
+
+function resolveToolLabelEs(rawToolName) {
+  const key = String(rawToolName || "tool").trim().toLowerCase();
+  if (TOOL_LABELS_ES[key]) return TOOL_LABELS_ES[key];
+  const suffix = key.split(/[/:._-]+/).slice(-3).join("_");
+  if (TOOL_LABELS_ES[suffix]) return TOOL_LABELS_ES[suffix];
+  for (const [knownKey, label] of Object.entries(TOOL_LABELS_ES)) {
+    if (
+      key.endsWith(`_${knownKey}`) ||
+      key.endsWith(`:${knownKey}`) ||
+      key.endsWith(`/${knownKey}`) ||
+      key.endsWith(`.${knownKey}`)
+    ) {
+      return label;
+    }
+  }
+  return `Tool: ${rawToolName || "tool"}`;
+}
+
+function extractReasoningExcerpt(rawText, maxLen = 44) {
+  const clean = extractCleanInquiryExcerpt(rawText, maxLen);
+  return clean || "";
+}
+
 function extractCleanInquiryExcerpt(rawText, maxLen = 135) {
   const clean = String(rawText || "")
     .replace(/```[\s\S]*?```/g, " ")
@@ -215,9 +264,13 @@ export class OpenCodeBridgeClient {
     this.historyFetchPromises = new Map();
     this.childSessionsByParent = new Map();
     this.messageMetaById = new Map();
+    this.partMetaById = new Map();
     this.reasoningBuffers = new Map();
     this.activeStreamEntryIds = new Map();
     this.emittedDelegations = new Set();
+    this.busySessionStartedAt = new Map();
+    this.busyMonitorTimer = null;
+    this.reconcilingReleaseSessions = new Set();
 
     // Cola de throttling por agente para proteger CanvasTexture de monitores 3D
     this.lastAgentEmitAt = new Map();
@@ -228,6 +281,7 @@ export class OpenCodeBridgeClient {
     this.lastSpatialSnapshot = null;
     this.spatialPollTimer = null;
     this.spatialBridgeBackoffUntil = 0;
+    this.lastHttpSpatialSyncAt = 0;
     this.spatialSyncInFlight = false;
     this.spatialPollInFlight = false;
     this.lastWhiteboardSig = "";
@@ -237,9 +291,6 @@ export class OpenCodeBridgeClient {
         this.syncSpatialState(snapshot);
       },
     );
-    if (typeof window !== "undefined") {
-      this._startSpatialPolling();
-    }
   }
 
   _loadConfig() {
@@ -337,8 +388,10 @@ export class OpenCodeBridgeClient {
       this.capabilities = null;
       this.capabilitiesCache.clear();
       this.deadGetPaths.clear();
+      this.spatialBridgeBackoffUntil = 0;
     }
 
+    this._syncSpatialPollingMode();
     this._saveConfig();
     this._emitConnectionState();
     return this.getConfig();
@@ -1850,23 +1903,174 @@ export class OpenCodeBridgeClient {
     return { ok: true, dismissed: true };
   }
 
+  _markSessionBusy(sessionId, agentId) {
+    if (!sessionId || !agentId) return;
+    this.busySessions.set(sessionId, agentId);
+    if (!this.busySessionStartedAt.has(sessionId)) {
+      this.busySessionStartedAt.set(sessionId, Date.now());
+    }
+    this._startBusyMonitor();
+  }
+
+  _finalizeRunningLogEntries(sessionId) {
+    if (!sessionId) return false;
+    const list = this.sessionLogsById.get(sessionId);
+    if (!Array.isArray(list) || list.length === 0) return false;
+    let changed = false;
+    for (const entry of list) {
+      if (entry && entry.status === "running") {
+        entry.status = "done";
+        changed = true;
+      }
+    }
+    for (const key of Array.from(this.activeStreamEntryIds.keys())) {
+      if (key.startsWith(`${sessionId}:`)) {
+        this.activeStreamEntryIds.delete(key);
+      }
+    }
+    if (changed) {
+      this._emitSessionLog(sessionId);
+    }
+    return changed;
+  }
+
+  _hasResponseAfterLatestPrompt(sessionId) {
+    if (!sessionId) return false;
+    const list = this.sessionLogsById.get(sessionId);
+    if (!Array.isArray(list) || list.length === 0) return false;
+    let lastPromptIdx = -1;
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      if (list[i]?.kind === "prompt") {
+        lastPromptIdx = i;
+        break;
+      }
+    }
+    for (let i = lastPromptIdx + 1; i < list.length; i += 1) {
+      const e = list[i];
+      if (!e) continue;
+      if (e.kind === "text" && String(e.content || "").trim()) return true;
+      if (e.kind === "error") return true;
+    }
+    return false;
+  }
+
+  async _reconcileSessionAfterRelease(sessionId, agentId) {
+    if (!sessionId || this.reconcilingReleaseSessions.has(sessionId)) return;
+    this.reconcilingReleaseSessions.add(sessionId);
+    try {
+      await this.hydrateSessionHistory(sessionId, { force: true });
+      this._finalizeRunningLogEntries(sessionId);
+      if (agentId && agentId !== "architect" && this._hasResponseAfterLatestPrompt(sessionId)) {
+        const logs = this.sessionLogsById.get(sessionId) || [];
+        for (let i = logs.length - 1; i >= 0; i -= 1) {
+          const entry = logs[i];
+          if (entry?.kind === "text" && entry.content && entry.agentId === agentId) {
+            this._maybeRegisterSpecialistInquiry({
+              sessionId,
+              agentId,
+              messageId: entry.sourceKey || entry.id,
+              text: entry.content,
+              onlyIfQuestion: false,
+            });
+            break;
+          }
+        }
+      }
+    } catch {
+      // Silencioso en reconciliación de respaldo
+    } finally {
+      this.reconcilingReleaseSessions.delete(sessionId);
+      this._emitConnectionState();
+    }
+  }
+
+  _startBusyMonitor() {
+    if (this.busyMonitorTimer || typeof window === "undefined") return;
+    this.busyMonitorTimer = setInterval(() => {
+      if (this.busySessions.size === 0 || this.status !== "connected") {
+        this._stopBusyMonitor();
+        return;
+      }
+      this._checkBusySessionsHealth();
+    }, 3500);
+  }
+
+  _stopBusyMonitor() {
+    if (this.busyMonitorTimer) {
+      clearInterval(this.busyMonitorTimer);
+      this.busyMonitorTimer = null;
+    }
+  }
+
+  async _checkBusySessionsHealth() {
+    if (this.busySessions.size === 0 || this.status !== "connected") return;
+    const baseUrl = this.getActiveBaseUrl();
+    const caps = this.capabilities;
+    if (!caps?.sessionStatusPath) return;
+
+    try {
+      const resp = await fetch(`${baseUrl}${caps.sessionStatusPath}`, {
+        headers: {
+          Accept: "application/json",
+          ...this._buildAuthHeaders(),
+        },
+        signal: AbortSignal.timeout(2500),
+      });
+      if (!resp.ok) return;
+      const ct = (resp.headers.get("content-type") || "").toLowerCase();
+      if (!ct.includes("application/json")) return;
+      const raw = await resp.json().catch(() => null);
+      const statusMap = this._unwrapResponseData(raw);
+      if (!statusMap || typeof statusMap !== "object") return;
+
+      const now = Date.now();
+      for (const [sid, busyAgentId] of Array.from(this.busySessions.entries())) {
+        const startedAt = this.busySessionStartedAt.get(sid) || 0;
+        if (now - startedAt < 2500) continue;
+        const st = statusMap[sid];
+        const stillBusy = st?.type === "busy" || st?.type === "running";
+        if (!stillBusy) {
+          await this.hydrateSessionHistory(sid, { force: true }).catch(() => []);
+          this._releaseSessionNow(sid, busyAgentId, {
+            status: "passed",
+            label: "Tarea finalizada",
+          });
+        }
+      }
+    } catch {
+      // Silencioso; reintenta si sigue busy
+    }
+  }
+
   _releaseSessionNow(
     sessionId,
     agentId,
     { status = "passed", label = "Tarea finalizada", file = null } = {},
   ) {
+    const effectiveAgentId =
+      (sessionId && this.busySessions.get(sessionId)) || agentId;
     if (sessionId) {
       this._cancelSessionIdleTimer(sessionId);
       this.busySessions.delete(sessionId);
+      this.busySessionStartedAt.delete(sessionId);
+      if (this.busySessions.size === 0) {
+        this._stopBusyMonitor();
+      }
+      this._finalizeRunningLogEntries(sessionId);
     }
-    if (status === "passed" && sessionId && agentId && agentId !== "architect") {
+    if (
+      status === "passed" &&
+      sessionId &&
+      effectiveAgentId &&
+      effectiveAgentId !== "architect"
+    ) {
       const logs = this.sessionLogsById.get(sessionId) || [];
       for (let i = logs.length - 1; i >= 0; i -= 1) {
         const entry = logs[i];
-        if (entry?.kind === "text" && entry.content && entry.agentId === agentId) {
+        if (entry?.kind === "text" && entry.content && entry.agentId === effectiveAgentId) {
           this._maybeRegisterSpecialistInquiry({
             sessionId,
-            agentId,
+            agentId: effectiveAgentId,
             messageId: entry.sourceKey || entry.id,
             text: entry.content,
             onlyIfQuestion: false,
@@ -1875,23 +2079,32 @@ export class OpenCodeBridgeClient {
         }
       }
     }
-    if (agentId) {
+    if (
+      status === "passed" &&
+      sessionId &&
+      this.status === "connected" &&
+      !this._hasResponseAfterLatestPrompt(sessionId)
+    ) {
+      this._reconcileSessionAfterRelease(sessionId, effectiveAgentId);
+    }
+    if (effectiveAgentId) {
       this._emitLiveKanbanSync({
         sessionId,
-        agentId,
+        agentId: effectiveAgentId,
         status: status === "failed" ? "blocked" : "done",
         title: label,
         file,
         preserveTitle: status !== "failed",
       });
     }
-    if (agentId && !this._hasOtherBusySessionForAgent(agentId, sessionId)) {
+    if (effectiveAgentId && !this._hasOtherBusySessionForAgent(effectiveAgentId, sessionId)) {
       this._queueAgentTask(
-        agentId,
+        effectiveAgentId,
         { status, label, file },
         { immediate: true },
       );
     }
+    this._emitConnectionState();
   }
 
   _scheduleSessionIdleRelease(
@@ -2318,7 +2531,7 @@ export class OpenCodeBridgeClient {
         return agentId;
       }
 
-      const baseLabel = TOOL_LABELS_ES[toolName] || `Tool: ${toolName}`;
+      const baseLabel = resolveToolLabelEs(toolName);
       const label = isFinished ? `${baseLabel} ✓` : baseLabel;
 
       this._emitLiveKanbanSync({
@@ -2631,7 +2844,7 @@ export class OpenCodeBridgeClient {
       if (statusType === "busy" || statusType === "running") {
         if (sessionId) {
           this._cancelSessionIdleTimer(sessionId);
-          this.busySessions.set(sessionId, agentId);
+          this._markSessionBusy(sessionId, agentId);
         }
         this._emitLiveKanbanSync({
           sessionId,
@@ -2737,17 +2950,129 @@ export class OpenCodeBridgeClient {
 
     if (eventType === "message.updated") {
       const info = props.info || props;
+      const sid = info?.sessionID || sessionId || this.activeSessionId || null;
       if (info?.id) {
         this.messageMetaById.set(info.id, {
           role: info.role || "assistant",
           agent: info.agent || null,
-          sessionID: info.sessionID || sessionId || null,
+          sessionID: sid,
         });
       }
       if (info?.sessionID && info?.agent) {
         this._upsertSessionRecord({ id: info.sessionID, agent: info.agent });
       }
-      return this._resolveEventAgentId(eventType, props);
+      const agentId =
+        this.resolveAgentId(info?.agent) ||
+        this._resolveEventAgentId(eventType, props);
+
+      if (info?.error && sid) {
+        const errMsg =
+          info.error?.data?.message ||
+          info.error?.message ||
+          info.error?.name ||
+          String(info.error);
+        const errSourceKey = info.id ? `msg:${info.id}:err` : null;
+        const list = this.sessionLogsById.get(sid) || [];
+        const alreadyLogged =
+          errSourceKey && list.some((e) => e.sourceKey === errSourceKey);
+        if (!alreadyLogged) {
+          this._appendSessionLogEntry(sid, {
+            sourceKey: errSourceKey,
+            kind: "error",
+            agentId: agentId || "architect",
+            content: String(errMsg),
+            status: "error",
+          });
+        }
+        this._releaseSessionNow(sid, agentId || "architect", {
+          status: "failed",
+          label: String(errMsg).slice(0, 34),
+        });
+        return agentId;
+      }
+
+      if (info?.role === "assistant" && info?.time?.completed && sid) {
+        const finish = String(info.finish || "").toLowerCase();
+        if (finish !== "tool-calls") {
+          this._finalizeRunningLogEntries(sid);
+          if (!this._hasResponseAfterLatestPrompt(sid)) {
+            this.hydrateSessionHistory(sid, { force: true }).catch(() => []);
+          }
+          this._scheduleSessionIdleRelease(sid, agentId || "architect", {
+            label: "Tarea finalizada",
+            delayMs: 900,
+          });
+        }
+      }
+      return agentId;
+    }
+
+    if (eventType === "message.part.delta") {
+      const sid = sessionId || props.sessionID || this.activeSessionId || "global";
+      this._cancelSessionIdleTimer(sid);
+      const partID = props.partID || props.id || props.part?.id || null;
+      const messageID = props.messageID || props.part?.messageID || null;
+      const field = String(props.field || "text").toLowerCase();
+      const delta = String(props.delta ?? props.text ?? "");
+      if (!delta || (field !== "text" && field !== "reasoning")) {
+        return null;
+      }
+
+      const partMeta = partID ? this.partMetaById.get(partID) : null;
+      const msgMeta = messageID ? this.messageMetaById.get(messageID) : null;
+      const role = String(partMeta?.role || msgMeta?.role || "").toLowerCase();
+      if (role === "user") return null;
+
+      const agentId =
+        partMeta?.agentId ||
+        this.resolveAgentId(msgMeta?.agent) ||
+        this._resolveEventAgentId(eventType, props);
+      if (!agentId) return null;
+
+      this._markSessionBusy(sid, agentId);
+      const isReasoning =
+        partMeta?.type === "reasoning" || field === "reasoning";
+      const streamId = partID || messageID || "active";
+      const sourceKey = messageID
+        ? `msg:${messageID}:part:${partID || (isReasoning ? "reasoning" : "text")}`
+        : null;
+
+      if (isReasoning) {
+        const bufKey = `${sid}:${agentId}`;
+        const sourceText = `${this.reasoningBuffers.get(bufKey) || ""}${delta}`.slice(-500);
+        this.reasoningBuffers.set(bufKey, sourceText);
+        this._upsertStreamingLogEntry(sid, {
+          streamKey: streamId,
+          sourceKey,
+          kind: "reasoning",
+          agentId,
+          deltaText: delta,
+          status: "running",
+        });
+        const excerpt = extractReasoningExcerpt(sourceText);
+        this._queueAgentTask(agentId, {
+          status: "started",
+          phase: "thinking",
+          label: excerpt ? `Pensando · ${excerpt}` : "Pensando...",
+          file: null,
+        });
+      } else {
+        this._upsertStreamingLogEntry(sid, {
+          streamKey: streamId,
+          sourceKey,
+          kind: "text",
+          agentId,
+          deltaText: delta,
+          status: "running",
+        });
+        this._queueAgentTask(agentId, {
+          status: "started",
+          phase: "working",
+          label: "Redactando respuesta",
+          file: null,
+        });
+      }
+      return agentId;
     }
 
     if (eventType === "message.part.updated") {
@@ -2759,6 +3084,21 @@ export class OpenCodeBridgeClient {
       if (!agentId) return null;
 
       const partRole = String(msgMeta?.role || part.role || props.info?.role || "").toLowerCase();
+      const sidForPart = part.sessionID || sessionId || this.activeSessionId || "global";
+      if (part.id) {
+        this.partMetaById.set(part.id, {
+          type: part.type || "text",
+          role: partRole,
+          agentId,
+          sessionID: sidForPart,
+          messageID: part.messageID || null,
+        });
+        while (this.partMetaById.size > 500) {
+          const oldest = this.partMetaById.keys().next().value;
+          if (!oldest) break;
+          this.partMetaById.delete(oldest);
+        }
+      }
 
       // Evitar duplicar prompts del usuario cuando message.part.updated emite la parte user text
       if (partRole === "user" && part.type === "text") {
@@ -2933,7 +3273,7 @@ export class OpenCodeBridgeClient {
             { immediate: true },
           );
         } else {
-          const label = TOOL_LABELS_ES[toolName] || `Tool: ${toolName}`;
+          const label = resolveToolLabelEs(toolName);
           this._emitLiveKanbanSync({
             sessionId,
             agentId,
@@ -2955,7 +3295,7 @@ export class OpenCodeBridgeClient {
 
       if (part.type === "text" || part.type === "reasoning") {
         const sid = part.sessionID || sessionId || this.activeSessionId || "global";
-        this.busySessions.set(sid, agentId);
+        this._markSessionBusy(sid, agentId);
         const partText = typeof part.text === "string" ? part.text : "";
         const delta = typeof props.delta === "string" ? props.delta : "";
         const isReasoning = part.type === "reasoning";
@@ -4995,7 +5335,7 @@ export class OpenCodeBridgeClient {
 
           if (!raceOutcome.settled) {
             const targetAgentId = this.resolveAgentId(agent) || "architect";
-            this.busySessions.set(targetSessionId, targetAgentId);
+            this._markSessionBusy(targetSessionId, targetAgentId);
             const { list } = this._ensureSessionLogList(targetSessionId);
             const alreadyLogged = list.some(
               (e) => e.kind === "prompt" && e.content.trim() === cleanText,
@@ -5020,11 +5360,30 @@ export class OpenCodeBridgeClient {
               label: "Procesando prompt",
               file: null,
             });
+            this._emitConnectionState();
             fetchPromise
+              .then((lateResp) =>
+                this._handleCompletedPromptHttpResponse(
+                  targetSessionId,
+                  targetAgentId,
+                  path,
+                  lateResp,
+                ),
+              )
               .catch((lateErr) => {
                 if (lateErr?.name !== "AbortError") {
-                  this.lastError = lateErr?.message || "Error en prompt OpenCode";
-                  this._emitConnectionState();
+                  const errMsg = lateErr?.message || "Error en prompt OpenCode";
+                  this.lastError = errMsg;
+                  this._appendSessionLogEntry(targetSessionId, {
+                    kind: "error",
+                    agentId: targetAgentId,
+                    content: errMsg,
+                    status: "error",
+                  });
+                  this._releaseSessionNow(targetSessionId, targetAgentId, {
+                    status: "failed",
+                    label: errMsg.slice(0, 34),
+                  });
                 }
               })
               .finally(() => {
@@ -5076,7 +5435,7 @@ export class OpenCodeBridgeClient {
           }
 
           const targetAgentId = this.resolveAgentId(agent) || "architect";
-          this.busySessions.set(targetSessionId, targetAgentId);
+          this._markSessionBusy(targetSessionId, targetAgentId);
           const { list } = this._ensureSessionLogList(targetSessionId);
           const alreadyLogged = list.some(
             (e) => e.kind === "prompt" && e.content.trim() === cleanText,
@@ -5101,6 +5460,13 @@ export class OpenCodeBridgeClient {
             label: "Prompt recibido",
             file: null,
           });
+          this._emitConnectionState();
+          await this._handleCompletedPromptHttpResponse(
+            targetSessionId,
+            targetAgentId,
+            path,
+            resp,
+          );
           return { ok: true, sessionId: targetSessionId, endpoint: path };
         }
       }
@@ -5119,6 +5485,116 @@ export class OpenCodeBridgeClient {
     } finally {
       this.promptAbortControllers.delete(controller);
     }
+  }
+
+  async _handleCompletedPromptHttpResponse(sessionId, agentId, path, resp) {
+    if (!resp || !sessionId) return;
+    const isAsyncPrompt = resp.status === 204 || String(path || "").endsWith("/prompt_async");
+    if (!resp.ok) {
+      const errMsg = await this._extractHttpError(
+        resp,
+        `Error HTTP ${resp.status} en ${path}`,
+      );
+      this._appendSessionLogEntry(sessionId, {
+        kind: "error",
+        agentId: agentId || "architect",
+        content: errMsg,
+        status: "error",
+      });
+      this._releaseSessionNow(sessionId, agentId || "architect", {
+        status: "failed",
+        label: errMsg.slice(0, 34),
+      });
+      return;
+    }
+
+    if (isAsyncPrompt) return;
+
+    const ct = (resp.headers.get("content-type") || "").toLowerCase();
+    if (!ct.includes("application/json")) return;
+    const raw = await resp.json().catch(() => null);
+    const data = this._unwrapResponseData(raw);
+    if (!data || typeof data !== "object") return;
+
+    const info = data.info || (data.role ? data : null);
+    const parts = Array.isArray(data.parts) ? data.parts : null;
+    if (!info && !parts) return;
+
+    if (info?.error) {
+      const errMsg =
+        info.error?.data?.message ||
+        info.error?.message ||
+        info.error?.name ||
+        String(info.error);
+      const errSourceKey = info.id ? `msg:${info.id}:err` : null;
+      const list = this.sessionLogsById.get(sessionId) || [];
+      if (!(errSourceKey && list.some((e) => e.sourceKey === errSourceKey))) {
+        this._appendSessionLogEntry(sessionId, {
+          sourceKey: errSourceKey,
+          kind: "error",
+          agentId: agentId || "architect",
+          content: String(errMsg),
+          status: "error",
+        });
+      }
+      this._releaseSessionNow(sessionId, agentId || "architect", {
+        status: "failed",
+        label: String(errMsg).slice(0, 34),
+      });
+      return;
+    }
+
+    // OpenCode devolvió el mensaje completo de forma síncrona tras ejecutar tools + texto:
+    // hidratar/finalizar por si SSE perdió algún chunk tras la llamada MCP.
+    if (parts && parts.length > 0) {
+      const converted = this._normalizeHistoryMessages(
+        [
+          {
+            info: info || {
+              id: `sync_${Date.now()}`,
+              role: "assistant",
+              agent: agentId || "architect",
+              sessionID: sessionId,
+            },
+            parts,
+          },
+        ],
+        sessionId,
+      );
+      if (converted.length > 0) {
+        const current = this.sessionLogsById.get(sessionId) || [];
+        for (const entry of converted) {
+          const exists = current.some(
+            (e) =>
+              (entry.sourceKey && e.sourceKey === entry.sourceKey) ||
+              (entry.callKey && e.callKey === entry.callKey),
+          );
+          if (!exists) {
+            current.push(entry);
+          } else {
+            const target = current.find(
+              (e) =>
+                (entry.sourceKey && e.sourceKey === entry.sourceKey) ||
+                (entry.callKey && e.callKey === entry.callKey),
+            );
+            if (target) {
+              if (entry.content && entry.content.length > (target.content || "").length) {
+                target.content = entry.content;
+              }
+              target.status = entry.status || "done";
+            }
+          }
+        }
+        this.sessionLogsById.set(sessionId, current);
+        this._emitSessionLog(sessionId);
+      }
+    }
+
+    await this.hydrateSessionHistory(sessionId, { force: true }).catch(() => []);
+    this._releaseSessionNow(sessionId, agentId || "architect", {
+      status: "passed",
+      label: "Tarea finalizada",
+    });
   }
 
   async interruptSession(sessionId = this.activeSessionId) {
@@ -5904,7 +6380,7 @@ export class OpenCodeBridgeClient {
       this._emitConnectionState();
       this._startWatchdog(controller);
       this.spatialBridgeBackoffUntil = 0;
-      this._startSpatialPolling();
+      this._syncSpatialPollingMode();
       if (this.lastSpatialSnapshot) {
         this.syncSpatialState(this.lastSpatialSnapshot, { force: true });
       }
@@ -5955,6 +6431,7 @@ export class OpenCodeBridgeClient {
       }
     } finally {
       this._stopWatchdog();
+      this._stopSpatialPolling();
     }
   }
 
@@ -5971,11 +6448,21 @@ export class OpenCodeBridgeClient {
     const jsonText = dataLines.join("\n").trim();
     if (!jsonText) return;
 
+    let parsed;
     try {
-      const parsed = JSON.parse(jsonText);
-      this.ingestEvent(parsed);
+      parsed = JSON.parse(jsonText);
     } catch {
-      // Ignorar frames SSE no JSON
+      // Ignorar frames SSE no JSON (ej. heartbeats o texto plano)
+      return;
+    }
+
+    try {
+      this.ingestEvent(parsed);
+    } catch (err) {
+      console.warn(
+        "[OpenCode SSE] Error procesando evento:",
+        err?.message || err,
+      );
     }
   }
 
@@ -5998,6 +6485,8 @@ export class OpenCodeBridgeClient {
   disconnect() {
     this.manualDisconnect = true;
     this._abortActiveStream();
+    this._stopBusyMonitor();
+    this._stopSpatialPolling();
     for (const ctrl of this.promptAbortControllers) {
       ctrl.abort();
     }
@@ -6017,6 +6506,8 @@ export class OpenCodeBridgeClient {
     this.activeSessionId = null;
     this.sessionAgentMap.clear();
     this.busySessions.clear();
+    this.busySessionStartedAt.clear();
+    this.reconcilingReleaseSessions.clear();
     this.pendingPermissions.clear();
     this.pendingQuestions.clear();
     this.pendingInquiries.clear();
@@ -6032,6 +6523,7 @@ export class OpenCodeBridgeClient {
     this.historyFetchPromises.clear();
     this.childSessionsByParent.clear();
     this.messageMetaById.clear();
+    this.partMetaById.clear();
     this.reasoningBuffers.clear();
     this.activeStreamEntryIds.clear();
     this.emittedDelegations.clear();
@@ -6047,6 +6539,7 @@ export class OpenCodeBridgeClient {
     );
     this._emitQuestionsState(false, null);
     this._emitPermissionsState(false, null);
+    this._emitConnectionState();
   }
 
   _getSpatialBridgeUrl() {
@@ -6068,12 +6561,29 @@ export class OpenCodeBridgeClient {
     );
   }
 
+  _syncSpatialPollingMode() {
+    if (typeof window === "undefined") return;
+    // Cuando SSE está conectado vía Puente (:4097), los comandos llegan en tiempo real por SSE
+    // y el propio POST /spatial-state avisa si queda alguno pendiente: cero polling redundante.
+    if (this.status === "connected" && this.config.mode === "bridge") {
+      this._stopSpatialPolling();
+      return;
+    }
+    // En modo directo (:4096), solo respaldo ligero cada 6s mientras esté conectado.
+    if (this.status === "connected") {
+      if (!this.spatialPollTimer) {
+        this.spatialPollTimer = setInterval(() => {
+          if (typeof document !== "undefined" && document.hidden) return;
+          this.pollSpatialCommands();
+        }, 6000);
+      }
+      return;
+    }
+    this._stopSpatialPolling();
+  }
+
   _startSpatialPolling() {
-    if (this.spatialPollTimer || typeof window === "undefined") return;
-    this.spatialPollTimer = setInterval(() => {
-      if (typeof document !== "undefined" && document.hidden) return;
-      this.pollSpatialCommands();
-    }, 1500);
+    this._syncSpatialPollingMode();
   }
 
   _stopSpatialPolling() {
@@ -6089,12 +6599,16 @@ export class OpenCodeBridgeClient {
 
     const now = Date.now();
     if (!force && now < this.spatialBridgeBackoffUntil) return;
+    if (!force && this.lastHttpSpatialSyncAt > 0 && now - this.lastHttpSpatialSyncAt < 3200) {
+      return;
+    }
     if (this.spatialSyncInFlight) return;
 
     const bridgeUrl = this._getSpatialBridgeUrl();
     if (!bridgeUrl) return;
 
     this.spatialSyncInFlight = true;
+    this.lastHttpSpatialSyncAt = now;
     try {
       const resp = await fetch(`${bridgeUrl}/api/office/spatial-state`, {
         method: "POST",
@@ -6163,6 +6677,7 @@ export class OpenCodeBridgeClient {
 
   dispose() {
     this._stopSpatialPolling();
+    this._stopBusyMonitor();
     if (this.spatialUnsub) {
       this.spatialUnsub();
       this.spatialUnsub = null;

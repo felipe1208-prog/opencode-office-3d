@@ -3,8 +3,9 @@ import { checkpointManager } from "../interaction/CheckpointManager.js";
 const NEARBY_OBJECT_RADIUS = 2.5;
 const NEARBY_PEER_RADIUS = 4.5;
 const WHITEBOARD_VISIBLE_RADIUS = 3.2;
-const SPATIAL_SYNC_INTERVAL_MS = 650; // ~1.5 Hz (<= 2 Hz), fuera de requestAnimationFrame
-const HEARTBEAT_SYNC_MS = 4500;
+const SPATIAL_SYNC_INTERVAL_MS = 2000; // Chequeo ligero off-rAF (0.5 Hz)
+const MIN_SYNC_INTERVAL_MS = 3500; // Mínimo entre envíos HTTP salvo force
+const HEARTBEAT_SYNC_MS = 6000; // Heartbeat máximo en reposo
 const MAX_PROCESSED_COMMANDS = 250;
 
 export const OFFICE_PROPS_CATALOG = [
@@ -543,7 +544,7 @@ export class SpatialAwarenessService {
         updatedAt: Date.now(),
       };
 
-      sig += `|${id}:${zoneInfo.zoneId}:${cpId || ""}:${posture}:${agent.state}:${Math.round(x * 2)},${Math.round(z * 2)}:${nearbyPeers.map((p) => p.id).join(",")}`;
+      sig += `|${id}:${zoneInfo.zoneId}:${cpId || ""}:${posture}:${agent.state}:${nearbyPeers.map((p) => p.id).join(",")}`;
     }
 
     return {
@@ -562,8 +563,12 @@ export class SpatialAwarenessService {
 
   tickSync({ force = false } = {}) {
     if (this.isDestroyed || !this.onSync) return null;
-    const { signature, snapshot } = this.computeSnapshot();
     const now = Date.now();
+    if (!force && this.lastSyncAt > 0 && now - this.lastSyncAt < MIN_SYNC_INTERVAL_MS) {
+      return null;
+    }
+
+    const { signature, snapshot } = this.computeSnapshot();
     const changed = signature !== this.lastSignature;
     const heartbeatDue = now - this.lastSyncAt >= HEARTBEAT_SYNC_MS;
 
