@@ -399,7 +399,9 @@ watch(
       const name = profileMap.value[inq.agentId]?.name || inq.agentId || "Equipo";
       dispatchDesktopNotification({
         id: `inq:${inq.id}`,
-        title: `${name} te hace una consulta`,
+        title: inq.isEscalation
+          ? `Límite de revisión automática · ${name}`
+          : `${name} te hace una consulta`,
         body: inq.excerpt || "Consulta pendiente en el chat",
         agentId: inq.agentId || "architect",
       });
@@ -817,6 +819,21 @@ async function handleLaunchStandup({ topic, prompt }) {
     commandForm.prompt = prompt;
     await handleSendOpenCodePrompt();
   }
+}
+
+async function handleInspectorDispatchPrompt({
+  agentId = "qa",
+  prompt = "",
+  openChat = true,
+} = {}) {
+  if (!prompt || openCodeState.value.status !== "connected") return;
+  isInspectorOpen.value = false;
+  selectChatAgent(agentId || "qa", {
+    focus3d: true,
+    openDrawer: Boolean(openChat),
+  });
+  commandForm.prompt = prompt;
+  await handleSendOpenCodePrompt();
 }
 
 async function handleApplyWorkspaceDir() {
@@ -1664,14 +1681,22 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <!-- Toast compacto (máx. 2 líneas) de consulta proactiva de especialista -->
+        <!-- Toast compacto (máx. 2 líneas) de consulta proactiva o escalado de revisión -->
         <div
           v-if="!isChatOpen && toastInquiry"
-          class="hud-glass-elevated rounded-2xl px-3.5 py-2.5 space-y-1.5"
+          :class="[
+            'hud-glass-elevated rounded-2xl px-3.5 py-2.5 space-y-1.5',
+            toastInquiry.isEscalation ? 'border border-[#FB7185]/45' : '',
+          ]"
         >
           <div class="flex items-center justify-between gap-2">
             <div class="flex items-center gap-2 text-xs font-semibold text-[#F6EFE6] min-w-0 truncate">
+              <AlertTriangle
+                v-if="toastInquiry.isEscalation"
+                class="w-3.5 h-3.5 text-[#FB7185] shrink-0"
+              />
               <span
+                v-else
                 class="w-2 h-2 rounded-full shrink-0"
                 :style="{
                   backgroundColor:
@@ -1679,9 +1704,14 @@ onBeforeUnmount(() => {
                 }"
               ></span>
               <span class="truncate">
-                {{
-                  profileMap[toastInquiry.agentId]?.name || toastInquiry.agentId
-                }} te hace una consulta
+                <template v-if="toastInquiry.isEscalation">
+                  Revisión detenida ({{ toastInquiry.round || 2 }}/{{ toastInquiry.maxRounds || 2 }}) · Requiere tu decisión
+                </template>
+                <template v-else>
+                  {{
+                    profileMap[toastInquiry.agentId]?.name || toastInquiry.agentId
+                  }} te hace una consulta
+                </template>
               </span>
             </div>
             <button
@@ -1709,7 +1739,7 @@ onBeforeUnmount(() => {
               "
               class="px-2.5 py-1 rounded-lg bg-[#E09F5A] hover:bg-[#E7AF72] text-[11px] font-semibold text-[#1B1714] cursor-pointer whitespace-nowrap shrink-0"
             >
-              Responder
+              {{ toastInquiry.isEscalation ? "Revisar hilo" : "Responder" }}
             </button>
           </div>
         </div>
@@ -2036,14 +2066,24 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
-        <!-- Aviso discreto cuando otro miembro hace una consulta mientras el chat está abierto -->
+        <!-- Aviso discreto cuando otro miembro hace una consulta o se escala una revisión -->
         <div
           v-if="toastQuestion || toastInquiry"
-          class="px-4 py-2 border-b border-[#F59E0B]/25 bg-[#F59E0B]/[0.08] flex items-center justify-between gap-2 shrink-0"
+          :class="[
+            'px-4 py-2 border-b flex items-center justify-between gap-2 shrink-0',
+            !toastQuestion && toastInquiry?.isEscalation
+              ? 'border-[#FB7185]/35 bg-[#FB7185]/[0.1]'
+              : 'border-[#F59E0B]/25 bg-[#F59E0B]/[0.08]',
+          ]"
         >
           <div class="flex items-center gap-2 min-w-0 text-xs text-[#F6EFE6]">
+            <AlertTriangle
+              v-if="!toastQuestion && toastInquiry?.isEscalation"
+              class="w-3.5 h-3.5 text-[#FB7185] shrink-0"
+            />
             <span
-              class="w-2 h-2 rounded-full shrink-0 animate-pulse"
+              v-else
+              class="w-2 h-2 rounded-full shrink-0"
               :style="{
                 backgroundColor:
                   profileMap[(toastQuestion || toastInquiry).agentId]?.color ||
@@ -2051,10 +2091,15 @@ onBeforeUnmount(() => {
               }"
             ></span>
             <span class="truncate">
-              {{
-                profileMap[(toastQuestion || toastInquiry).agentId]?.name ||
-                (toastQuestion || toastInquiry).agentId
-              }} te hace una consulta
+              <template v-if="!toastQuestion && toastInquiry?.isEscalation">
+                Límite de revisión ({{ toastInquiry.round || 2 }}/{{ toastInquiry.maxRounds || 2 }}) · Requiere tu decisión
+              </template>
+              <template v-else>
+                {{
+                  profileMap[(toastQuestion || toastInquiry).agentId]?.name ||
+                  (toastQuestion || toastInquiry).agentId
+                }} te hace una consulta
+              </template>
             </span>
           </div>
           <div class="flex items-center gap-1.5 shrink-0">
@@ -2068,7 +2113,7 @@ onBeforeUnmount(() => {
               "
               class="px-2.5 py-1 rounded-lg bg-[#E09F5A] hover:bg-[#E7AF72] text-[11px] font-semibold text-[#1B1714] cursor-pointer whitespace-nowrap"
             >
-              Responder
+              {{ !toastQuestion && toastInquiry?.isEscalation ? "Revisar" : "Responder" }}
             </button>
             <button
               type="button"
@@ -2279,6 +2324,74 @@ onBeforeUnmount(() => {
                 class="text-xs text-[#F8F4EE] whitespace-pre-wrap select-text leading-relaxed"
               >
                 {{ entry.content }}
+              </div>
+            </div>
+
+            <!-- Registro de auditoría: Revisión automática entre especialistas -->
+            <div
+              v-else-if="entry.kind === 'peer_review'"
+              :class="[
+                'rounded-xl border px-3.5 py-2.5 space-y-1.5',
+                entry.reviewMeta?.escalated
+                  ? 'bg-[#FB7185]/[0.1] border-[#FB7185]/35'
+                  : 'bg-[#8B5CF6]/[0.09] border-[#8B5CF6]/30',
+              ]"
+            >
+              <div class="flex items-center justify-between gap-2 text-[11px]">
+                <span
+                  :class="[
+                    'font-semibold flex items-center gap-1.5 min-w-0 truncate',
+                    entry.reviewMeta?.escalated ? 'text-[#FECDD3]' : 'text-[#DDD6FE]',
+                  ]"
+                >
+                  <AlertTriangle
+                    v-if="entry.reviewMeta?.escalated"
+                    class="w-3.5 h-3.5 text-[#FB7185] shrink-0"
+                  />
+                  <span
+                    v-else
+                    class="w-2 h-2 rounded-full shrink-0"
+                    :style="{
+                      backgroundColor:
+                        profileMap[entry.reviewMeta?.fromAgentId || entry.agentId]?.color ||
+                        '#8B5CF6',
+                    }"
+                  ></span>
+                  <span class="truncate">
+                    {{ entry.reviewMeta?.headerLine || "Revisión automática entre especialistas" }}
+                  </span>
+                </span>
+                <span class="text-[10px] text-[#B5AEA4] shrink-0 tabular-nums">
+                  Ronda {{ entry.reviewMeta?.round || 1 }}/{{ entry.reviewMeta?.maxRounds || 2 }}
+                  ·
+                  {{
+                    entry.reviewMeta?.escalated
+                      ? "Escalada"
+                      : entry.reviewMeta?.dispatched
+                        ? "Despachada"
+                        : "Registrada"
+                  }}
+                </span>
+              </div>
+
+              <div
+                v-if="entry.reviewMeta?.files?.length"
+                class="font-mono text-[10px] text-[#F6C894] break-all select-text"
+              >
+                {{ entry.reviewMeta.files.join(" · ") }}
+              </div>
+
+              <div
+                class="text-xs text-[#F3EFE8] whitespace-pre-wrap select-text leading-relaxed"
+              >
+                {{ entry.content }}
+              </div>
+
+              <div
+                v-if="entry.reviewMeta?.dispatchError"
+                class="text-[10px] text-[#FDA4AF]"
+              >
+                {{ entry.reviewMeta.dispatchError }}
               </div>
             </div>
 
@@ -3146,6 +3259,7 @@ onBeforeUnmount(() => {
       :tool-activity="toolActivityList"
       :is-connected="openCodeState.status === 'connected'"
       @close="isInspectorOpen = false"
+      @dispatch-prompt="handleInspectorDispatchPrompt"
       @open-settings="
         (tab) => {
           isInspectorOpen = false;

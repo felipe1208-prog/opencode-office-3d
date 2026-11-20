@@ -554,6 +554,7 @@ export class OpenCodeBridgeClient {
       isDelegation: Boolean(entry.isDelegation),
       subagentId: entry.subagentId || null,
       childSessionId: entry.childSessionId || null,
+      reviewMeta: entry.reviewMeta || null,
       content: String(entry.content || ""),
       status: entry.status || "done",
       timestamp: entry.timestamp || Date.now(),
@@ -721,6 +722,33 @@ export class OpenCodeBridgeClient {
     return existing;
   }
 
+  _extractFullToolOutput(source = {}) {
+    if (!source || typeof source !== "object") return "";
+    const parts = [];
+    const pushUnique = (val) => {
+      if (typeof val !== "string") return;
+      const trimmed = val.trim();
+      if (!trimmed) return;
+      if (!parts.includes(trimmed)) parts.push(trimmed);
+    };
+    pushUnique(source.output);
+    pushUnique(source.state?.output);
+    pushUnique(source.result);
+    pushUnique(source.stdout);
+    pushUnique(source.state?.metadata?.stdout);
+    pushUnique(source.state?.metadata?.output);
+    const stderr =
+      typeof source.stderr === "string"
+        ? source.stderr.trim()
+        : typeof source.state?.metadata?.stderr === "string"
+          ? source.state.metadata.stderr.trim()
+          : "";
+    if (stderr && !parts.some((p) => p.includes(stderr))) {
+      parts.push(`[stderr]\n${stderr}`);
+    }
+    return parts.join("\n\n");
+  }
+
   _recordToolActivity({
     agentId = "architect",
     sessionId = null,
@@ -742,16 +770,30 @@ export class OpenCodeBridgeClient {
     const commandStr =
       typeof rawInput?.command === "string" ? rawInput.command.trim() : null;
     const label = resolveToolLabelEs(toolName);
-    const cleanOutput = String(outputExcerpt || "").trim().slice(0, 800);
-    const cleanError = errorMessage ? String(errorMessage).trim().slice(0, 400) : null;
+    const rawOutputStr = String(outputExcerpt || "").trim();
+    const MAX_FULL_OUTPUT = 16000;
+    const outputTruncated = rawOutputStr.length > MAX_FULL_OUTPUT;
+    const fullOutput = outputTruncated
+      ? `${rawOutputStr.slice(0, MAX_FULL_OUTPUT)}\n... [salida truncada a 16 KB]`
+      : rawOutputStr;
+    const cleanOutput = rawOutputStr.slice(0, 800);
+    const rawErrStr = errorMessage
+      ? typeof errorMessage === "string"
+        ? errorMessage.trim()
+        : String(errorMessage?.message || errorMessage?.data?.message || JSON.stringify(errorMessage)).trim()
+      : null;
+    const cleanError = rawErrStr ? rawErrStr.slice(0, 8000) : null;
 
     let rec = callKey ? list.find((item) => item.callKey === callKey) : null;
     if (!rec) {
+      const id = `act_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
       rec = {
-        id: `act_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        id,
+        callId: callKey || id,
         callKey: callKey || null,
         agentId: canonical,
         sessionId: sessionId || this.activeSessionId || null,
+        tool: toolName,
         toolName,
         label,
         target: target || shortFileName(rawPath) || commandStr || null,
@@ -759,7 +801,11 @@ export class OpenCodeBridgeClient {
         command: commandStr,
         status,
         outputExcerpt: cleanOutput,
+        fullOutput,
+        output: fullOutput,
+        outputTruncated,
         errorMessage: cleanError,
+        error: cleanError,
         snippetLines: null,
         timestamp: Date.now(),
       };
@@ -770,8 +816,16 @@ export class OpenCodeBridgeClient {
       if (target) rec.target = target;
       if (rawPath && !rec.rawPath) rec.rawPath = String(rawPath).trim();
       if (commandStr && !rec.command) rec.command = commandStr;
-      if (cleanOutput) rec.outputExcerpt = cleanOutput;
-      if (cleanError) rec.errorMessage = cleanError;
+      if (rawOutputStr) {
+        rec.outputExcerpt = cleanOutput;
+        rec.fullOutput = fullOutput;
+        rec.output = fullOutput;
+        rec.outputTruncated = outputTruncated;
+      }
+      if (cleanError) {
+        rec.errorMessage = cleanError;
+        rec.error = cleanError;
+      }
       rec.timestamp = Date.now();
     }
 
@@ -820,7 +874,7 @@ export class OpenCodeBridgeClient {
   }
 
   getToolActivity(agentId = null) {
-    if (agentId) {
+    if (agentId && agentId !== "all") {
       const canonical = this.resolveAgentId(agentId) || agentId;
       return (this.toolActivityByAgent.get(canonical) || []).map((item) => ({ ...item }));
     }
@@ -1347,6 +1401,9 @@ export class OpenCodeBridgeClient {
       if (matchesAgent || matchesSession) {
         this._markInquiryDismissedLru(id);
         this.pendingInquiries.delete(id);
+        if (inq.isEscalation && inq.chainKey) {
+          this.resetPeerReviewChain(inq.chainKey).catch(() => null);
+        }
         removedCount += 1;
       }
     }
@@ -1359,12 +1416,54 @@ export class OpenCodeBridgeClient {
   dismissInquiry(inquiryId) {
     const clean = String(inquiryId || "").trim();
     if (!clean) return { ok: true, dismissed: false };
+    const existing = this.pendingInquiries.get(clean);
     this._markInquiryDismissedLru(clean);
     const existed = this.pendingInquiries.delete(clean);
+    if (existing?.isEscalation && existing?.chainKey) {
+      this.resetPeerReviewChain(existing.chainKey).catch(() => null);
+    }
     if (existed) {
       this._emitQuestionsState(false, null);
     }
     return { ok: true, dismissed: existed };
+  }
+
+  _registerPeerReviewEscalation(review) {
+    if (!review || !review.fromAgentId) return null;
+    const fromId = this.resolveAgentId(review.fromAgentId) || review.fromAgentId;
+    const toId = this.resolveAgentId(review.toAgentId) || review.toAgentId || "qa";
+    const targetSid =
+      review.targetSessionId ||
+      this.getPreferredSessionForAgent(toId) ||
+      this.getPreferredSessionForAgent(fromId) ||
+      this.activeSessionId ||
+      `peer_${review.chainKey || Date.now()}`;
+    const round = Number(review.round || 2);
+    const maxRounds = Number(review.maxRounds || 2);
+    const id = `esc_${review.chainKey || review.id}`;
+    const filesLabel =
+      Array.isArray(review.files) && review.files.length > 0
+        ? ` (${review.files.slice(0, 3).join(", ")})`
+        : "";
+    const excerpt = `Límite de ${round}/${maxRounds} rondas con ${review.toAgentName || toId}${filesLabel}: ${String(review.context || "").slice(0, 120)}`;
+    const inquiry = {
+      id,
+      sessionID: targetSid,
+      agentId: toId,
+      fromAgentId: fromId,
+      toAgentId: toId,
+      chainKey: review.chainKey || "",
+      round,
+      maxRounds,
+      isEscalation: true,
+      excerpt,
+      fullText: `Se detuvo el rebote automático tras ${round}/${maxRounds} rondas entre ${review.fromAgentName || fromId} y ${review.toAgentName || toId}.\nContexto: ${review.context || ""}${filesLabel}`,
+      isQuestionText: true,
+      createdAt: review.createdAt || Date.now(),
+    };
+    this.pendingInquiries.set(id, inquiry);
+    this._emitQuestionsState(true, inquiry);
+    return inquiry;
   }
 
   _maybeRegisterSpecialistInquiry({
@@ -2459,23 +2558,113 @@ export class OpenCodeBridgeClient {
     if (eventType === "office.peer_review") {
       const review = props?.review || props;
       if (review && review.fromAgentId && review.toAgentId) {
-        officeEventBus.emit(OFFICE_EVENTS.OFFICE_PEER_REVIEW, review, "opencode-sse");
+        const fromId = this.resolveAgentId(review.fromAgentId) || review.fromAgentId;
+        const toId = this.resolveAgentId(review.toAgentId) || review.toAgentId;
+        const round = Number(review.round || 1);
+        const maxRounds = Number(review.maxRounds || 2);
+        const files = Array.isArray(review.files) ? review.files : [];
+
+        if (review.targetSessionId) {
+          this._trackAgentSession(toId, review.targetSessionId, { forcePreferred: true });
+          this._upsertSessionRecord({
+            id: review.targetSessionId,
+            agent: toId,
+            title: `Revisión @${toId}: ${String(review.context || "").slice(0, 32)}`,
+            updatedAt: review.createdAt || Date.now(),
+          });
+        }
+
         const targetSid =
-          this.getPreferredSessionForAgent(review.toAgentId) ||
+          review.targetSessionId ||
+          this.getPreferredSessionForAgent(toId) ||
           this.activeSessionId;
+
         if (targetSid) {
-          const filesLine =
-            Array.isArray(review.files) && review.files.length > 0
-              ? `\nArchivos: ${review.files.join(", ")}`
-              : "";
+          const filesLine = files.length > 0 ? `\nArchivos: ${files.join(", ")}` : "";
+          const headerLine = review.escalated || review.limitReached
+            ? `Revisión detenida por límite de seguridad (${round}/${maxRounds}) · Requiere tu decisión`
+            : `Revisión automática ${round}/${maxRounds} de ${review.fromAgentName || fromId}`;
+
           this._appendSessionLogEntry(targetSid, {
-            kind: "text",
-            agentId: review.fromAgentId,
-            content: `Solicitud de revisión para ${review.toAgentName || review.toAgentId}: ${review.context}${filesLine}`,
-            status: "done",
+            kind: "peer_review",
+            agentId: fromId,
+            content: `${review.context}${filesLine}`,
+            reviewMeta: {
+              id: review.id,
+              fromAgentId: fromId,
+              fromAgentName: review.fromAgentName || fromId,
+              toAgentId: toId,
+              toAgentName: review.toAgentName || toId,
+              round,
+              maxRounds,
+              chainKey: review.chainKey || "",
+              files,
+              dispatched: Boolean(review.dispatched),
+              dispatchError: review.dispatchError || null,
+              escalated: Boolean(review.escalated || review.limitReached),
+              headerLine,
+            },
+            status: review.escalated || review.limitReached ? "error" : "done",
             timestamp: review.createdAt || Date.now(),
           });
         }
+
+        const senderSid = this.getPreferredSessionForAgent(fromId);
+        if (senderSid && senderSid !== targetSid) {
+          this._appendSessionLogEntry(senderSid, {
+            kind: "peer_review",
+            agentId: fromId,
+            content: `${review.context}${files.length > 0 ? `\nArchivos: ${files.join(", ")}` : ""}`,
+            reviewMeta: {
+              id: `${review.id}_out`,
+              fromAgentId: fromId,
+              fromAgentName: review.fromAgentName || fromId,
+              toAgentId: toId,
+              toAgentName: review.toAgentName || toId,
+              round,
+              maxRounds,
+              chainKey: review.chainKey || "",
+              files,
+              dispatched: Boolean(review.dispatched),
+              dispatchError: review.dispatchError || null,
+              escalated: Boolean(review.escalated || review.limitReached),
+              headerLine:
+                review.escalated || review.limitReached
+                  ? `Límite de ${round}/${maxRounds} rondas alcanzado con ${review.toAgentName || toId} · Escalado al Tech Lead`
+                  : `Revisión automática ${round}/${maxRounds} enviada a ${review.toAgentName || toId}`,
+            },
+            status: review.escalated || review.limitReached ? "error" : "done",
+            timestamp: review.createdAt || Date.now(),
+          });
+        }
+
+        if (review.escalated || review.limitReached) {
+          this._registerPeerReviewEscalation(review);
+          this._queueAgentTask(
+            fromId,
+            {
+              status: "failed",
+              label: `Límite ${round}/${maxRounds} rondas`,
+              file: files[0] || "Revisión escalada",
+            },
+            { immediate: true },
+          );
+        } else if (review.dispatched && targetSid) {
+          this._markSessionBusy(targetSid, toId);
+          this._queueAgentTask(
+            toId,
+            {
+              status: "started",
+              phase: "working",
+              label: `Revisión automática (${round}/${maxRounds})`,
+              file: files[0] || review.fromAgentName || fromId,
+            },
+            { immediate: true },
+          );
+          this._emitConnectionState();
+        }
+
+        officeEventBus.emit(OFFICE_EVENTS.OFFICE_PEER_REVIEW, review, "opencode-sse");
       }
       return review?.toAgentId || null;
     }
@@ -2625,14 +2814,7 @@ export class OpenCodeBridgeClient {
         target: logTarget,
         rawInput: input,
         status: isError ? "error" : isFinished ? "done" : "running",
-        outputExcerpt:
-          typeof props.output === "string"
-            ? props.output
-            : typeof props.state?.output === "string"
-              ? props.state.output
-              : typeof props.result === "string"
-                ? props.result
-                : "",
+        outputExcerpt: this._extractFullToolOutput(props),
         errorMessage: isError
           ? props.error?.data?.message || props.error?.message || props.message || null
           : null,
@@ -3399,12 +3581,7 @@ export class OpenCodeBridgeClient {
           target: logTarget,
           rawInput: input,
           status: isErr ? "error" : isDone ? "done" : "running",
-          outputExcerpt:
-            typeof part.state?.output === "string"
-              ? part.state.output
-              : typeof part.output === "string"
-                ? part.output
-                : "",
+          outputExcerpt: this._extractFullToolOutput(part),
           errorMessage: isErr ? part.state?.error || part.error || null : null,
         });
 
@@ -6812,6 +6989,12 @@ export class OpenCodeBridgeClient {
 
     this.spatialSyncInFlight = true;
     this.lastHttpSpatialSyncAt = now;
+    const agentSessions = {};
+    for (const id of ["architect", "frontend", "qa", "backend", "systems"]) {
+      const sid = this.getPreferredSessionForAgent(id);
+      if (sid) agentSessions[id] = sid;
+    }
+
     try {
       const resp = await fetch(`${bridgeUrl}/api/office/spatial-state`, {
         method: "POST",
@@ -6819,7 +7002,7 @@ export class OpenCodeBridgeClient {
           "Content-Type": "application/json",
           Accept: "application/json",
         },
-        body: JSON.stringify(snapshot),
+        body: JSON.stringify({ ...snapshot, agentSessions }),
         signal: AbortSignal.timeout(2000),
       });
       if (!resp.ok) {
@@ -6937,6 +7120,25 @@ export class OpenCodeBridgeClient {
   async fetchWorkspaceDiff(relPath) {
     const qs = encodeURIComponent(String(relPath || "").trim());
     return this._bridgeFetchJson(`/api/office/workspace/diff?path=${qs}`, { method: "GET" });
+  }
+
+  async fetchWorkspaceLog(limit = 15) {
+    return this._bridgeFetchJson(
+      `/api/office/workspace/log?limit=${encodeURIComponent(limit)}`,
+      { method: "GET" },
+    );
+  }
+
+  async fetchWorkspaceCommitDetail(hash) {
+    const qs = encodeURIComponent(String(hash || "").trim());
+    return this._bridgeFetchJson(`/api/office/workspace/commit?hash=${qs}`, { method: "GET" });
+  }
+
+  async resetPeerReviewChain(chainKey = "") {
+    return this._bridgeFetchJson("/api/office/peer-review/reset", {
+      method: "POST",
+      body: JSON.stringify({ chainKey: String(chainKey || "").trim() }),
+    });
   }
 
   async fetchWorkspaceFileSnippet(relPath, maxLines = 40) {

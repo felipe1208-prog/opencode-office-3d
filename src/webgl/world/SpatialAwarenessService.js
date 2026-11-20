@@ -889,6 +889,21 @@ export class SpatialAwarenessService {
       if (!targetAgent || targetId === agentId) return false;
 
       const targetName = targetAgent.config?.name || targetId;
+      const round = Number(command.round || 1);
+      const maxRounds = Number(command.maxRounds || 2);
+
+      if (command.escalated || command.limitReached) {
+        agent.setContextualBubble(
+          `Límite ${round}/${maxRounds} · Requiere tu decisión`,
+          {
+            color: "#FB7185",
+            durationMs: 6500,
+          },
+        );
+        this.tickSync({ force: true });
+        return true;
+      }
+
       const reviewCp = PEER_REVIEW_CHECKPOINT[targetId];
       const destCp =
         reviewCp && checkpointManager.isAvailable(reviewCp)
@@ -896,13 +911,13 @@ export class SpatialAwarenessService {
           : this._resolveDestination(agentId, targetId)?.checkpointId;
 
       this.director.holdAgentForSpatialIntent?.(agentId, 22000);
-      agent.setContextualBubble(`Pidiendo revisión a ${targetName}`, {
+      agent.setContextualBubble(`Revisión ${round}/${maxRounds} → ${targetName}`, {
         color: agent.config?.color || "#E09F5A",
-        durationMs: 4200,
+        durationMs: 4600,
       });
-      targetAgent.setContextualBubble(`Revisando con ${agent.config?.name || agentId}`, {
+      targetAgent.setContextualBubble(`Revisando (${round}/${maxRounds}) con ${agent.config?.name || agentId}`, {
         color: targetAgent.config?.color || "#8B5CF6",
-        durationMs: 4200,
+        durationMs: 4600,
       });
 
       if (destCp) {

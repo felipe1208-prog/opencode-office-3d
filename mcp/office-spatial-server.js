@@ -148,7 +148,7 @@ const TOOLS = [
   {
     name: "pedir_revision_a",
     description:
-      "Solicita una revisión técnica o validación real a un compañero del equipo: el avatar camina hasta el escritorio del destinatario en 3D y registra la solicitud con contexto y archivos en su hilo para que pueda actuar sobre ella.",
+      "Solicita una revisión técnica autónoma a un compañero del equipo: el avatar camina hasta su escritorio en 3D y despacha directamente el contexto y archivos a la sesión de OpenCode del revisor. Tiene un límite de seguridad de 2 rondas automáticas por tarea/hilo; si se supera, detiene los rebotes y escala al Tech Lead humano.",
     inputSchema: {
       type: "object",
       properties: {
@@ -171,6 +171,11 @@ const TOOLS = [
           type: "array",
           items: { type: "string" },
           description: "Lista opcional de rutas de archivos relevantes para la revisión.",
+        },
+        hilo: {
+          type: "string",
+          description:
+            "Identificador opcional de la tarea/hilo de revisión para mantener el conteo de rondas (máx. 2).",
         },
       },
       required: ["agente", "destinatario", "contexto"],
@@ -481,6 +486,7 @@ async function executeTool(name, args = {}) {
     const fromAgentId = resolveAgentId(args.agente ?? args.agent ?? args.agentId);
     const toAgentId = resolveAgentId(args.destinatario ?? args.to ?? args.target ?? args.reviewer);
     const contexto = String(args.contexto ?? args.context ?? args.message ?? "").trim();
+    const hilo = String(args.hilo ?? args.threadKey ?? args.taskKey ?? "").trim();
     const archivos = Array.isArray(args.archivos ?? args.files)
       ? (args.archivos ?? args.files).map((f) => String(f || "").trim()).filter(Boolean).slice(0, 10)
       : [];
@@ -512,15 +518,43 @@ async function executeTool(name, args = {}) {
           toAgentId,
           context: contexto,
           files: archivos,
+          threadKey: hilo || undefined,
         }),
       });
       const review = res?.review || {};
       const filesSuffix = archivos.length > 0 ? ` (archivos: ${archivos.join(", ")})` : "";
+      const round = Number(res?.round || review.round || 1);
+      const maxRounds = Number(res?.maxRounds || review.maxRounds || 2);
+      const chainKey = res?.chainKey || review.chainKey || "";
+
+      if (res?.limitReached || res?.escalated) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `LÍMITE DE SEGURIDAD ALCANZADO (${round}/${maxRounds} rondas automáticas en hilo "${chainKey}"). No se despachó otro rebote automático hacia ${review.toAgentName || toAgentId}${filesSuffix}. Se notificó al Tech Lead humano como alerta pendiente en la oficina 3D. Detente y resume el bloqueo para que el usuario decida.`,
+            },
+          ],
+        };
+      }
+
+      if (res?.dispatched) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Revisión automática despachada (ronda ${round}/${maxRounds}, hilo "${chainKey}") de ${review.fromAgentName || fromAgentId} hacia ${review.toAgentName || toAgentId}${filesSuffix}. El avatar camina a su escritorio en 3D y la sesión de OpenCode del revisor ya está procesando la solicitud.`,
+            },
+          ],
+        };
+      }
+
+      const fallbackReason = res?.dispatchError ? ` Motivo de despacho pendiente: ${res.dispatchError}` : "";
       return {
         content: [
           {
             type: "text",
-            text: `Solicitud de revisión enviada de ${review.fromAgentName || fromAgentId} hacia ${review.toAgentName || toAgentId}${filesSuffix}. El avatar se acerca a su escritorio en 3D y el contexto quedó compartido en su hilo.`,
+            text: `Solicitud registrada (ronda ${round}/${maxRounds}, hilo "${chainKey}") de ${review.fromAgentName || fromAgentId} hacia ${review.toAgentName || toAgentId}${filesSuffix} y visible en su hilo de auditoría.${fallbackReason}`,
           },
         ],
       };

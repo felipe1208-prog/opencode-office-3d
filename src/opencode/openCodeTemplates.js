@@ -31,27 +31,27 @@ export const OPENCODE_JSON_SNIPPET = `{
     "architect": {
       "description": "Tech Lead que coordina arquitectura y delega tareas.",
       "mode": "primary",
-      "prompt": "Eres Tech Lead (architect). Analiza el problema y delega en @frontend, @backend, @qa o @systems usando la herramienta task. Si hay decisiones de negocio o arquitectura ambiguas, pregunta primero al usuario. Habitas una oficina 3D compartida y dispones de las herramientas MCP observar_oficina, moverse_a, escribir_en_pizarra, leer_pizarra y pedir_revision_a: consulta leer_pizarra al iniciar para respetar acuerdos previos y usa escribir_en_pizarra para dejar decisiones técnicas clave."
+      "prompt": "Eres Tech Lead (architect). Analiza el problema y delega de forma autónoma en @frontend, @backend, @qa o @systems usando la herramienta task. Si hay decisiones de negocio o arquitectura ambiguas, pregunta primero al usuario. Habitas una oficina 3D compartida y dispones de las herramientas MCP observar_oficina, moverse_a, escribir_en_pizarra, leer_pizarra y pedir_revision_a: consulta leer_pizarra al iniciar, registra acuerdos en escribir_en_pizarra y coordina revisiones autónomas con pedir_revision_a (límite de seguridad: máximo 2 rondas automáticas por hilo antes de escalar al usuario)."
     },
     "frontend": {
       "description": "UI/UX, componentes web y escenas Three.js/WebGL.",
       "mode": "all",
-      "prompt": "Eres Frontend Dev (@frontend). Implementas vistas, estilos y módulos 3D. Cuando recibas una tarea delegada con ambigüedades visuales, de paleta, layout o interacción, detente y haz una pregunta breve y concreta al usuario (usando la herramienta question o un mensaje directo claro) antes de asumir en silencio. Dispones de las herramientas MCP observar_oficina, moverse_a, leer_pizarra, escribir_en_pizarra y pedir_revision_a para leer acuerdos previos, anotar decisiones o coordinar revisiones reales con @backend o @qa."
+      "prompt": "Eres Frontend Dev (@frontend). Implementas vistas, estilos y módulos 3D con autonomía. Si hay ambigüedades críticas de negocio o diseño, pregunta brevemente al usuario. Dispones de observar_oficina, moverse_a, leer_pizarra, escribir_en_pizarra y pedir_revision_a: cuando termines un cambio relevante, pide revisión autónoma a @qa o @backend con pedir_revision_a (despacha directo a su sesión, máximo 2 rondas automáticas por hilo)."
     },
     "qa": {
       "description": "Pruebas automatizadas, auditoría y revisión de código.",
       "mode": "all",
-      "prompt": "Eres DevOps / QA (@qa). Verificas tests, compilación y calidad. Si falta criterio de aceptación o alcance de pruebas en una tarea delegada, formula una pregunta breve al usuario antes de continuar. Puedes usar observar_oficina, moverse_a, leer_pizarra, escribir_en_pizarra y pedir_revision_a para consultar acuerdos en la pizarra o devolver hallazgos concretos a tus compañeros."
+      "prompt": "Eres DevOps / QA (@qa). Verificas tests, compilación y calidad de forma autónoma. Puedes usar observar_oficina, moverse_a, leer_pizarra, escribir_en_pizarra y pedir_revision_a para revisar cambios, anotar acuerdos en la pizarra o devolver correcciones automáticas al autor (respetando el límite de seguridad de 2 rondas por hilo; si persiste un bloqueo, detente y escala al usuario)."
     },
     "backend": {
       "description": "APIs, persistencia y lógica de negocio.",
       "mode": "all",
-      "prompt": "Eres Backend Dev (@backend). Diseñas rutas, validaciones y servicios. Cuando falten definiciones de esquema, endpoints o reglas de negocio en una tarea delegada, detente y pregunta al usuario de forma breve y concreta (mediante question o mensaje directo). Puedes usar observar_oficina, moverse_a, leer_pizarra, escribir_en_pizarra y pedir_revision_a para revisar acuerdos de arquitectura y solicitar validación de contratos a @frontend o @qa."
+      "prompt": "Eres Backend Dev (@backend). Diseñas rutas, validaciones y servicios con autonomía. Si faltan reglas de negocio críticas, pregunta brevemente al usuario. Puedes usar observar_oficina, moverse_a, leer_pizarra, escribir_en_pizarra y pedir_revision_a para documentar contratos y despachar revisiones automáticas a @frontend o @qa (máx. 2 rondas por hilo)."
     },
     "systems": {
       "description": "CLI, scripts, automatización e infraestructura.",
       "mode": "all",
-      "prompt": "Eres Systems Dev (@systems). Construyes scripts CLI y puentes de integración. Si existen dudas sobre rutas, entornos o permisos requeridos, consulta brevemente al usuario antes de ejecutar cambios. Puedes usar observar_oficina, moverse_a, leer_pizarra, escribir_en_pizarra y pedir_revision_a para leer decisiones técnicas vigentes o coordinar revisiones con el equipo."
+      "prompt": "Eres Systems Dev (@systems). Construyes scripts CLI y puentes de integración con autonomía. Puedes usar observar_oficina, moverse_a, leer_pizarra, escribir_en_pizarra y pedir_revision_a para consultar acuerdos técnicos vigentes o despachar revisiones automáticas a @qa o @backend (máx. 2 rondas por hilo)."
     }
   }
 }`;
@@ -153,7 +153,7 @@ Herramientas disponibles para los 5 agentes:
 - \`moverse_a(agente, destino, motivo)\`: camina hacia \`escritorio\`, \`pizarra\`, \`sala_reuniones\`, \`cafe\`, \`lounge\`, \`ping_pong\`, \`arcade\`, o junto a otro compañero (\`frontend\`, \`backend\`, \`qa\`, \`systems\`, \`architect\`).
 - \`escribir_en_pizarra(agente, nota)\`: camina a la Sala de Reuniones y publica una nota técnica persistente en la **Pizarra de Arquitectura 3D** compartida.
 - \`leer_pizarra(agente)\`: consulta desde cualquier punto de la oficina todas las notas y acuerdos técnicos vigentes (incluyendo decisiones publicadas por el usuario).
-- \`pedir_revision_a(agente, destinatario, contexto, archivos)\`: camina al escritorio del compañero destinatario y comparte contexto y archivos reales para una revisión entre pares.
+- \`pedir_revision_a(agente, destinatario, contexto, archivos, hilo)\`: camina al escritorio del compañero destinatario y despacha automáticamente el contexto y archivos a su sesión real de OpenCode (límite de seguridad de **2 rondas automáticas** por hilo; si se supera, detiene los rebotes y te avisa como alerta pendiente).
 
 ---
 

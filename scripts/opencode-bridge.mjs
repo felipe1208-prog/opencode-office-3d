@@ -36,6 +36,8 @@ let detectedUpstreamPrefix = "/api";
 const MAX_WHITEBOARD_NOTES = 18;
 const MAX_SPATIAL_COMMANDS = 100;
 const MAX_DIFF_BYTES = 65536;
+const MAX_PEER_REVIEW_ROUNDS = 2;
+const PEER_REVIEW_CHAIN_TTL_MS = 45 * 60 * 1000;
 const BRIDGE_DATA_DIR = path.join(os.homedir(), ".opencode-office-3d");
 const BRIDGE_CONFIG_PATH = path.join(BRIDGE_DATA_DIR, "config.json");
 
@@ -306,6 +308,9 @@ let spatialCommandQueue = [];
 let spatialCommandSeq = 0;
 let deletedWhiteboardIds = new Set();
 let recentPeerReviews = [];
+const peerReviewChains = new Map();
+const preferredAgentSessions = {};
+let lastClientAuthHeader = "";
 
 function ensureBridgeDataDir() {
   try {
@@ -501,9 +506,21 @@ async function getWorkspaceSummary() {
       filePath = filePath.replace(/^"|"$/g, "");
       if (!filePath) continue;
 
+      const normalizedStatus =
+        xy === "??"
+          ? "untracked"
+          : xy.includes("D")
+            ? "deleted"
+            : xy.includes("R")
+              ? "renamed"
+              : xy.includes("A")
+                ? "added"
+                : "modified";
+
       changesMap.set(filePath, {
         path: filePath,
         code: xy.trim() || "M",
+        status: normalizedStatus,
         statusLabel: describeGitStatusCode(xy),
         staged: xy[0] !== " " && xy[0] !== "?",
         unstaged: xy[1] !== " ",
@@ -604,6 +621,68 @@ async function getWorkspaceDiff(relPath) {
   };
 }
 
+async function getWorkspaceLog(limit = 15) {
+  const safeLimit = Math.max(1, Math.min(30, Number(limit) || 15));
+  try {
+    const inside = (await runGitSafe(["rev-parse", "--is-inside-work-tree"]).catch(() => "")).trim();
+    if (inside !== "true") {
+      return { ok: true, isGitRepo: false, commits: [] };
+    }
+    const raw = await runGitSafe([
+      "log",
+      `-n`,
+      String(safeLimit),
+      "--date=iso-strict",
+      "--pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s",
+    ]).catch(() => "");
+
+    const commits = raw
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        const [hash, shortHash, author, date, ...subjectParts] = line.split("\x1f");
+        return {
+          hash: String(hash || "").trim(),
+          shortHash: String(shortHash || "").trim(),
+          author: String(author || "").trim(),
+          date: String(date || "").trim(),
+          subject: subjectParts.join(" ").trim(),
+        };
+      })
+      .filter((c) => c.hash);
+
+    return { ok: true, isGitRepo: true, commits };
+  } catch (err) {
+    return {
+      ok: false,
+      isGitRepo: false,
+      commits: [],
+      error: err?.message || "No se pudo consultar el historial de commits.",
+    };
+  }
+}
+
+async function getWorkspaceCommitDetail(rawHash) {
+  const hash = String(rawHash || "").trim();
+  if (!/^[0-9a-f]{6,40}$/i.test(hash)) {
+    return { ok: false, error: "Identificador de commit inválido." };
+  }
+  try {
+    let diffText = await runGitSafe(["show", "--stat", "--patch", "--max-count=1", hash]);
+    let truncated = false;
+    if (Buffer.byteLength(diffText, "utf8") > MAX_DIFF_BYTES) {
+      diffText = `${diffText.slice(0, MAX_DIFF_BYTES)}\n... [commit truncado a 64 KB]`;
+      truncated = true;
+    }
+    return { ok: true, hash, diff: diffText, truncated };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err?.message || "No se pudo inspeccionar el commit solicitado.",
+    };
+  }
+}
+
 function getWorkspaceFileSnippet(relPath, maxLines = 48) {
   const safe = resolveSafeWorkspacePath(relPath);
   if (!safe) {
@@ -658,7 +737,7 @@ function applyCors(res) {
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 
-function buildUpstreamHeaders(reqHeaders) {
+function buildUpstreamHeaders(reqHeaders = {}) {
   const headers = { ...reqHeaders };
   delete headers.host;
   delete headers.connection;
@@ -666,11 +745,297 @@ function buildUpstreamHeaders(reqHeaders) {
   delete headers.origin;
   delete headers.referer;
 
-  if (!headers.authorization && (AUTH_USER || AUTH_PASS)) {
+  if (headers.authorization) {
+    lastClientAuthHeader = headers.authorization;
+  } else if (AUTH_USER || AUTH_PASS) {
     const token = Buffer.from(`${AUTH_USER}:${AUTH_PASS}`).toString("base64");
     headers.authorization = `Basic ${token}`;
+  } else if (lastClientAuthHeader) {
+    headers.authorization = lastClientAuthHeader;
   }
   return headers;
+}
+
+function pruneExpiredPeerReviewChains(now = Date.now()) {
+  for (const [key, chain] of peerReviewChains.entries()) {
+    if (!chain || now - (chain.updatedAt || chain.createdAt || 0) > PEER_REVIEW_CHAIN_TTL_MS) {
+      peerReviewChains.delete(key);
+    }
+  }
+}
+
+function normalizeChainSlug(raw) {
+  return String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.:/-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+function findOrCreatePeerReviewChain({ fromAgentId, toAgentId, files = [], threadKey = "" } = {}) {
+  const now = Date.now();
+  pruneExpiredPeerReviewChains(now);
+
+  const explicitSlug = normalizeChainSlug(threadKey);
+  if (explicitSlug) {
+    const key = `thread:${explicitSlug}`;
+    let existing = peerReviewChains.get(key);
+    if (!existing) {
+      existing = {
+        key,
+        rounds: 0,
+        maxRounds: MAX_PEER_REVIEW_ROUNDS,
+        participants: new Set([fromAgentId, toAgentId]),
+        files: new Set(files),
+        history: [],
+        escalated: false,
+        blockedAttempts: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+      peerReviewChains.set(key, existing);
+    }
+    existing.participants.add(fromAgentId);
+    existing.participants.add(toAgentId);
+    for (const f of files) existing.files.add(f);
+    return existing;
+  }
+
+  // Buscar cadena activa que comparta archivos o el mismo par de especialistas en los últimos 30 min
+  const recentWindowMs = 30 * 60 * 1000;
+  let matched = null;
+  for (const chain of peerReviewChains.values()) {
+    if (now - chain.updatedAt > recentWindowMs) continue;
+    const sharesFile = files.length > 0 && files.some((f) => chain.files.has(f));
+    const sharesPair = chain.participants.has(fromAgentId) && chain.participants.has(toAgentId);
+    if (sharesFile || sharesPair) {
+      if (!matched || chain.updatedAt > matched.updatedAt) {
+        matched = chain;
+      }
+    }
+  }
+
+  if (matched) {
+    matched.participants.add(fromAgentId);
+    matched.participants.add(toAgentId);
+    for (const f of files) matched.files.add(f);
+    return matched;
+  }
+
+  const pair = [fromAgentId, toAgentId].sort().join("-");
+  const key = `rev_${pair}_${now.toString(36)}`;
+  const created = {
+    key,
+    rounds: 0,
+    maxRounds: MAX_PEER_REVIEW_ROUNDS,
+    participants: new Set([fromAgentId, toAgentId]),
+    files: new Set(files),
+    history: [],
+    escalated: false,
+    blockedAttempts: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+  peerReviewChains.set(key, created);
+  return created;
+}
+
+async function resolveReviewerSessionId(prefix, toAgentId, contextPreview = "") {
+  const cached = preferredAgentSessions[toAgentId];
+  if (cached && typeof cached === "string") {
+    return cached;
+  }
+
+  const headers = buildUpstreamHeaders({ accept: "application/json" });
+  try {
+    const listResp = await fetch(`${OPENCODE_URL}${prefix}/session`, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(3000),
+    });
+    if (listResp.ok) {
+      const payload = await listResp.json().catch(() => null);
+      const list = Array.isArray(payload)
+        ? payload
+        : Array.isArray(payload?.sessions)
+          ? payload.sessions
+          : Array.isArray(payload?.data)
+            ? payload.data
+            : [];
+
+      const matching = list
+        .filter((s) => {
+          const sAgent = resolveAgentId(s?.agent || s?.agentId || s?.profile);
+          if (sAgent === toAgentId) return true;
+          const title = String(s?.title || "").toLowerCase();
+          return title.includes(`@${toAgentId}`) || title.includes(`[revisión ${toAgentId}]`);
+        })
+        .sort((a, b) => Number(b?.time?.updated || b?.updatedAt || 0) - Number(a?.time?.updated || a?.updatedAt || 0));
+
+      if (matching[0]?.id) {
+        preferredAgentSessions[toAgentId] = matching[0].id;
+        return matching[0].id;
+      }
+    }
+  } catch {
+    // Continuar con creación de sesión dedicada
+  }
+
+  try {
+    const createResp = await fetch(`${OPENCODE_URL}${prefix}/session`, {
+      method: "POST",
+      headers: buildUpstreamHeaders({
+        accept: "application/json",
+        "content-type": "application/json",
+      }),
+      body: JSON.stringify({
+        title: `Revisión @${toAgentId}: ${String(contextPreview || "revisión").slice(0, 34)}`,
+        agent: toAgentId,
+      }),
+      signal: AbortSignal.timeout(3500),
+    });
+    if (createResp.ok) {
+      const created = await createResp.json().catch(() => null);
+      const newId = created?.id || created?.session?.id || created?.data?.id || null;
+      if (newId) {
+        preferredAgentSessions[toAgentId] = newId;
+        return newId;
+      }
+    }
+  } catch {
+    // Fallback controlado
+  }
+  return null;
+}
+
+async function dispatchPeerReviewToOpenCode({
+  fromAgentId,
+  fromAgentName,
+  toAgentId,
+  toAgentName,
+  context,
+  files = [],
+  round = 1,
+  maxRounds = MAX_PEER_REVIEW_ROUNDS,
+  chainKey = "",
+} = {}) {
+  const probe = await probeUpstream();
+  if (!probe.ok) {
+    return {
+      dispatched: false,
+      targetSessionId: preferredAgentSessions[toAgentId] || null,
+      error: probe.error || "OpenCode Server no disponible para despacho automático.",
+    };
+  }
+
+  const prefix = probe.prefix ?? detectedUpstreamPrefix;
+  const targetSessionId = await resolveReviewerSessionId(prefix, toAgentId, context);
+  if (!targetSessionId) {
+    return {
+      dispatched: false,
+      targetSessionId: null,
+      error: `No se pudo resolver ni crear una sesión activa para @${toAgentId}.`,
+    };
+  }
+
+  const filesSection =
+    files.length > 0 ? `\nArchivos implicados:\n${files.map((f) => `- ${f}`).join("\n")}` : "";
+  const remainingAfterThis = Math.max(0, maxRounds - round);
+  const loopGuardNote =
+    remainingAfterThis > 0
+      ? `Esta es la ronda ${round}/${maxRounds} de revisión automática (hilo: ${chainKey}). Si necesitas devolver un ajuste concreto a @${fromAgentId}, pasa hilo="${chainKey}" en pedir_revision_a.`
+      : `ATENCIÓN: Esta es la ronda final (${round}/${maxRounds}, hilo: ${chainKey}). Aplica tu revisión o resume claramente cualquier bloqueo para el Tech Lead humano; NO vuelvas a rebotar esta tarea con pedir_revision_a.`;
+
+  const promptText = [
+    `[Revisión automática entre especialistas · Ronda ${round}/${maxRounds}]`,
+    `Solicitada por: ${fromAgentName} (@${fromAgentId}) -> Para: ${toAgentName} (@${toAgentId})`,
+    filesSection,
+    "",
+    "Contexto a revisar:",
+    context,
+    "",
+    loopGuardNote,
+  ]
+    .filter((line) => line !== undefined)
+    .join("\n")
+    .trim();
+
+  const headers = buildUpstreamHeaders({
+    accept: "application/json",
+    "content-type": "application/json",
+  });
+
+  const bodies = [
+    { agent: toAgentId, parts: [{ type: "text", text: promptText }] },
+    { agent: toAgentId, text: promptText },
+  ];
+  const endpoints = [
+    `${OPENCODE_URL}${prefix}/session/${encodeURIComponent(targetSessionId)}/prompt_async`,
+    `${OPENCODE_URL}${prefix}/session/${encodeURIComponent(targetSessionId)}/prompt`,
+  ];
+
+  let lastError = null;
+  for (const url of endpoints) {
+    const isAsync = url.endsWith("/prompt_async");
+    for (const body of bodies) {
+      try {
+        const fetchPromise = fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(isAsync ? 4000 : 12000),
+        });
+
+        const race = isAsync
+          ? { settled: true, resp: await fetchPromise }
+          : await Promise.race([
+              fetchPromise
+                .then((resp) => ({ settled: true, resp }))
+                .catch((err) => ({ settled: true, err })),
+              new Promise((resolve) => setTimeout(() => resolve({ settled: false }), 1500)),
+            ]);
+
+        if (!race.settled) {
+          // /prompt sigue ejecutándose en segundo plano en OpenCode
+          fetchPromise.catch(() => {});
+          return {
+            dispatched: true,
+            targetSessionId,
+            dispatchEndpoint: "prompt",
+            error: null,
+          };
+        }
+
+        if (race.err) {
+          lastError = race.err.message || "Error de red al despachar revisión.";
+          continue;
+        }
+
+        if (race.resp.ok || race.resp.status === 204) {
+          return {
+            dispatched: true,
+            targetSessionId,
+            dispatchEndpoint: isAsync ? "prompt_async" : "prompt",
+            error: null,
+          };
+        }
+
+        lastError = `HTTP ${race.resp.status} al despachar revisión.`;
+        if (race.resp.status === 404 || race.resp.status === 405) {
+          break; // Probar siguiente endpoint
+        }
+      } catch (err) {
+        lastError = err?.message || "Timeout al despachar revisión.";
+      }
+    }
+  }
+
+  return {
+    dispatched: false,
+    targetSessionId,
+    error: lastError || "No se pudo despachar el turno al revisor en OpenCode.",
+  };
 }
 
 function broadcastCustomEvent(payload) {
@@ -962,6 +1327,24 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (reqPath === "/api/office/workspace/log" || reqPath === "/office/workspace/log") {
+    if (req.method === "GET") {
+      const limit = Number(searchParams.get("limit") || 15);
+      const result = await getWorkspaceLog(limit);
+      sendJson(res, result.ok ? 200 : 400, result);
+      return;
+    }
+  }
+
+  if (reqPath === "/api/office/workspace/commit" || reqPath === "/office/workspace/commit") {
+    if (req.method === "GET") {
+      const hash = searchParams.get("hash") || "";
+      const result = await getWorkspaceCommitDetail(hash);
+      sendJson(res, result.ok ? 200 : 400, result);
+      return;
+    }
+  }
+
   // Pizarra de Arquitectura bidireccional persistente fuera de git
   if (reqPath === "/api/office/whiteboard" || reqPath === "/office/whiteboard") {
     if (req.method === "GET") {
@@ -1070,10 +1453,44 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Revisión entre pares real (MCP pedir_revision_a -> 3D DESK_REVIEW + contexto al hilo destino)
+  // Revisión entre pares autónoma con límite de seguridad (máx. 2 rondas por hilo/tarea)
+  if (reqPath === "/api/office/peer-review/reset" || reqPath === "/office/peer-review/reset") {
+    if (req.method === "POST") {
+      try {
+        const body = await readJsonBody(req);
+        const rawKey = String(body?.chainKey || body?.hilo || "").trim();
+        let cleared = 0;
+        if (rawKey) {
+          if (peerReviewChains.delete(rawKey)) cleared += 1;
+          const prefixed = `thread:${normalizeChainSlug(rawKey)}`;
+          if (peerReviewChains.delete(prefixed)) cleared += 1;
+        } else {
+          cleared = peerReviewChains.size;
+          peerReviewChains.clear();
+        }
+        sendJson(res, 200, { ok: true, cleared });
+      } catch {
+        sendJson(res, 400, { ok: false, error: "JSON inválido en peer-review/reset" });
+      }
+      return;
+    }
+  }
+
   if (reqPath === "/api/office/peer-review" || reqPath === "/office/peer-review") {
     if (req.method === "GET") {
-      sendJson(res, 200, { ok: true, reviews: recentPeerReviews });
+      sendJson(res, 200, {
+        ok: true,
+        maxRounds: MAX_PEER_REVIEW_ROUNDS,
+        reviews: recentPeerReviews,
+        activeChains: Array.from(peerReviewChains.values()).map((c) => ({
+          key: c.key,
+          rounds: c.rounds,
+          maxRounds: c.maxRounds,
+          escalated: c.escalated,
+          participants: Array.from(c.participants),
+          updatedAt: c.updatedAt,
+        })),
+      });
       return;
     }
     if (req.method === "POST") {
@@ -1082,6 +1499,7 @@ const server = http.createServer(async (req, res) => {
         const fromAgentId = resolveAgentId(body?.fromAgentId || body?.agente);
         const toAgentId = resolveAgentId(body?.toAgentId || body?.destinatario);
         const context = String(body?.context || body?.contexto || "").trim().slice(0, 600);
+        const threadKey = String(body?.threadKey || body?.hilo || body?.taskKey || "").trim();
         const files = Array.isArray(body?.files || body?.archivos)
           ? (body.files || body.archivos).map((f) => String(f || "").trim()).filter(Boolean).slice(0, 10)
           : [];
@@ -1098,6 +1516,94 @@ const server = http.createServer(async (req, res) => {
         spatialCommandSeq += 1;
         const fromMeta = AGENT_META[fromAgentId];
         const toMeta = AGENT_META[toAgentId];
+        const chain = findOrCreatePeerReviewChain({ fromAgentId, toAgentId, files, threadKey });
+        chain.updatedAt = now;
+
+        // Límite de seguridad de rebotes: máximo 2 rondas automáticas por tarea/hilo
+        if (chain.rounds >= MAX_PEER_REVIEW_ROUNDS) {
+          chain.escalated = true;
+          chain.blockedAttempts = (chain.blockedAttempts || 0) + 1;
+
+          const escalatedReview = {
+            id: `pr_${now}_${spatialCommandSeq}`,
+            fromAgentId,
+            fromAgentName: fromMeta?.name || fromAgentId,
+            toAgentId,
+            toAgentName: toMeta?.name || toAgentId,
+            context,
+            files,
+            chainKey: chain.key,
+            round: chain.rounds,
+            maxRounds: MAX_PEER_REVIEW_ROUNDS,
+            dispatched: false,
+            limitReached: true,
+            escalated: true,
+            targetSessionId: preferredAgentSessions[toAgentId] || null,
+            createdAt: now,
+          };
+          recentPeerReviews.unshift(escalatedReview);
+          if (recentPeerReviews.length > 30) recentPeerReviews.length = 30;
+
+          const escalatedCommand = {
+            id: `sc_${now}_${spatialCommandSeq}`,
+            type: "peer_review",
+            agentId: fromAgentId,
+            agentName: fromMeta?.name || fromAgentId,
+            targetAgentId: toAgentId,
+            targetAgentName: toMeta?.name || toAgentId,
+            context,
+            files,
+            chainKey: chain.key,
+            round: chain.rounds,
+            maxRounds: MAX_PEER_REVIEW_ROUNDS,
+            limitReached: true,
+            escalated: true,
+            createdAt: now,
+          };
+          spatialCommandQueue.push(escalatedCommand);
+          if (spatialCommandQueue.length > MAX_SPATIAL_COMMANDS) {
+            spatialCommandQueue = spatialCommandQueue.slice(-MAX_SPATIAL_COMMANDS);
+          }
+
+          broadcastCustomEvent({
+            type: "office.peer_review",
+            properties: { review: escalatedReview, command: escalatedCommand },
+          });
+          broadcastCustomEvent({
+            type: "office.spatial.command",
+            properties: { command: escalatedCommand, whiteboard: spatialState.whiteboard },
+          });
+
+          sendJson(res, 200, {
+            ok: true,
+            dispatched: false,
+            limitReached: true,
+            escalated: true,
+            round: chain.rounds,
+            maxRounds: MAX_PEER_REVIEW_ROUNDS,
+            chainKey: chain.key,
+            review: escalatedReview,
+            command: escalatedCommand,
+            clients: sseClients.size,
+          });
+          return;
+        }
+
+        // Ronda automática permitida (1/2 o 2/2): despachar turno real a OpenCode
+        chain.rounds += 1;
+        const round = chain.rounds;
+        const dispatchRes = await dispatchPeerReviewToOpenCode({
+          fromAgentId,
+          fromAgentName: fromMeta?.name || fromAgentId,
+          toAgentId,
+          toAgentName: toMeta?.name || toAgentId,
+          context,
+          files,
+          round,
+          maxRounds: MAX_PEER_REVIEW_ROUNDS,
+          chainKey: chain.key,
+        });
+
         const review = {
           id: `pr_${now}_${spatialCommandSeq}`,
           fromAgentId,
@@ -1106,8 +1612,24 @@ const server = http.createServer(async (req, res) => {
           toAgentName: toMeta?.name || toAgentId,
           context,
           files,
+          chainKey: chain.key,
+          round,
+          maxRounds: MAX_PEER_REVIEW_ROUNDS,
+          dispatched: Boolean(dispatchRes.dispatched),
+          dispatchError: dispatchRes.error || null,
+          targetSessionId: dispatchRes.targetSessionId || null,
+          limitReached: false,
+          escalated: false,
           createdAt: now,
         };
+        chain.history.push({
+          id: review.id,
+          fromAgentId,
+          toAgentId,
+          round,
+          dispatched: review.dispatched,
+          createdAt: now,
+        });
         recentPeerReviews.unshift(review);
         if (recentPeerReviews.length > 30) recentPeerReviews.length = 30;
 
@@ -1120,6 +1642,12 @@ const server = http.createServer(async (req, res) => {
           targetAgentName: toMeta?.name || toAgentId,
           context,
           files,
+          chainKey: chain.key,
+          round,
+          maxRounds: MAX_PEER_REVIEW_ROUNDS,
+          dispatched: review.dispatched,
+          limitReached: false,
+          escalated: false,
           createdAt: now,
         };
         spatialCommandQueue.push(command);
@@ -1136,7 +1664,20 @@ const server = http.createServer(async (req, res) => {
           properties: { command, whiteboard: spatialState.whiteboard },
         });
 
-        sendJson(res, 200, { ok: true, review, command, clients: sseClients.size });
+        sendJson(res, 200, {
+          ok: true,
+          dispatched: review.dispatched,
+          dispatchError: review.dispatchError,
+          targetSessionId: review.targetSessionId,
+          limitReached: false,
+          escalated: false,
+          round,
+          maxRounds: MAX_PEER_REVIEW_ROUNDS,
+          chainKey: chain.key,
+          review,
+          command,
+          clients: sseClients.size,
+        });
       } catch {
         sendJson(res, 400, { ok: false, error: "JSON inválido en peer-review" });
       }
@@ -1155,6 +1696,15 @@ const server = http.createServer(async (req, res) => {
       try {
         const body = await readJsonBody(req);
         const now = Date.now();
+
+        if (body?.agentSessions && typeof body.agentSessions === "object") {
+          for (const [rawId, sid] of Object.entries(body.agentSessions)) {
+            const agentId = resolveAgentId(rawId);
+            if (agentId && typeof sid === "string" && sid.trim()) {
+              preferredAgentSessions[agentId] = sid.trim();
+            }
+          }
+        }
 
         if (body?.agents && typeof body.agents === "object") {
           for (const [rawId, info] of Object.entries(body.agents)) {
