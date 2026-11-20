@@ -87,6 +87,16 @@ export class MonitorScreenSystem {
     this.loungeScreen = null;
     this.nightFactor = -1;
     this.tickCounter = 0;
+
+    // Estado real en modo OpenCode Live (cero métricas falsas cuando está conectado)
+    this.isLiveMode = false;
+    this.liveWorkspace = {
+      projectName: "",
+      branch: "",
+      changedCount: 0,
+      isGitRepo: false,
+    };
+    this.liveTeamSnapshot = {};
   }
 
   _getStandbyTexture() {
@@ -177,6 +187,14 @@ export class MonitorScreenSystem {
         ? ROLE_SNIPPETS[agentConfig.id]?.file || "workspace/index.ts"
         : "standby",
       partnerName: null,
+      liveToolName: null,
+      liveToolLabel: null,
+      liveTarget: null,
+      liveStatus: null,
+      liveSnippetLines: null,
+      liveOutputLines: null,
+      liveErrorText: null,
+      liveUpdatedAt: 0,
       canvas,
       ctx,
       texture,
@@ -434,6 +452,128 @@ export class MonitorScreenSystem {
     this._redrawLoungeTV();
   }
 
+  setLiveMode(enabled) {
+    const next = Boolean(enabled);
+    if (this.isLiveMode === next) return;
+    this.isLiveMode = next;
+    for (const entry of this.stationScreens.values()) {
+      if (next) {
+        entry.taskLabel = "Disponible";
+        entry.taskFile = null;
+        entry.liveToolName = null;
+        entry.liveToolLabel = null;
+        entry.liveTarget = null;
+        entry.liveStatus = null;
+        entry.liveSnippetLines = null;
+        entry.liveOutputLines = null;
+        entry.liveErrorText = null;
+        entry.liveUpdatedAt = Date.now();
+      } else {
+        entry.liveSnippetLines = null;
+        entry.liveOutputLines = null;
+        entry.liveErrorText = null;
+      }
+      entry.dirty = true;
+      this._redrawStation(entry);
+    }
+    this._redrawMeetingTV();
+    this._redrawMeetingWhiteboard();
+  }
+
+  setLiveWorkspaceSummary(summary = {}) {
+    if (!summary || typeof summary !== "object") return;
+    const nextProject = String(summary.projectName || "").trim();
+    const nextBranch = String(summary.branch || "").trim();
+    const nextCount = Number.isFinite(Number(summary.changedCount))
+      ? Number(summary.changedCount)
+      : Array.isArray(summary.changes)
+        ? summary.changes.length
+        : this.liveWorkspace.changedCount;
+    const nextGit = Boolean(summary.isGitRepo);
+
+    if (
+      nextProject === this.liveWorkspace.projectName &&
+      nextBranch === this.liveWorkspace.branch &&
+      nextCount === this.liveWorkspace.changedCount &&
+      nextGit === this.liveWorkspace.isGitRepo
+    ) {
+      return;
+    }
+
+    this.liveWorkspace = {
+      projectName: nextProject,
+      branch: nextBranch,
+      changedCount: nextCount,
+      isGitRepo: nextGit,
+    };
+
+    if (this.isLiveMode) {
+      for (const entry of this.stationScreens.values()) {
+        this._redrawStation(entry);
+      }
+    }
+    this._redrawMeetingTV();
+  }
+
+  setLiveTeamSnapshot(snapshots = {}) {
+    if (!snapshots || typeof snapshots !== "object") return;
+    this.liveTeamSnapshot = snapshots;
+    if (this.meetingScreen) {
+      this._redrawMeetingTV();
+    }
+  }
+
+  setAgentLiveActivity(agentId, activity = {}) {
+    if (!agentId || !activity) return;
+    for (const entry of this.stationScreens.values()) {
+      if (entry.agentConfig?.id !== agentId) continue;
+
+      if (activity.tool) entry.liveToolName = String(activity.tool);
+      if (activity.label) entry.liveToolLabel = String(activity.label);
+      if (activity.target !== undefined && activity.target !== null) {
+        entry.liveTarget = String(activity.target).slice(0, 64);
+        entry.taskFile = entry.liveTarget;
+      }
+      if (activity.status) entry.liveStatus = String(activity.status);
+
+      if (Array.isArray(activity.snippetLines) && activity.snippetLines.length > 0) {
+        entry.liveSnippetLines = activity.snippetLines
+          .slice(0, 8)
+          .map((line) => String(line ?? "").replace(/\t/g, "  ").slice(0, 56));
+      }
+
+      if (typeof activity.output === "string" && activity.output.trim()) {
+        entry.liveOutputLines = activity.output
+          .split(/\r?\n/)
+          .map((l) => l.trimEnd())
+          .filter(Boolean)
+          .slice(-6)
+          .map((l) => l.slice(0, 52));
+      }
+
+      if (activity.error) {
+        entry.liveErrorText = String(activity.error).trim().slice(0, 180);
+        entry.mode = "ERROR";
+      } else if (activity.status === "completed") {
+        entry.liveErrorText = null;
+      }
+
+      if (activity.label) {
+        entry.taskLabel = activity.target
+          ? `${activity.label}: ${String(activity.target).split(/[\\/]/).pop()}`
+          : activity.label;
+      }
+
+      entry.liveUpdatedAt = Number(activity.timestamp) || Date.now();
+      entry.dirty = true;
+      this._redrawStation(entry);
+    }
+
+    if (this.meetingScreen) {
+      this._redrawMeetingTV();
+    }
+  }
+
   setAgentScreenState(agentId, { mode, taskLabel, taskFile, partnerName } = {}) {
     for (const entry of this.stationScreens.values()) {
       if (entry.agentConfig?.id === agentId) {
@@ -479,6 +619,7 @@ export class MonitorScreenSystem {
       id,
       agentId: raw.agentId || "architect",
       agentName: String(raw.agentName || raw.author || "Tech Lead"),
+      authorType: raw.authorType === "human" ? "human" : "agent",
       color: raw.color || "#8B5CF6",
       text: text.slice(0, 220),
       createdAt,
@@ -497,7 +638,11 @@ export class MonitorScreenSystem {
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
       .slice(0, 8);
     if (this.whiteboardScreen) {
+      this.whiteboardScreen.lastRenderKey = null;
       this._redrawMeetingWhiteboard();
+    }
+    if (this.meetingScreen) {
+      this._redrawMeetingTV();
     }
     return this.getWhiteboardNotes();
   }
@@ -510,7 +655,11 @@ export class MonitorScreenSystem {
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
       .slice(0, 8);
     if (this.whiteboardScreen) {
+      this.whiteboardScreen.lastRenderKey = null;
       this._redrawMeetingWhiteboard();
+    }
+    if (this.meetingScreen) {
+      this._redrawMeetingTV();
     }
     return normalized;
   }
@@ -593,7 +742,13 @@ export class MonitorScreenSystem {
   }
 
   _redrawStation(entry) {
-    const renderKey = `${entry.mode}|${entry.taskLabel || ""}|${entry.taskFile || ""}|${entry.partnerName || ""}|${entry.agentConfig?.name || ""}|${entry.agentConfig?.color || ""}`;
+    const wsKey = this.isLiveMode
+      ? `${this.liveWorkspace.projectName}|${this.liveWorkspace.branch}|${this.liveWorkspace.changedCount}`
+      : "demo";
+    const liveKey = this.isLiveMode
+      ? `${entry.liveToolName || ""}|${entry.liveStatus || ""}|${entry.liveTarget || ""}|${entry.liveUpdatedAt}|${entry.liveSnippetLines?.length || 0}|${entry.liveOutputLines?.length || 0}|${entry.liveErrorText || ""}`
+      : "";
+    const renderKey = `${this.isLiveMode ? "L" : "D"}|${entry.mode}|${entry.taskLabel || ""}|${entry.taskFile || ""}|${entry.partnerName || ""}|${entry.agentConfig?.name || ""}|${entry.agentConfig?.color || ""}|${wsKey}|${liveKey}`;
     if (renderKey === entry.lastRenderKey) {
       entry.dirty = false;
       return false;
@@ -615,7 +770,7 @@ export class MonitorScreenSystem {
     const snippet = ROLE_SNIPPETS[agentConfig?.id] || ROLE_SNIPPETS.frontend;
     const pulseStep = this.tickCounter % 6;
 
-    // === MONITOR IZQUIERDO (Código / Diff / Estado Principal en estética nórdica limpia) ===
+    // === MONITOR IZQUIERDO ===
     ctx.fillStyle = "#111824";
     ctx.fillRect(0, 0, 512, 320);
 
@@ -625,7 +780,6 @@ export class MonitorScreenSystem {
     ctx.fillStyle = accent;
     ctx.fillRect(0, 0, 5, 320);
 
-    // Puntos de ventana sobrios
     ["#64748B", "#64748B", "#64748B"].forEach((dotCol, i) => {
       ctx.fillStyle = dotCol;
       ctx.beginPath();
@@ -633,13 +787,21 @@ export class MonitorScreenSystem {
       ctx.fill();
     });
 
+    const leftHeaderTitle = this.isLiveMode
+      ? entry.liveTarget ||
+        entry.taskFile ||
+        (this.liveWorkspace.branch
+          ? `git:${this.liveWorkspace.branch}`
+          : this.liveWorkspace.projectName || "opencode · en espera")
+      : entry.taskFile || snippet.file;
+
     ctx.fillStyle = "#E5E7EB";
-    ctx.font = "600 14px monospace";
-    ctx.fillText(entry.taskFile || snippet.file, 68, 23);
+    ctx.font = "600 13px monospace";
+    ctx.fillText(String(leftHeaderTitle).slice(0, 34), 68, 23);
 
     ctx.fillStyle = "#94A3B8";
     ctx.font = "12px sans-serif";
-    ctx.fillText(agentConfig?.name || "Agent", 402, 23);
+    ctx.fillText(String(agentConfig?.name || "Agent").slice(0, 14), 398, 23);
 
     if (mode === "AWAY") {
       ctx.fillStyle = "#162030";
@@ -657,7 +819,7 @@ export class MonitorScreenSystem {
       ctx.fillText(nowStr, 178, 152);
       ctx.fillStyle = "#94A3B8";
       ctx.font = "16px sans-serif";
-      ctx.fillText(entry.taskLabel || "Fuera del escritorio", 148, 198);
+      ctx.fillText(String(entry.taskLabel || "Fuera del escritorio").slice(0, 34), 118, 198);
     } else if (mode === "REVIEWING") {
       ctx.fillStyle = "rgba(56, 189, 248, 0.10)";
       ctx.fillRect(18, 48, 476, 34);
@@ -669,24 +831,49 @@ export class MonitorScreenSystem {
         70,
       );
 
-      const diffLines = [
-        { sign: " ", text: "async function syncAgentRoutes() {", color: "#CBD5E1" },
-        { sign: "-", text: "  const path = legacyWalk(pos);", color: "#FCA5A5", bg: "rgba(239,68,68,0.12)" },
-        { sign: "+", text: "  const path = Pathfinding.findPath(pos);", color: "#86EFAC", bg: "rgba(34,197,94,0.12)" },
-        { sign: "+", text: "  bus.emit('agent:state', { ok: true });", color: "#86EFAC", bg: "rgba(34,197,94,0.12)" },
-        { sign: " ", text: "  return checkpointMgr.commit(path);", color: "#CBD5E1" },
-        { sign: " ", text: "}", color: "#CBD5E1" },
-      ];
-      diffLines.forEach((line, idx) => {
-        const y = 102 + idx * 32;
-        if (line.bg) {
-          ctx.fillStyle = line.bg;
-          ctx.fillRect(18, y - 19, 476, 26);
-        }
-        ctx.fillStyle = line.color;
-        ctx.font = "14px monospace";
-        ctx.fillText(`${line.sign} ${line.text}`, 26, y);
-      });
+      if (this.isLiveMode && entry.liveSnippetLines?.length) {
+        entry.liveSnippetLines.slice(0, 6).forEach((line, idx) => {
+          const y = 104 + idx * 32;
+          ctx.fillStyle = "#64748B";
+          ctx.font = "12px monospace";
+          ctx.fillText(String(idx + 1).padStart(2, "0"), 22, y);
+          ctx.fillStyle = idx % 2 === 0 ? "#E2E8F0" : "#93C5FD";
+          ctx.font = "13px monospace";
+          ctx.fillText(line.slice(0, 48), 48, y);
+        });
+      } else if (this.isLiveMode) {
+        ctx.fillStyle = "#CBD5E1";
+        ctx.font = "15px sans-serif";
+        ctx.fillText(String(entry.taskLabel || "Revisión técnica en curso").slice(0, 44), 28, 128);
+        ctx.fillStyle = "#94A3B8";
+        ctx.font = "13px monospace";
+        ctx.fillText(
+          this.liveWorkspace.branch
+            ? `Rama: ${this.liveWorkspace.branch} · ${this.liveWorkspace.changedCount} cambios`
+            : "Sincronizado con OpenCode",
+          28,
+          166,
+        );
+      } else {
+        const diffLines = [
+          { sign: " ", text: "async function syncAgentRoutes() {", color: "#CBD5E1" },
+          { sign: "-", text: "  const path = legacyWalk(pos);", color: "#FCA5A5", bg: "rgba(239,68,68,0.12)" },
+          { sign: "+", text: "  const path = Pathfinding.findPath(pos);", color: "#86EFAC", bg: "rgba(34,197,94,0.12)" },
+          { sign: "+", text: "  bus.emit('agent:state', { ok: true });", color: "#86EFAC", bg: "rgba(34,197,94,0.12)" },
+          { sign: " ", text: "  return checkpointMgr.commit(path);", color: "#CBD5E1" },
+          { sign: " ", text: "}", color: "#CBD5E1" },
+        ];
+        diffLines.forEach((line, idx) => {
+          const y = 102 + idx * 32;
+          if (line.bg) {
+            ctx.fillStyle = line.bg;
+            ctx.fillRect(18, y - 19, 476, 26);
+          }
+          ctx.fillStyle = line.color;
+          ctx.font = "14px monospace";
+          ctx.fillText(`${line.sign} ${line.text}`, 26, y);
+        });
+      }
     } else if (mode === "SUCCESS") {
       ctx.fillStyle = "rgba(16, 185, 129, 0.12)";
       ctx.fillRect(26, 62, 460, 210);
@@ -695,14 +882,20 @@ export class MonitorScreenSystem {
       ctx.strokeRect(26, 62, 460, 210);
 
       ctx.fillStyle = "#6EE7B7";
-      ctx.font = "600 26px monospace";
-      ctx.fillText("BUILD & TESTS PASSED", 78, 134);
+      ctx.font = "600 24px monospace";
+      ctx.fillText(this.isLiveMode ? "TURNO COMPLETADO" : "BUILD & TESTS PASSED", 64, 130);
       ctx.fillStyle = "#E2E8F0";
-      ctx.font = "17px sans-serif";
-      ctx.fillText(entry.taskLabel || "Objetivo completado", 78, 180);
+      ctx.font = "16px sans-serif";
+      ctx.fillText(String(entry.taskLabel || "Objetivo completado").slice(0, 38), 64, 176);
       ctx.fillStyle = "#A7F3D0";
-      ctx.font = "14px monospace";
-      ctx.fillText("✓ 0 errores · checkpoints verificados", 78, 224);
+      ctx.font = "13px monospace";
+      ctx.fillText(
+        this.isLiveMode
+          ? `✓ ${String(entry.liveTarget || "OpenCode listo").slice(0, 40)}`
+          : "✓ 0 errores · checkpoints verificados",
+        64,
+        220,
+      );
     } else if (mode === "ERROR") {
       ctx.fillStyle = "rgba(239, 68, 68, 0.12)";
       ctx.fillRect(26, 62, 460, 210);
@@ -711,14 +904,28 @@ export class MonitorScreenSystem {
       ctx.strokeRect(26, 62, 460, 210);
 
       ctx.fillStyle = "#FCA5A5";
-      ctx.font = "600 24px monospace";
-      ctx.fillText("CHECK REQUIRES REVIEW", 74, 132);
+      ctx.font = "600 22px monospace";
+      ctx.fillText(
+        this.isLiveMode
+          ? String(entry.liveToolLabel || "ERROR EN EJECUCIÓN").toUpperCase().slice(0, 26)
+          : "CHECK REQUIRES REVIEW",
+        54,
+        118,
+      );
       ctx.fillStyle = "#FECACA";
-      ctx.font = "15px monospace";
-      ctx.fillText("ERR_ASSERTION: revisar contrato bus", 66, 178);
-      ctx.fillStyle = "#FDBA74";
-      ctx.font = "15px sans-serif";
-      ctx.fillText(entry.taskLabel || "Analizando incidente...", 66, 220);
+      ctx.font = "14px monospace";
+      const errDetail = this.isLiveMode
+        ? entry.liveErrorText || entry.taskLabel || "Revisar salida en inspector"
+        : "ERR_ASSERTION: revisar contrato bus";
+      const errLines = this._wrapCanvasLines(ctx, errDetail, 410, 3);
+      errLines.forEach((l, idx) => {
+        ctx.fillText(l, 54, 160 + idx * 24);
+      });
+      if (!this.isLiveMode) {
+        ctx.fillStyle = "#FDBA74";
+        ctx.font = "15px sans-serif";
+        ctx.fillText(String(entry.taskLabel || "Analizando incidente...").slice(0, 38), 54, 236);
+      }
     } else if (mode === "THINKING") {
       ctx.fillStyle = "rgba(125, 211, 252, 0.10)";
       ctx.fillRect(22, 52, 468, 38);
@@ -730,7 +937,6 @@ export class MonitorScreenSystem {
       ctx.font = "600 15px monospace";
       ctx.fillText("RAZONAMIENTO EN CURSO", 36, 76);
 
-      // Barras limpias de inferencia
       for (let i = 0; i < 16; i++) {
         const waveH = 16 + Math.round(Math.abs(Math.sin(i * 0.55 + this.tickCounter * 0.85)) * 52);
         ctx.fillStyle = i % 2 === 0 ? "rgba(125, 211, 252, 0.58)" : "rgba(186, 230, 253, 0.35)";
@@ -750,8 +956,74 @@ export class MonitorScreenSystem {
       ctx.fillStyle = "#94A3B8";
       ctx.font = "12px monospace";
       ctx.fillText("Planificando pasos y contexto técnico", 36, 274);
+    } else if (this.isLiveMode) {
+      // MODO LIVE REAL: nunca mostrar ROLE_SNIPPETS falsos
+      if (entry.liveSnippetLines && entry.liveSnippetLines.length > 0) {
+        entry.liveSnippetLines.slice(0, 6).forEach((line, idx) => {
+          const y = 74 + idx * 36;
+          if (idx === pulseStep % entry.liveSnippetLines.length) {
+            ctx.fillStyle = "rgba(148, 163, 184, 0.10)";
+            ctx.fillRect(16, y - 22, 480, 29);
+          }
+          ctx.fillStyle = "#64748B";
+          ctx.font = "12px monospace";
+          ctx.fillText(String(idx + 1).padStart(2, "0"), 22, y);
+
+          ctx.fillStyle = idx % 2 === 0 ? "#E5E7EB" : "#93C5FD";
+          ctx.font = "13px monospace";
+          ctx.fillText(line.slice(0, 48), 50, y);
+        });
+      } else if (entry.liveOutputLines && entry.liveOutputLines.length > 0) {
+        ctx.fillStyle = "#94A3B8";
+        ctx.font = "600 12px monospace";
+        ctx.fillText(
+          `$ ${String(entry.liveToolLabel || entry.liveToolName || "comando").slice(0, 40)}`,
+          24,
+          64,
+        );
+        entry.liveOutputLines.slice(0, 6).forEach((line, idx) => {
+          const y = 94 + idx * 34;
+          ctx.fillStyle = "#CBD5E1";
+          ctx.font = "13px monospace";
+          ctx.fillText(line.slice(0, 50), 24, y);
+        });
+      } else {
+        // Standby real limpio conectado a OpenCode
+        ctx.fillStyle = "#162030";
+        ctx.fillRect(32, 66, 448, 214);
+        ctx.strokeStyle = "#26354C";
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(32, 66, 448, 214);
+
+        ctx.fillStyle = "#E2E8F0";
+        ctx.font = "600 18px sans-serif";
+        ctx.fillText(
+          String(this.liveWorkspace.projectName || "Workspace OpenCode").slice(0, 32),
+          54,
+          114,
+        );
+
+        ctx.fillStyle = "#93C5FD";
+        ctx.font = "600 14px monospace";
+        const branchText = this.liveWorkspace.isGitRepo
+          ? `git:${this.liveWorkspace.branch || "HEAD"} · ${this.liveWorkspace.changedCount} cambios`
+          : "Directorio local activo";
+        ctx.fillText(branchText.slice(0, 44), 54, 152);
+
+        ctx.fillStyle = "#94A3B8";
+        ctx.font = "15px sans-serif";
+        ctx.fillText(
+          String(entry.taskLabel || "En espera de instrucciones").slice(0, 38),
+          54,
+          202,
+        );
+
+        ctx.fillStyle = "#64748B";
+        ctx.font = "12px monospace";
+        ctx.fillText("Clic en monitor para abrir Inspector Git", 54, 246);
+      }
     } else {
-      // WORKING
+      // MODO DEMO OFFLINE
       snippet.lines.forEach((line, idx) => {
         const y = 74 + idx * 36;
         if (idx === pulseStep) {
@@ -773,7 +1045,7 @@ export class MonitorScreenSystem {
       }
     }
 
-    // === MONITOR DERECHO (Telemetría / Terminal / Métricas limpias) ===
+    // === MONITOR DERECHO ===
     rightCtx.fillStyle = "#0F1622";
     rightCtx.fillRect(0, 0, 512, 320);
     rightCtx.fillStyle = "#172131";
@@ -783,12 +1055,89 @@ export class MonitorScreenSystem {
 
     rightCtx.fillStyle = "#CBD5E1";
     rightCtx.font = "600 14px monospace";
-    rightCtx.fillText(snippet.metricTitle, 20, 23);
+    const rightHeader = this.isLiveMode
+      ? String(entry.liveToolLabel || "SESIÓN OPENCODE LIVE").toUpperCase().slice(0, 32)
+      : snippet.metricTitle;
+    rightCtx.fillText(rightHeader, 20, 23);
 
     if (mode === "AWAY") {
       rightCtx.fillStyle = "#475569";
       rightCtx.font = "17px monospace";
       rightCtx.fillText("SESIÓN EN PAUSA", 164, 165);
+    } else if (this.isLiveMode) {
+      const barColor =
+        mode === "ERROR"
+          ? "#F87171"
+          : mode === "SUCCESS"
+            ? "#34D399"
+            : mode === "THINKING"
+              ? "#7DD3FC"
+              : accent;
+
+      // Bloque superior: salida real de terminal o resumen real del workspace
+      rightCtx.fillStyle = "#141D2C";
+      rightCtx.fillRect(20, 52, 472, 126);
+      rightCtx.strokeStyle = "#223045";
+      rightCtx.strokeRect(20, 52, 472, 126);
+
+      if (entry.liveErrorText) {
+        rightCtx.fillStyle = "#FCA5A5";
+        rightCtx.font = "13px monospace";
+        const errRows = this._wrapCanvasLines(rightCtx, entry.liveErrorText, 444, 4);
+        errRows.forEach((row, idx) => {
+          rightCtx.fillText(row, 32, 78 + idx * 24);
+        });
+      } else if (entry.liveOutputLines && entry.liveOutputLines.length > 0) {
+        entry.liveOutputLines.slice(-4).forEach((line, idx) => {
+          rightCtx.fillStyle = idx === entry.liveOutputLines.length - 1 ? "#E2E8F0" : "#94A3B8";
+          rightCtx.font = "12px monospace";
+          rightCtx.fillText(line.slice(0, 52), 30, 78 + idx * 25);
+        });
+      } else {
+        rightCtx.fillStyle = "#94A3B8";
+        rightCtx.font = "13px monospace";
+        rightCtx.fillText(
+          this.liveWorkspace.isGitRepo
+            ? `REPO: ${this.liveWorkspace.projectName || "local"}`
+            : "ENTORNO: Conectado a puente local",
+          32,
+          84,
+        );
+        rightCtx.fillStyle = "#CBD5E1";
+        rightCtx.fillText(
+          this.liveWorkspace.isGitRepo
+            ? `RAMA: ${this.liveWorkspace.branch || "HEAD"} · ${this.liveWorkspace.changedCount} modificados`
+            : "Sin repositorio Git detectado",
+          32,
+          114,
+        );
+        rightCtx.fillStyle = "#64748B";
+        rightCtx.fillText("Esperando herramienta o lectura de código", 32, 148);
+      }
+
+      // Bloque inferior: acción real en curso
+      rightCtx.fillStyle = "#151F2E";
+      rightCtx.fillRect(20, 192, 472, 104);
+      rightCtx.strokeStyle = "#243247";
+      rightCtx.strokeRect(20, 192, 472, 104);
+
+      rightCtx.fillStyle = "#F1F5F9";
+      rightCtx.font = "600 15px monospace";
+      rightCtx.fillText(
+        `> ${String(entry.taskLabel || "Disponible").slice(0, 38)}`,
+        34,
+        224,
+      );
+
+      rightCtx.fillStyle = "#94A3B8";
+      rightCtx.font = "13px monospace";
+      rightCtx.fillText(
+        String(entry.liveTarget || "Sin archivo activo").slice(0, 44),
+        34,
+        252,
+      );
+      rightCtx.fillStyle = barColor;
+      rightCtx.fillText(`ESTADO: ${(entry.liveStatus || mode).toUpperCase()}`, 34, 278);
     } else {
       const barColor =
         mode === "ERROR"
@@ -835,10 +1184,13 @@ export class MonitorScreenSystem {
     let profileSig = "";
     for (const entry of this.stationScreens.values()) {
       if (entry.agentConfig) {
-        profileSig += `${entry.agentConfig.id}:${entry.agentConfig.name}:${entry.agentConfig.color};`;
+        profileSig += `${entry.agentConfig.id}:${entry.agentConfig.name}:${entry.agentConfig.color}:${entry.mode}:${entry.liveStatus || ""}:${entry.taskLabel || ""};`;
       }
     }
-    const renderKey = `${mode}|${topic}|${presenterName}|${profileSig}`;
+    const liveSig = this.isLiveMode
+      ? `${this.liveWorkspace.projectName}|${this.liveWorkspace.branch}|${this.liveWorkspace.changedCount}|${this.whiteboardNotes.length}|${Object.entries(this.liveTeamSnapshot).map(([k, v]) => `${k}:${v?.actionLabel || ""}:${v?.isLiveBusy ? 1 : 0}`).join(",")}`
+      : "demo";
+    const renderKey = `${this.isLiveMode ? "L" : "D"}|${mode}|${topic}|${presenterName}|${profileSig}|${liveSig}`;
     if (renderKey === this.meetingScreen.lastRenderKey) {
       return false;
     }
@@ -857,14 +1209,27 @@ export class MonitorScreenSystem {
     ctx.fillStyle = "#F3EFE8";
     ctx.font = "600 25px sans-serif";
     ctx.fillText(
-      mode === "MEETING" ? "SALA DE REUNIONES · SINCRONIZACIÓN" : "ARQUITECTURA DE ESTUDIO · SPRINT",
+      mode === "MEETING"
+        ? "SALA DE REUNIONES · SINCRONIZACIÓN"
+        : this.isLiveMode
+          ? `WORKSPACE EN VIVO · ${String(this.liveWorkspace.projectName || "OPENCODE").toUpperCase().slice(0, 24)}`
+          : "ARQUITECTURA DE ESTUDIO · SPRINT",
       36,
       44,
     );
 
-    ctx.fillStyle = mode === "MEETING" ? "#FBBF24" : "#94A3B8";
+    ctx.fillStyle =
+      mode === "MEETING"
+        ? "#FBBF24"
+        : this.isLiveMode
+          ? "#34D399"
+          : "#94A3B8";
     ctx.font = "600 18px monospace";
-    ctx.fillText(mode === "MEETING" ? "LIVE SYNC" : "STANDBY", 884, 44);
+    ctx.fillText(
+      mode === "MEETING" ? "LIVE SYNC" : this.isLiveMode ? "OPENCODE" : "DEMO",
+      878,
+      44,
+    );
 
     // Panel izquierdo: Diagrama de arquitectura limpio y nodos conectados
     ctx.fillStyle = "#152032";
@@ -885,6 +1250,24 @@ export class MonitorScreenSystem {
           ? `${String(topic).slice(0, 33)}…`
           : String(topic || "Sincronización");
       ctx.fillText(safeTopic, 62, 188);
+    } else if (this.isLiveMode) {
+      ctx.fillStyle = "#6EE7B7";
+      ctx.font = "600 17px monospace";
+      ctx.fillText(
+        this.liveWorkspace.isGitRepo
+          ? `GIT: ${String(this.liveWorkspace.branch || "HEAD").slice(0, 22)} · ${this.liveWorkspace.changedCount} CAMBIOS`
+          : "OPENCODE BRIDGE CONECTADO",
+        62,
+        144,
+      );
+
+      ctx.fillStyle = "#E2E8F0";
+      ctx.font = "600 22px sans-serif";
+      ctx.fillText(
+        `Pizarra: ${this.whiteboardNotes.length} notas · Clic en mesa para Standup`,
+        62,
+        182,
+      );
     } else {
       ctx.fillStyle = "#93C5FD";
       ctx.font = "600 18px monospace";
@@ -895,7 +1278,6 @@ export class MonitorScreenSystem {
       ctx.fillText("Flujo Coordinado · OpenCode Bridge", 62, 182);
     }
 
-    // Diagrama vectorial limpio de arquitectura (Tech Lead -> Bus -> Workers)
     ctx.strokeStyle = "#475569";
     ctx.lineWidth = 2.5;
     ctx.beginPath();
@@ -919,23 +1301,68 @@ export class MonitorScreenSystem {
       ctx.strokeRect(x, y, w, h);
       ctx.fillStyle = "#F1F5F9";
       ctx.font = "600 15px sans-serif";
-      ctx.fillText(label, x + 14, y + 26);
+      ctx.fillText(String(label).slice(0, 18), x + 14, y + 26);
       ctx.fillStyle = "#94A3B8";
       ctx.font = "12px monospace";
-      ctx.fillText(sub, x + 14, y + 46);
+      ctx.fillText(String(sub).slice(0, 20), x + 14, y + 46);
     };
 
-    drawNode(206, 212, 220, 56, "Tech Lead", "Planner & Barrier", "#A78BFA");
-    drawNode(76, 354, 152, 60, "Frontend", "UI & WebGL", "#EAB308");
-    drawNode(240, 354, 152, 60, "Backend", "API & Events", "#38BDF8");
-    drawNode(404, 354, 152, 60, "QA / Sys", "Tests & CLI", "#FB923C");
+    const getEntryById = (id) => {
+      for (const e of this.stationScreens.values()) {
+        if (e.agentConfig?.id === id) return e;
+      }
+      return null;
+    };
+    const archEntry = getEntryById("architect");
+    const feEntry = getEntryById("frontend");
+    const beEntry = getEntryById("backend");
+    const qaEntry = getEntryById("qa");
+
+    drawNode(
+      206,
+      212,
+      220,
+      56,
+      archEntry?.agentConfig?.name || "Tech Lead",
+      this.isLiveMode ? archEntry?.liveToolLabel || "Coordinador" : "Planner & Barrier",
+      archEntry?.agentConfig?.color || "#A78BFA",
+    );
+    drawNode(
+      76,
+      354,
+      152,
+      60,
+      feEntry?.agentConfig?.name || "Frontend",
+      this.isLiveMode ? feEntry?.liveToolLabel || "Disponible" : "UI & WebGL",
+      feEntry?.agentConfig?.color || "#EAB308",
+    );
+    drawNode(
+      240,
+      354,
+      152,
+      60,
+      beEntry?.agentConfig?.name || "Backend",
+      this.isLiveMode ? beEntry?.liveToolLabel || "Disponible" : "API & Events",
+      beEntry?.agentConfig?.color || "#38BDF8",
+    );
+    drawNode(
+      404,
+      354,
+      152,
+      60,
+      qaEntry?.agentConfig?.name || "QA / Sys",
+      this.isLiveMode ? qaEntry?.liveToolLabel || "Disponible" : "Tests & CLI",
+      qaEntry?.agentConfig?.color || "#FB923C",
+    );
 
     ctx.fillStyle = "#94A3B8";
     ctx.font = "15px monospace";
     ctx.fillText(
       mode === "MEETING"
-        ? "Barrera de encuentro sincronizada · 4 fases activas"
-        : "Listo para delegación y sincronización de sprint",
+        ? "Reunión sincronizada en curso"
+        : this.isLiveMode
+          ? "Datos reales en directo · Cero actividad simulada"
+          : "Listo para delegación y sincronización de sprint",
       62,
       482,
     );
@@ -959,26 +1386,43 @@ export class MonitorScreenSystem {
       { id: "systems", name: "Systems", color: "#EA580C", pct: 0.81 },
     ];
     const roles = defaultRoles.map((r) => {
-      for (const entry of this.stationScreens.values()) {
-        if (entry.agentConfig?.id === r.id) {
-          return {
-            ...r,
-            name: entry.agentConfig.name,
-            color: entry.agentConfig.color,
-          };
-        }
-      }
-      return r;
+      const entry = getEntryById(r.id);
+      const snap = this.liveTeamSnapshot[r.id];
+      const liveBusy = Boolean(snap?.isLiveBusy) || entry?.liveStatus === "running";
+      const label = this.isLiveMode
+        ? snap?.actionLabel || entry?.taskLabel || "Disponible"
+        : null;
+      const fillRatio = this.isLiveMode
+        ? liveBusy
+          ? 0.94
+          : entry?.mode === "REVIEWING" || mode === "MEETING"
+            ? 0.56
+            : 0.16
+        : r.pct;
+      return {
+        ...r,
+        name: entry?.agentConfig?.name || r.name,
+        color: entry?.agentConfig?.color || r.color,
+        pct: fillRatio,
+        liveLabel: label,
+      };
     });
     roles.forEach((r, i) => {
-      const y = 188 + i * 64;
+      const y = 186 + i * 64;
       ctx.fillStyle = "#E5E7EB";
-      ctx.font = "500 18px sans-serif";
-      ctx.fillText(r.name, 652, y);
+      ctx.font = "600 16px sans-serif";
+      ctx.fillText(String(r.name).slice(0, 16), 652, y);
+
+      if (this.isLiveMode && r.liveLabel) {
+        ctx.fillStyle = "#94A3B8";
+        ctx.font = "12px monospace";
+        ctx.fillText(String(r.liveLabel).slice(0, 22), 788, y);
+      }
+
       ctx.fillStyle = "#1E293B";
-      ctx.fillRect(652, y + 12, 304, 12);
+      ctx.fillRect(652, y + 12, 304, 10);
       ctx.fillStyle = r.color;
-      ctx.fillRect(652, y + 12, Math.round(304 * r.pct), 12);
+      ctx.fillRect(652, y + 12, Math.round(304 * r.pct), 10);
     });
 
     texture.needsUpdate = true;
@@ -1023,7 +1467,7 @@ export class MonitorScreenSystem {
     const notesSig = this.whiteboardNotes
       .map((n) => `${n.id}:${n.createdAt}:${n.text}`)
       .join(";");
-    let stateSig = `${this.meetingScreen?.mode || "STANDBY"}#${notesSig}`;
+    let stateSig = `${this.isLiveMode ? "L" : "D"}#${this.meetingScreen?.mode || "STANDBY"}#${notesSig}`;
     const activeCards = [];
     for (const entry of this.stationScreens.values()) {
       if (entry.agentConfig) {
@@ -1032,7 +1476,7 @@ export class MonitorScreenSystem {
           name: entry.agentConfig.name,
           color: entry.agentConfig.color || "#3B82F6",
           mode: entry.mode,
-          label: entry.taskLabel || "En curso",
+          label: entry.taskLabel || "Disponible",
         });
       }
     }
@@ -1058,11 +1502,13 @@ export class MonitorScreenSystem {
     ctx.font = "bold 15px monospace";
     const rightBadge =
       this.whiteboardNotes.length > 0
-        ? `${this.whiteboardNotes.length} NOTAS RECIENTES`
-        : this.meetingScreen?.mode === "MEETING"
-          ? "SYNC EN VIVO"
-          : "FLUJO ACTIVO";
-    ctx.fillText(rightBadge, 818, 37);
+        ? `${this.whiteboardNotes.length} NOTAS PERSISTIDAS`
+        : this.isLiveMode
+          ? "CLIC PARA ANOTAR"
+          : this.meetingScreen?.mode === "MEETING"
+            ? "SYNC EN VIVO"
+            : "FLUJO ACTIVO";
+    ctx.fillText(rightBadge, 800, 37);
 
     if (this.whiteboardNotes.length > 0) {
       const visibleNotes = this.whiteboardNotes.slice(0, 6);
@@ -1091,7 +1537,11 @@ export class MonitorScreenSystem {
 
         ctx.fillStyle = "#1F2937";
         ctx.font = "bold 16px sans-serif";
-        ctx.fillText(String(note.agentName || "Equipo").slice(0, 22), x + 20, y + 26);
+        const authorLabel =
+          note.authorType === "human"
+            ? `${String(note.agentName || "Tech Lead").slice(0, 18)} [Tú]`
+            : String(note.agentName || "Equipo").slice(0, 22);
+        ctx.fillText(authorLabel, x + 20, y + 26);
 
         ctx.fillStyle = "#6B7280";
         ctx.font = "13px monospace";
@@ -1119,6 +1569,45 @@ export class MonitorScreenSystem {
         44,
         496,
       );
+
+      texture.needsUpdate = true;
+      return true;
+    }
+
+    if (this.isLiveMode) {
+      // Pizarra limpia en modo live esperando decisiones reales
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillRect(64, 110, 896, 250);
+      ctx.strokeStyle = "#DCD6CC";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(64, 110, 896, 250);
+
+      ctx.fillStyle = "#334155";
+      ctx.font = "bold 24px sans-serif";
+      ctx.fillText("Pizarra lista para decisiones del proyecto", 104, 184);
+
+      ctx.fillStyle = "#64748B";
+      ctx.font = "18px sans-serif";
+      ctx.fillText(
+        "Haz clic aquí para fijar acuerdos técnicos o pide a tus agentes",
+        104,
+        232,
+      );
+      ctx.fillText(
+        "que anoten contratos usando escribir_en_pizarra / leer_pizarra.",
+        104,
+        266,
+      );
+
+      ctx.fillStyle = "#EFECE6";
+      ctx.fillRect(64, 396, 896, 68);
+      ctx.fillStyle = "#475569";
+      ctx.font = "15px monospace";
+      const liveSummary = activeCards
+        .slice(0, 5)
+        .map((c) => `${c.name}: ${String(c.label).slice(0, 14)}`)
+        .join("  ·  ");
+      ctx.fillText(liveSummary || "Equipo conectado y listo", 86, 436);
 
       texture.needsUpdate = true;
       return true;

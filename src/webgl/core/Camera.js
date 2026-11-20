@@ -103,6 +103,40 @@ export class Camera {
     this._notifyViewStateIfChanged(false);
   }
 
+  focusOnPoint(targetPos, camPos = null, desiredDistance = 10.5) {
+    if (!targetPos) return;
+    this.followAgentRef = null;
+
+    if (Array.isArray(targetPos)) {
+      this.transitionTarget.set(targetPos[0], targetPos[1], targetPos[2]);
+    } else {
+      this.transitionTarget.set(targetPos.x, targetPos.y, targetPos.z);
+    }
+    this.hasTransitionTarget = true;
+
+    if (camPos) {
+      if (Array.isArray(camPos)) {
+        this.transitionCamPos.set(camPos[0], camPos[1], camPos[2]);
+      } else {
+        this.transitionCamPos.set(camPos.x, camPos.y, camPos.z);
+      }
+    } else {
+      _offsetDir.subVectors(this.instance.position, this.controls.target);
+      if (_offsetDir.lengthSq() < 0.01) {
+        _offsetDir.set(1, 0.9, 1);
+      }
+      _offsetDir.normalize();
+      _desiredCamPos
+        .copy(this.transitionTarget)
+        .addScaledVector(_offsetDir, Math.max(desiredDistance, 7.5));
+      this.transitionCamPos.copy(_desiredCamPos);
+    }
+
+    this.hasTransitionCamPos = true;
+    this.isTransitioning = true;
+    this._notifyViewStateIfChanged(false);
+  }
+
   resetView() {
     this.followAgentRef = null;
     this.transitionTarget.copy(DEFAULT_TARGET);

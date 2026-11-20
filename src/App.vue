@@ -24,20 +24,34 @@ import {
   ShieldAlert,
   AlertTriangle,
   SlidersHorizontal,
+  Volume2,
+  Volume1,
+  VolumeX,
+  GitBranch,
+  FolderOpen,
+  Bell,
 } from "@lucide/vue";
 import { Resources } from "./webgl/core/Resources";
 import { Experience } from "./webgl/Experience";
 import { ASSETS_MANIFEST } from "./config/assets";
 import { AGENT_STATIONS } from "./config/officeLayout";
 import { officeEventBus, OFFICE_EVENTS } from "./events/OfficeEventBus";
-import { agentProfileManager, taskBoardManager } from "./state/officeWorkspace";
+import {
+  agentProfileManager,
+  taskBoardManager,
+  AGENT_COLOR_PALETTE,
+} from "./state/officeWorkspace";
 import { openCodeBridge } from "./opencode/OpenCodeBridgeClient";
+import { ambientAudio } from "./audio/AmbientAudioEngine";
 import {
   OPENCODE_JSON_SNIPPET,
   OPENCODE_CLI_COMMANDS,
   buildOpenCodeSetupReport,
 } from "./opencode/openCodeTemplates";
 import { renderSafeMarkdown } from "./utils/safeMarkdown";
+import GitActivityInspectorModal from "./components/GitActivityInspectorModal.vue";
+import WhiteboardModal from "./components/WhiteboardModal.vue";
+import QuickStandupModal from "./components/QuickStandupModal.vue";
 
 const canvasRef = ref(null);
 const loadProgress = ref(0);
@@ -47,9 +61,46 @@ const selectedAgentId = ref(null);
 
 const isChatOpen = ref(false);
 const isSettingsModalOpen = ref(false);
-const settingsTab = ref("connection"); // 'connection' | 'mapping' | 'guide'
+const settingsTab = ref("connection"); // 'connection' | 'workspace' | 'mapping' | 'guide'
+
+const hoveredProp = ref(null);
+const isInspectorOpen = ref(false);
+const inspectorInitialTab = ref("git");
+const inspectorAgentId = ref("all");
+const isWhiteboardOpen = ref(false);
+const whiteboardNotes = ref([]);
+const isStandupOpen = ref(false);
+
+const workspaceSummary = ref(null);
+const workspaceDirInput = ref("");
+const workspaceDirFeedback = ref(null);
+const isApplyingWorkspaceDir = ref(false);
+const toolActivityList = ref([]);
+
+const audioMode = ref(ambientAudio.getMode());
+const DESKTOP_NOTIF_KEY = "oficina3d:desktop_notifications:v1";
+function readDesktopNotifPref() {
+  try {
+    return typeof localStorage !== "undefined" && localStorage.getItem(DESKTOP_NOTIF_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+const desktopNotifEnabled = ref(readDesktopNotifPref());
+const desktopNotifPermission = ref(
+  typeof Notification !== "undefined" ? Notification.permission : "unsupported",
+);
+const notifiedAttentionIds = new Set();
 
 const profiles = ref(agentProfileManager.getProfiles());
+const profileDrafts = reactive(
+  Object.fromEntries(
+    profiles.value.map((p) => [
+      p.id,
+      { name: p.name, role: p.role, color: p.color },
+    ]),
+  ),
+);
 const tasks = ref(taskBoardManager.getTasks());
 const dismissedBlockedAlertKeys = ref(new Set());
 
@@ -63,6 +114,7 @@ const openCodeForm = reactive({
   password: initialOpenCodeCfg.password,
   idleCooldownSec: initialOpenCodeCfg.idleCooldownSec,
   autoReconnect: initialOpenCodeCfg.autoReconnect,
+  autoConnect: Boolean(initialOpenCodeCfg.autoConnect),
 });
 const aliasDraft = reactive(
   Object.fromEntries(
@@ -279,7 +331,112 @@ let unsubProfileSync = null;
 let unsubTaskSync = null;
 let unsubOpenCode = null;
 let unsubSessionLog = null;
+let unsubToolActivity = null;
+let unsubWorkspace = null;
+let unsubWhiteboard = null;
+let unsubAudioChange = null;
 let copyFeedbackTimer = null;
+
+const BASE_DOC_TITLE = "Oficina Virtual 3D";
+
+watch(
+  pendingAttentionCount,
+  (count) => {
+    if (typeof document !== "undefined") {
+      document.title = count > 0 ? `(${count}) ${BASE_DOC_TITLE}` : BASE_DOC_TITLE;
+    }
+  },
+  { immediate: true },
+);
+
+function dispatchDesktopNotification({ id, title, body, agentId = "architect" }) {
+  if (!desktopNotifEnabled.value) return;
+  if (typeof document === "undefined" || !document.hidden) return;
+  if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+  if (!id || notifiedAttentionIds.has(id)) return;
+  notifiedAttentionIds.add(id);
+  try {
+    const n = new Notification(title, {
+      body: String(body || "").slice(0, 140),
+      tag: id,
+    });
+    n.onclick = () => {
+      try {
+        window.focus();
+      } catch {
+        // Ignorar restricciones del navegador
+      }
+      selectChatAgent(agentId, { focus3d: true, openDrawer: true });
+      n.close();
+    };
+  } catch {
+    // Ignorar fallo si el navegador bloquea notificaciones en iframe
+  }
+}
+
+watch(
+  [pendingPermissions, pendingQuestions, pendingInquiries],
+  ([perms, questions, inquiries]) => {
+    for (const p of perms) {
+      const name = profileMap.value[p.agentId]?.name || p.agentId || "Equipo";
+      dispatchDesktopNotification({
+        id: `perm:${p.id}`,
+        title: `Permiso solicitado · ${name}`,
+        body: `${p.title || "Autorización"}: ${p.targetSummary || ""}`,
+        agentId: p.agentId || "architect",
+      });
+    }
+    for (const q of questions) {
+      const name = profileMap.value[q.agentId]?.name || q.agentId || "Equipo";
+      dispatchDesktopNotification({
+        id: `q:${q.id}`,
+        title: `${name} te hace una consulta`,
+        body: q.questions?.[0]?.question || "Esperando tu respuesta",
+        agentId: q.agentId || "architect",
+      });
+    }
+    for (const inq of inquiries) {
+      const name = profileMap.value[inq.agentId]?.name || inq.agentId || "Equipo";
+      dispatchDesktopNotification({
+        id: `inq:${inq.id}`,
+        title: `${name} te hace una consulta`,
+        body: inq.excerpt || "Consulta pendiente en el chat",
+        agentId: inq.agentId || "architect",
+      });
+    }
+  },
+  { deep: false },
+);
+
+const audioModeLabel = computed(() => {
+  if (audioMode.value === "ambient") return "Audio: Ambiente y avisos";
+  if (audioMode.value === "muted") return "Audio: Silenciado";
+  return "Audio: Solo avisos sutiles";
+});
+
+const workspaceChangedCount = computed(() =>
+  Array.isArray(workspaceSummary.value?.changes)
+    ? workspaceSummary.value.changes.length
+    : 0,
+);
+
+const anyFloatingModalOpen = computed(
+  () =>
+    isSettingsModalOpen.value ||
+    isInspectorOpen.value ||
+    isWhiteboardOpen.value ||
+    isStandupOpen.value,
+);
+
+const hoverTooltipStyle = computed(() => {
+  if (!hoveredProp.value) return {};
+  const maxW = typeof window !== "undefined" ? window.innerWidth : 1200;
+  const x = Math.min((hoveredProp.value.clientX || 0) + 14, maxW - 240);
+  const y = Math.max((hoveredProp.value.clientY || 0) - 12, 12);
+  return {
+    transform: `translate3d(${x}px, ${y}px, 0)`,
+  };
+});
 
 function hexToRgba(hex, alpha = 0.14) {
   const clean = String(hex || "#E09F5A").replace("#", "");
@@ -563,8 +720,164 @@ function syncAliasDraft(cfg = openCodeBridge.getConfig()) {
   }
 }
 
+function syncProfileDrafts(list = profiles.value) {
+  for (const p of list) {
+    profileDrafts[p.id] = {
+      name: p.name,
+      role: p.role,
+      color: p.color,
+    };
+  }
+}
+
+function handleCycleAudioMode() {
+  ambientAudio.cycleMode();
+}
+
+function handleSetAudioMode(mode) {
+  ambientAudio.setMode(mode);
+}
+
+async function handleToggleDesktopNotifications() {
+  if (typeof Notification === "undefined") {
+    desktopNotifPermission.value = "unsupported";
+    desktopNotifEnabled.value = false;
+    return;
+  }
+  if (!desktopNotifEnabled.value) {
+    if (Notification.permission === "default") {
+      try {
+        const res = await Notification.requestPermission();
+        desktopNotifPermission.value = res;
+        if (res !== "granted") {
+          desktopNotifEnabled.value = false;
+          return;
+        }
+      } catch {
+        desktopNotifEnabled.value = false;
+        return;
+      }
+    } else if (Notification.permission !== "granted") {
+      desktopNotifPermission.value = Notification.permission;
+      desktopNotifEnabled.value = false;
+      return;
+    }
+    desktopNotifEnabled.value = true;
+  } else {
+    desktopNotifEnabled.value = false;
+  }
+  try {
+    localStorage.setItem(DESKTOP_NOTIF_KEY, desktopNotifEnabled.value ? "1" : "0");
+  } catch {
+    // Ignorar error de almacenamiento
+  }
+}
+
+function openInspectorModal({ tab = "git", agentId = "all" } = {}) {
+  hoveredProp.value = null;
+  inspectorInitialTab.value = tab;
+  inspectorAgentId.value = agentId || "all";
+  toolActivityList.value = openCodeBridge.getToolActivity("all");
+  isInspectorOpen.value = true;
+}
+
+function openWhiteboardModal() {
+  hoveredProp.value = null;
+  isWhiteboardOpen.value = true;
+}
+
+function openStandupModal() {
+  hoveredProp.value = null;
+  isStandupOpen.value = true;
+}
+
+function handlePropSelected(propHit) {
+  if (!propHit) return;
+  hoveredProp.value = null;
+  if (propHit.propKind === "whiteboard") {
+    openWhiteboardModal();
+  } else if (propHit.propKind === "meeting-table") {
+    openStandupModal();
+  } else if (propHit.propKind === "monitor") {
+    const agentAct = openCodeBridge.getToolActivity(propHit.agentId || "all");
+    const defaultTab =
+      workspaceChangedCount.value === 0 && agentAct.length > 0 ? "activity" : "git";
+    openInspectorModal({
+      tab: defaultTab,
+      agentId: propHit.agentId || "all",
+    });
+  }
+}
+
+async function handleLaunchStandup({ topic, prompt }) {
+  isStandupOpen.value = false;
+  experience?.triggerTeamMeeting(topic || "Standup de equipo");
+  if (openCodeState.value.status === "connected" && prompt) {
+    selectChatAgent("architect", { focus3d: false, openDrawer: true });
+    commandForm.prompt = prompt;
+    await handleSendOpenCodePrompt();
+  }
+}
+
+async function handleApplyWorkspaceDir() {
+  const dir = workspaceDirInput.value.trim();
+  if (!dir || isApplyingWorkspaceDir.value) return;
+  isApplyingWorkspaceDir.value = true;
+  workspaceDirFeedback.value = null;
+  const res = await openCodeBridge.setWorkspaceDirectory(dir);
+  isApplyingWorkspaceDir.value = false;
+  if (res.ok) {
+    workspaceSummary.value = res;
+    workspaceDirInput.value = res.projectDir || dir;
+    workspaceDirFeedback.value = {
+      ok: true,
+      text: res.isGitRepo
+        ? `Proyecto activo: ${res.projectName} (rama ${res.branch || "HEAD"})`
+        : `Carpeta activa actualizada: ${res.projectName}`,
+    };
+  } else {
+    workspaceDirFeedback.value = {
+      ok: false,
+      text: res.error || "No se pudo cambiar la carpeta del proyecto.",
+    };
+  }
+}
+
+function handleSaveTeamAndAliases() {
+  for (const ag of profiles.value) {
+    const draft = profileDrafts[ag.id];
+    if (draft) {
+      agentProfileManager.updateProfile(ag.id, {
+        name: draft.name,
+        role: draft.role,
+        color: draft.color,
+      });
+    }
+  }
+  handleSaveAliases();
+}
+
+function handleResetTeamAndAliases() {
+  agentProfileManager.resetProfiles();
+  profiles.value = agentProfileManager.getProfiles();
+  syncProfileDrafts(profiles.value);
+  handleResetAliases();
+}
+
 function handleKeyDown(e) {
   if (e.key === "Escape") {
+    if (isInspectorOpen.value) {
+      isInspectorOpen.value = false;
+      return;
+    }
+    if (isWhiteboardOpen.value) {
+      isWhiteboardOpen.value = false;
+      return;
+    }
+    if (isStandupOpen.value) {
+      isStandupOpen.value = false;
+      return;
+    }
     if (isSettingsModalOpen.value) {
       isSettingsModalOpen.value = false;
       return;
@@ -581,7 +894,7 @@ function handleKeyDown(e) {
 
   const tag = e.target?.tagName;
   if (["INPUT", "TEXTAREA", "SELECT"].includes(tag)) return;
-  if (isSettingsModalOpen.value) return;
+  if (anyFloatingModalOpen.value) return;
 
   if (e.key === "Tab") {
     e.preventDefault();
@@ -593,15 +906,52 @@ function handleKeyDown(e) {
 
 onMounted(() => {
   window.addEventListener("keydown", handleKeyDown);
+  ambientAudio.init();
+  audioMode.value = ambientAudio.getMode();
+  unsubAudioChange = ambientAudio.onChange((st) => {
+    audioMode.value = st.mode;
+  });
+
   unsubProfileSync = officeEventBus.on(
     OFFICE_EVENTS.AGENT_PROFILE_UPDATED,
     () => {
       profiles.value = agentProfileManager.getProfiles();
+      syncProfileDrafts(profiles.value);
     },
   );
   unsubTaskSync = officeEventBus.on(OFFICE_EVENTS.TASK_BOARD_SYNC, () => {
     tasks.value = taskBoardManager.getTasks();
   });
+  unsubToolActivity = officeEventBus.on(
+    OFFICE_EVENTS.OPENCODE_TOOL_ACTIVITY,
+    () => {
+      toolActivityList.value = openCodeBridge.getToolActivity("all");
+    },
+  );
+  unsubWorkspace = officeEventBus.on(
+    OFFICE_EVENTS.OFFICE_WORKSPACE_UPDATED,
+    (payload) => {
+      if (payload && typeof payload === "object") {
+        workspaceSummary.value = payload;
+        if (payload.projectDir && !workspaceDirInput.value) {
+          workspaceDirInput.value = payload.projectDir;
+        }
+      }
+    },
+  );
+  unsubWhiteboard = officeEventBus.on(
+    OFFICE_EVENTS.OFFICE_WHITEBOARD_UPDATED,
+    (payload) => {
+      if (Array.isArray(payload?.notes)) {
+        whiteboardNotes.value = payload.notes;
+      } else if (payload?.note) {
+        const filtered = whiteboardNotes.value.filter(
+          (n) => n.id !== payload.note.id,
+        );
+        whiteboardNotes.value = [payload.note, ...filtered].slice(0, 12);
+      }
+    },
+  );
   unsubOpenCode = officeEventBus.on(OFFICE_EVENTS.OPENCODE_CONNECTION, (snap) => {
     openCodeState.value = snap;
 
@@ -670,6 +1020,19 @@ onMounted(() => {
   );
   syncSessionLogView();
 
+  // Autoconexión al iniciar si el usuario la activó en Ajustes
+  if (openCodeForm.autoConnect && openCodeState.value.status === "disconnected") {
+    openCodeBridge.connect();
+  } else {
+    // Cargar pizarra y estado Git si el puente local ya está corriendo
+    openCodeBridge.fetchWhiteboard();
+    openCodeBridge.fetchWorkspaceSummary().then((res) => {
+      if (res?.ok && res.projectDir) {
+        workspaceDirInput.value = res.projectDir;
+      }
+    });
+  }
+
   const resources = new Resources(ASSETS_MANIFEST);
 
   resources.addEventListener("progress", (e) => {
@@ -682,6 +1045,12 @@ onMounted(() => {
       experience = new Experience(canvasRef.value, resources, {
         onSelect: (agentId) => {
           selectedAgentId.value = agentId;
+        },
+        onPropSelect: (propHit) => {
+          handlePropSelected(propHit);
+        },
+        onHoverTarget: (hoverInfo) => {
+          hoveredProp.value = hoverInfo;
         },
         onAgentUpdate: (agentId, snapshot) => {
           agentSnapshots[agentId] = snapshot;
@@ -831,6 +1200,7 @@ function saveOpenCodeConfig() {
     password: openCodeForm.password,
     idleCooldownSec: Number(openCodeForm.idleCooldownSec) || 15,
     autoReconnect: openCodeForm.autoReconnect,
+    autoConnect: Boolean(openCodeForm.autoConnect),
   });
 }
 
@@ -1107,6 +1477,11 @@ onBeforeUnmount(() => {
   unsubTaskSync?.();
   unsubOpenCode?.();
   unsubSessionLog?.();
+  unsubToolActivity?.();
+  unsubWorkspace?.();
+  unsubWhiteboard?.();
+  unsubAudioChange?.();
+  ambientAudio.dispose();
   if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
   openCodeBridge.dispose();
   experience?.destroy();
@@ -1171,6 +1546,19 @@ onBeforeUnmount(() => {
       class="absolute top-4 right-4 z-30 flex flex-col items-end gap-2.5 pointer-events-none"
     >
       <div class="flex items-center gap-2 pointer-events-auto">
+        <!-- Botón discreto de Audio (Solo avisos / Ambiente / Silencio) -->
+        <button
+          type="button"
+          @click="handleCycleAudioMode"
+          :title="audioModeLabel"
+          :aria-label="audioModeLabel"
+          class="hud-glass p-2 rounded-xl text-xs font-medium text-[#DCD5CC] hover:text-[#FFFDF9] flex items-center justify-center transition-transform duration-150 active:scale-95 cursor-pointer"
+        >
+          <Volume2 v-if="audioMode === 'ambient'" class="w-3.5 h-3.5 text-[#E09F5A]" />
+          <VolumeX v-else-if="audioMode === 'muted'" class="w-3.5 h-3.5 text-[#8C847A]" />
+          <Volume1 v-else class="w-3.5 h-3.5 text-[#C8C0B5]" />
+        </button>
+
         <!-- Botón discreto de Estado de Conexión y Ajustes -->
         <button
           type="button"
@@ -1210,10 +1598,9 @@ onBeforeUnmount(() => {
           <span>Chat</span>
           <span
             v-if="pendingAttentionCount > 0"
-            class="px-1.5 py-0.5 rounded-full bg-[#F59E0B] text-[10px] font-semibold text-[#1B1714] tabular-nums leading-none flex items-center gap-1"
+            class="px-1.5 py-0.5 rounded-md bg-[#E09F5A] text-[10px] font-semibold text-[#1B1714] tabular-nums leading-none"
           >
-            <span class="w-1.5 h-1.5 rounded-full bg-[#1B1714] animate-pulse"></span>
-            <span>{{ pendingAttentionCount }}</span>
+            {{ pendingAttentionCount }}
           </span>
         </button>
       </div>
@@ -1490,14 +1877,22 @@ onBeforeUnmount(() => {
             </p>
           </div>
 
-          <div class="pt-0.5">
+          <div class="pt-0.5 grid grid-cols-2 gap-2">
             <button
               type="button"
               @click="experience?.focusAgent(selectedSnapshot.id)"
-              class="w-full px-3 py-2 rounded-xl bg-white/[0.08] hover:bg-white/[0.13] border border-white/[0.08] text-xs font-medium text-[#F6EFE6] flex items-center justify-center gap-1.5 transition-transform duration-150 active:scale-[0.99] cursor-pointer"
+              class="px-3 py-2 rounded-xl bg-white/[0.08] hover:bg-white/[0.13] border border-white/[0.08] text-xs font-medium text-[#F6EFE6] flex items-center justify-center gap-1.5 transition-transform duration-150 active:scale-[0.99] cursor-pointer whitespace-nowrap"
             >
               <Crosshair class="w-3.5 h-3.5 text-[#E09F5A]" />
-              <span>Seguir con cámara</span>
+              <span>Seguir</span>
+            </button>
+            <button
+              type="button"
+              @click="openInspectorModal({ tab: 'activity', agentId: selectedSnapshot.id })"
+              class="px-3 py-2 rounded-xl bg-white/[0.05] hover:bg-white/[0.11] border border-white/[0.08] text-xs font-medium text-[#DDD6CD] hover:text-[#FFFDF9] flex items-center justify-center gap-1.5 transition-transform duration-150 active:scale-[0.99] cursor-pointer whitespace-nowrap"
+            >
+              <GitBranch class="w-3.5 h-3.5 text-[#E09F5A]" />
+              <span>Ver cambios</span>
             </button>
           </div>
         </div>
@@ -1580,15 +1975,28 @@ onBeforeUnmount(() => {
             </button>
           </div>
 
-          <button
-            type="button"
-            @click="isChatOpen = false"
-            title="Ocultar chat (Tab / H)"
-            aria-label="Cerrar chat"
-            class="p-1.5 rounded-lg text-[#B5AEA4] hover:text-[#FFFDF9] hover:bg-white/[0.07] cursor-pointer"
-          >
-            <X class="w-4 h-4" />
-          </button>
+          <div class="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              @click="openInspectorModal({ tab: 'git', agentId: commandForm.agent })"
+              title="Ver cambios Git y actividad técnica"
+              class="px-2 py-1 rounded-lg text-[11px] font-medium text-[#C8C0B5] hover:text-[#FFFDF9] hover:bg-white/[0.07] flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+            >
+              <GitBranch class="w-3.5 h-3.5 text-[#E09F5A]" />
+              <span v-if="workspaceChangedCount > 0" class="tabular-nums">
+                {{ workspaceChangedCount }}
+              </span>
+            </button>
+            <button
+              type="button"
+              @click="isChatOpen = false"
+              title="Ocultar chat (Tab / H)"
+              aria-label="Cerrar chat"
+              class="p-1.5 rounded-lg text-[#B5AEA4] hover:text-[#FFFDF9] hover:bg-white/[0.07] cursor-pointer"
+            >
+              <X class="w-4 h-4" />
+            </button>
+          </div>
         </div>
 
         <!-- Selector unificado por miembro del equipo -->
@@ -2109,13 +2517,13 @@ onBeforeUnmount(() => {
           <!-- Navegación interna de ajustes -->
           <div class="px-5 pt-3 shrink-0">
             <div
-              class="grid grid-cols-3 gap-1 p-1 rounded-xl bg-black/25 border border-white/[0.08]"
+              class="grid grid-cols-4 gap-1 p-1 rounded-xl bg-black/25 border border-white/[0.08]"
             >
               <button
                 type="button"
                 @click="settingsTab = 'connection'"
                 :class="[
-                  'px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer text-center',
+                  'px-2.5 py-1.5 rounded-lg text-xs font-medium cursor-pointer text-center whitespace-nowrap',
                   settingsTab === 'connection'
                     ? 'bg-white/[0.1] text-[#FFFDF9]'
                     : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
@@ -2125,27 +2533,39 @@ onBeforeUnmount(() => {
               </button>
               <button
                 type="button"
+                @click="settingsTab = 'workspace'"
+                :class="[
+                  'px-2.5 py-1.5 rounded-lg text-xs font-medium cursor-pointer text-center whitespace-nowrap',
+                  settingsTab === 'workspace'
+                    ? 'bg-white/[0.1] text-[#FFFDF9]'
+                    : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
+                ]"
+              >
+                Proyecto
+              </button>
+              <button
+                type="button"
                 @click="settingsTab = 'mapping'"
                 :class="[
-                  'px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer text-center',
+                  'px-2.5 py-1.5 rounded-lg text-xs font-medium cursor-pointer text-center whitespace-nowrap',
                   settingsTab === 'mapping'
                     ? 'bg-white/[0.1] text-[#FFFDF9]'
                     : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
                 ]"
               >
-                Mapeo de agentes
+                Equipo
               </button>
               <button
                 type="button"
                 @click="settingsTab = 'guide'"
                 :class="[
-                  'px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer text-center',
+                  'px-2.5 py-1.5 rounded-lg text-xs font-medium cursor-pointer text-center whitespace-nowrap',
                   settingsTab === 'guide'
                     ? 'bg-white/[0.1] text-[#FFFDF9]'
                     : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
                 ]"
               >
-                Guía de instalación
+                Guía
               </button>
             </div>
           </div>
@@ -2283,6 +2703,101 @@ onBeforeUnmount(() => {
               </button>
             </div>
 
+            <!-- Preferencias de segundo monitor: Autoconexión, Audio y Notificaciones -->
+            <div class="rounded-xl bg-black/20 border border-white/[0.08] p-3.5 space-y-3">
+              <label class="flex items-center justify-between gap-3 cursor-pointer">
+                <div>
+                  <div class="text-xs font-medium text-[#F6EFE6]">
+                    Conectar automáticamente al abrir
+                  </div>
+                  <div class="text-[11px] text-[#A39B90]">
+                    Enlaza con tu puente OpenCode al iniciar la oficina
+                  </div>
+                </div>
+                <input
+                  v-model="openCodeForm.autoConnect"
+                  @change="saveOpenCodeConfig"
+                  type="checkbox"
+                  class="accent-[#E09F5A] w-4 h-4 cursor-pointer"
+                />
+              </label>
+
+              <div class="pt-2 border-t border-white/[0.07] space-y-1.5">
+                <div class="text-xs font-medium text-[#F6EFE6]">
+                  Audio de la oficina
+                </div>
+                <div class="grid grid-cols-3 gap-1 p-1 rounded-xl bg-black/30 border border-white/[0.07]">
+                  <button
+                    type="button"
+                    @click="handleSetAudioMode('alerts')"
+                    :class="[
+                      'px-2 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer whitespace-nowrap',
+                      audioMode === 'alerts'
+                        ? 'bg-white/[0.12] text-[#FFFDF9]'
+                        : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
+                    ]"
+                  >
+                    Solo avisos
+                  </button>
+                  <button
+                    type="button"
+                    @click="handleSetAudioMode('ambient')"
+                    :class="[
+                      'px-2 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer whitespace-nowrap',
+                      audioMode === 'ambient'
+                        ? 'bg-white/[0.12] text-[#FFFDF9]'
+                        : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
+                    ]"
+                  >
+                    Ambiente + avisos
+                  </button>
+                  <button
+                    type="button"
+                    @click="handleSetAudioMode('muted')"
+                    :class="[
+                      'px-2 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer whitespace-nowrap',
+                      audioMode === 'muted'
+                        ? 'bg-white/[0.12] text-[#FFFDF9]'
+                        : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
+                    ]"
+                  >
+                    Silencio
+                  </button>
+                </div>
+              </div>
+
+              <div class="pt-2 border-t border-white/[0.07] flex items-center justify-between gap-3">
+                <div class="min-w-0">
+                  <div class="text-xs font-medium text-[#F6EFE6] flex items-center gap-1.5">
+                    <Bell class="w-3.5 h-3.5 text-[#E09F5A]" />
+                    <span>Avisos de escritorio en segundo plano</span>
+                  </div>
+                  <div class="text-[11px] text-[#A39B90]">
+                    Notifica preguntas y permisos solo cuando esta pestaña está oculta
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  @click="handleToggleDesktopNotifications"
+                  :disabled="desktopNotifPermission === 'unsupported' || desktopNotifPermission === 'denied'"
+                  :class="[
+                    'px-3 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-45',
+                    desktopNotifEnabled
+                      ? 'bg-[#34D399]/20 border border-[#34D399]/40 text-[#A7F3D0]'
+                      : 'bg-white/[0.07] border border-white/[0.08] text-[#DDD6CD] hover:text-[#FFFDF9]',
+                  ]"
+                >
+                  {{
+                    desktopNotifPermission === "denied"
+                      ? "Bloqueado"
+                      : desktopNotifEnabled
+                        ? "Activado"
+                        : "Activar"
+                  }}
+                </button>
+              </div>
+            </div>
+
             <div
               class="rounded-xl bg-black/20 border border-white/[0.08] px-3.5 py-2.5 flex items-center justify-between text-xs text-[#C8C0B5] tabular-nums"
             >
@@ -2324,25 +2839,98 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <!-- Tab Mapeo de Agentes -->
+          <!-- Tab Proyecto / Workspace -->
+          <div
+            v-else-if="settingsTab === 'workspace'"
+            class="flex-1 min-h-0 overflow-y-auto p-5 space-y-4"
+          >
+            <div class="rounded-xl bg-black/20 border border-white/[0.08] p-4 space-y-3">
+              <div class="flex items-center gap-2 text-xs font-semibold text-[#F6EFE6]">
+                <FolderOpen class="w-4 h-4 text-[#E09F5A]" />
+                <span>Carpeta del proyecto activo</span>
+              </div>
+              <p class="text-[11px] text-[#B5AEA4] leading-relaxed">
+                Define qué repositorio local inspeccionan el puente (:4097), los monitores 3D y la pizarra de arquitectura.
+              </p>
+
+              <div class="flex items-center gap-2">
+                <input
+                  v-model="workspaceDirInput"
+                  type="text"
+                  placeholder="Ej: C:\Users\tu-usuario\proyectos\mi-app"
+                  class="flex-1 min-w-0 px-3 py-2 rounded-xl bg-black/30 border border-white/[0.08] text-xs font-mono text-[#F3EFE8] placeholder:text-[#8C847A] focus:outline-none focus:border-[#E09F5A]/60"
+                />
+                <button
+                  type="button"
+                  @click="handleApplyWorkspaceDir"
+                  :disabled="isApplyingWorkspaceDir || !workspaceDirInput.trim()"
+                  class="px-3.5 py-2 rounded-xl bg-[#E09F5A] hover:bg-[#E7AF72] text-xs font-semibold text-[#1B1714] cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-45"
+                >
+                  {{ isApplyingWorkspaceDir ? "Aplicando..." : "Aplicar" }}
+                </button>
+              </div>
+
+              <div
+                v-if="workspaceDirFeedback"
+                :class="[
+                  'text-[11px]',
+                  workspaceDirFeedback.ok ? 'text-[#34D399]' : 'text-[#FDA4AF]',
+                ]"
+              >
+                {{ workspaceDirFeedback.text }}
+              </div>
+            </div>
+
+            <div class="rounded-xl bg-black/20 border border-white/[0.08] p-4 space-y-2 text-xs text-[#C8C0B5]">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[#A39B90]">Proyecto</span>
+                <span class="font-medium text-[#F6EFE6]">
+                  {{ workspaceSummary?.projectName || "Sin datos del puente" }}
+                </span>
+              </div>
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[#A39B90]">Rama Git</span>
+                <span class="font-mono text-[#F6C894]">
+                  {{
+                    workspaceSummary?.isGitRepo
+                      ? workspaceSummary.branch || "HEAD"
+                      : "No es repo Git"
+                  }}
+                </span>
+              </div>
+              <div class="flex items-center justify-between gap-2 tabular-nums">
+                <span class="text-[#A39B90]">Archivos modificados</span>
+                <span class="text-[#F3EFE8]">{{ workspaceChangedCount }}</span>
+              </div>
+              <div class="flex items-center justify-between gap-2 tabular-nums">
+                <span class="text-[#A39B90]">Notas en pizarra</span>
+                <span class="text-[#F3EFE8]">{{ whiteboardNotes.length }}</span>
+              </div>
+              <div class="pt-2 border-t border-white/[0.07] text-[11px] text-[#9C948A] leading-relaxed">
+                Las notas de la pizarra y tu carpeta activa se guardan en <span class="font-mono text-[#DDD6CD]">~/.opencode-office-3d/</span> fuera del historial Git de tu repositorio.
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab Equipo (Personalización de avatares + Mapeo de alias) -->
           <div
             v-else-if="settingsTab === 'mapping'"
             class="flex-1 min-h-0 overflow-y-auto p-5 space-y-3"
           >
-            <div class="space-y-2">
+            <div class="space-y-2.5">
               <div
                 v-for="ag in agentList"
                 :key="ag.id"
-                class="rounded-xl bg-black/20 border border-white/[0.08] p-3 space-y-1.5"
+                class="rounded-xl bg-black/20 border border-white/[0.08] p-3.5 space-y-2.5"
               >
                 <div class="flex items-center justify-between gap-2">
                   <div class="flex items-center gap-2 min-w-0">
                     <span
                       class="w-2.5 h-2.5 rounded-full shrink-0"
-                      :style="{ backgroundColor: ag.color }"
+                      :style="{ backgroundColor: profileDrafts[ag.id]?.color || ag.color }"
                     ></span>
                     <span class="text-xs font-semibold text-[#F6EFE6] truncate">
-                      {{ ag.name }}
+                      {{ profileDrafts[ag.id]?.name || ag.name }}
                     </span>
                     <span class="text-[11px] text-[#A39B90]">({{ ag.id }})</span>
                   </div>
@@ -2356,31 +2944,68 @@ onBeforeUnmount(() => {
                   >
                     {{
                       openCodeState.activeAgents.includes(ag.id)
-                        ? "En línea"
-                        : "Autónomo"
+                        ? "Activo"
+                        : "Disponible"
                     }}
                   </span>
                 </div>
-                <input
-                  v-model="aliasDraft[ag.id]"
-                  type="text"
-                  placeholder="alias1, alias2"
-                  class="w-full px-2.5 py-1.5 rounded-lg bg-black/25 border border-white/[0.08] text-xs text-[#F3EFE8] focus:outline-none focus:border-[#E09F5A]/60"
-                />
+
+                <div class="grid grid-cols-2 gap-2">
+                  <input
+                    v-model="profileDrafts[ag.id].name"
+                    type="text"
+                    maxlength="20"
+                    placeholder="Nombre visible"
+                    class="px-2.5 py-1.5 rounded-lg bg-black/25 border border-white/[0.08] text-xs text-[#F3EFE8] focus:outline-none focus:border-[#E09F5A]/60"
+                  />
+                  <input
+                    v-model="profileDrafts[ag.id].role"
+                    type="text"
+                    maxlength="28"
+                    placeholder="Rol"
+                    class="px-2.5 py-1.5 rounded-lg bg-black/25 border border-white/[0.08] text-xs text-[#F3EFE8] focus:outline-none focus:border-[#E09F5A]/60"
+                  />
+                </div>
+
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div class="flex items-center gap-1.5">
+                    <button
+                      v-for="swatch in AGENT_COLOR_PALETTE"
+                      :key="swatch.hex"
+                      type="button"
+                      @click="profileDrafts[ag.id].color = swatch.hex"
+                      :title="swatch.name"
+                      :class="[
+                        'w-4 h-4 rounded-full cursor-pointer transition-transform',
+                        profileDrafts[ag.id].color === swatch.hex
+                          ? 'ring-2 ring-white scale-110'
+                          : 'opacity-70 hover:opacity-100',
+                      ]"
+                      :style="{ backgroundColor: swatch.hex }"
+                    ></button>
+                  </div>
+                  <input
+                    v-model="aliasDraft[ag.id]"
+                    type="text"
+                    placeholder="alias1, alias2"
+                    title="Alias de agente OpenCode"
+                    class="w-44 px-2 py-1 rounded-lg bg-black/25 border border-white/[0.08] text-[11px] font-mono text-[#D5CEC4] focus:outline-none focus:border-[#E09F5A]/60"
+                  />
+                </div>
               </div>
             </div>
 
             <div class="flex items-center gap-2 pt-1">
               <button
                 type="button"
-                @click="handleSaveAliases"
+                @click="handleSaveTeamAndAliases"
                 class="px-3.5 py-2 rounded-xl bg-[#E09F5A] hover:bg-[#E7AF72] text-xs font-semibold text-[#1B1714] cursor-pointer whitespace-nowrap"
               >
-                Guardar alias
+                Guardar equipo
               </button>
               <button
                 type="button"
-                @click="handleResetAliases"
+                @click="handleResetTeamAndAliases"
                 class="px-3 py-2 rounded-xl bg-white/[0.06] hover:bg-white/[0.11] border border-white/[0.08] text-xs font-medium text-[#D5CEC4] cursor-pointer whitespace-nowrap"
               >
                 Restaurar
@@ -2496,5 +3121,58 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </transition>
+
+    <!-- Tooltip discreto al pasar el cursor sobre mobiliario 3D interactivo -->
+    <div
+      v-if="isReady && hoveredProp && !anyFloatingModalOpen"
+      class="fixed top-0 left-0 z-40 pointer-events-none hud-glass rounded-xl px-2.5 py-1.5 text-[11px] max-w-[230px]"
+      :style="hoverTooltipStyle"
+    >
+      <div class="font-semibold text-[#F6EFE6] truncate">
+        {{ hoveredProp.label }}
+      </div>
+      <div v-if="hoveredProp.hint" class="text-[10px] text-[#C8C0B5] truncate">
+        {{ hoveredProp.hint }}
+      </div>
+    </div>
+
+    <!-- ZONA 4C: Modal Flotante Cristalino — Inspector Git y Actividad Técnica -->
+    <GitActivityInspectorModal
+      :open="isReady && isInspectorOpen"
+      :initial-tab="inspectorInitialTab"
+      :initial-agent-id="inspectorAgentId"
+      :profiles="profiles"
+      :workspace="workspaceSummary"
+      :tool-activity="toolActivityList"
+      :is-connected="openCodeState.status === 'connected'"
+      @close="isInspectorOpen = false"
+      @open-settings="
+        (tab) => {
+          isInspectorOpen = false;
+          openSettingsModal(tab || 'workspace');
+        }
+      "
+    />
+
+    <!-- ZONA 4D: Modal Flotante Cristalino — Pizarra de Arquitectura -->
+    <WhiteboardModal
+      :open="isReady && isWhiteboardOpen"
+      :notes="whiteboardNotes"
+      :project-name="workspaceSummary?.projectName || ''"
+      @close="isWhiteboardOpen = false"
+      @updated="
+        (notes) => {
+          whiteboardNotes = notes;
+        }
+      "
+    />
+
+    <!-- ZONA 4E: Modal Flotante Cristalino — Standup Rápido -->
+    <QuickStandupModal
+      :open="isReady && isStandupOpen"
+      :is-connected="openCodeState.status === 'connected'"
+      @close="isStandupOpen = false"
+      @launch-standup="handleLaunchStandup"
+    />
   </main>
 </template>

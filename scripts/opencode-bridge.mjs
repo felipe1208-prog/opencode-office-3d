@@ -13,6 +13,14 @@
  */
 
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import crypto from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const BRIDGE_PORT = Number(process.env.BRIDGE_PORT || 4097);
 const BRIDGE_HOST = process.env.BRIDGE_HOST || "127.0.0.1";
@@ -25,8 +33,11 @@ const sseClients = new Set();
 
 let detectedUpstreamPrefix = "/api";
 
-const MAX_WHITEBOARD_NOTES = 10;
+const MAX_WHITEBOARD_NOTES = 18;
 const MAX_SPATIAL_COMMANDS = 100;
+const MAX_DIFF_BYTES = 65536;
+const BRIDGE_DATA_DIR = path.join(os.homedir(), ".opencode-office-3d");
+const BRIDGE_CONFIG_PATH = path.join(BRIDGE_DATA_DIR, "config.json");
 
 const AGENT_META = {
   architect: {
@@ -293,6 +304,100 @@ function buildSeedSpatialState() {
 const spatialState = buildSeedSpatialState();
 let spatialCommandQueue = [];
 let spatialCommandSeq = 0;
+let deletedWhiteboardIds = new Set();
+let recentPeerReviews = [];
+
+function ensureBridgeDataDir() {
+  try {
+    fs.mkdirSync(BRIDGE_DATA_DIR, { recursive: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readJsonFileSafe(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, "utf8");
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonFileSafe(filePath, payload) {
+  if (!ensureBridgeDataDir()) return false;
+  try {
+    const tmp = `${filePath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf8");
+    fs.renameSync(tmp, filePath);
+    return true;
+  } catch {
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf8");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function isValidExistingDir(candidate) {
+  if (!candidate || typeof candidate !== "string") return false;
+  try {
+    const resolved = path.resolve(candidate.trim());
+    return fs.existsSync(resolved) && fs.statSync(resolved).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function loadInitialProjectDir() {
+  const fromEnv = process.env.OFFICE_PROJECT_DIR || process.env.OPENCODE_PROJECT_DIR;
+  if (isValidExistingDir(fromEnv)) return path.resolve(fromEnv);
+  const cfg = readJsonFileSafe(BRIDGE_CONFIG_PATH);
+  if (isValidExistingDir(cfg?.projectDir)) return path.resolve(cfg.projectDir);
+  return path.resolve(process.cwd());
+}
+
+let activeProjectDir = loadInitialProjectDir();
+
+function getWhiteboardFilePath(projectDir = activeProjectDir) {
+  const norm = path.resolve(projectDir || process.cwd());
+  const hash = crypto.createHash("sha1").update(norm).digest("hex").slice(0, 12);
+  return path.join(BRIDGE_DATA_DIR, `whiteboard-${hash}.json`);
+}
+
+function loadPersistedWhiteboard(projectDir = activeProjectDir) {
+  const saved = readJsonFileSafe(getWhiteboardFilePath(projectDir));
+  deletedWhiteboardIds = new Set(Array.isArray(saved?.deletedIds) ? saved.deletedIds.slice(-100) : []);
+  const notes = Array.isArray(saved?.notes)
+    ? saved.notes
+        .filter((n) => n && typeof n === "object" && String(n.text || "").trim() && !deletedWhiteboardIds.has(n.id))
+        .slice(0, MAX_WHITEBOARD_NOTES)
+    : [];
+  spatialState.whiteboard.notes = notes;
+  spatialState.whiteboard.updatedAt = notes[0]?.createdAt || saved?.updatedAt || null;
+}
+
+function savePersistedWhiteboard() {
+  writeJsonFileSafe(getWhiteboardFilePath(activeProjectDir), {
+    projectDir: activeProjectDir,
+    updatedAt: spatialState.whiteboard.updatedAt || Date.now(),
+    notes: spatialState.whiteboard.notes,
+    deletedIds: Array.from(deletedWhiteboardIds).slice(-100),
+  });
+}
+
+function saveBridgeConfig() {
+  writeJsonFileSafe(BRIDGE_CONFIG_PATH, {
+    projectDir: activeProjectDir,
+    updatedAt: Date.now(),
+  });
+}
+
+loadPersistedWhiteboard(activeProjectDir);
 
 function mergeWhiteboardNotes(existing = [], incoming = []) {
   const byId = new Map();
@@ -301,13 +406,18 @@ function mergeWhiteboardNotes(existing = [], incoming = []) {
     const text = String(item.text || item.note || "").trim();
     if (!text) continue;
     const id = String(item.id || `wb_${item.createdAt || Date.now()}`).trim();
+    if (deletedWhiteboardIds.has(id)) continue;
     if (!byId.has(id)) {
+      const isHuman = item.authorType === "human" || item.agentId === "user";
       byId.set(id, {
         id,
-        agentId: item.agentId || "architect",
-        agentName: item.agentName || item.agentId || "Tech Lead",
-        color: item.color || AGENT_META[item.agentId]?.color || "#8B5CF6",
-        text: text.slice(0, 220),
+        agentId: isHuman ? "user" : (item.agentId || "architect"),
+        agentName: isHuman
+          ? (item.agentName || "Tech Lead (Tú)")
+          : (item.agentName || AGENT_META[item.agentId]?.name || item.agentId || "Tech Lead"),
+        authorType: isHuman ? "human" : "agent",
+        color: isHuman ? "#D97706" : (item.color || AGENT_META[item.agentId]?.color || "#8B5CF6"),
+        text: text.slice(0, 240),
         createdAt: Number(item.createdAt) || Date.now(),
       });
     }
@@ -315,6 +425,213 @@ function mergeWhiteboardNotes(existing = [], incoming = []) {
   return Array.from(byId.values())
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
     .slice(0, MAX_WHITEBOARD_NOTES);
+}
+
+function resolveSafeWorkspacePath(relPath) {
+  if (!relPath || typeof relPath !== "string") return null;
+  const cleaned = relPath.trim().replace(/^["']|["']$/g, "");
+  if (!cleaned || cleaned.includes("\0")) return null;
+  const root = path.resolve(activeProjectDir);
+  const full = path.resolve(root, cleaned);
+  if (full !== root && !full.startsWith(root + path.sep)) return null;
+  return { root, full, relative: path.relative(root, full).split(path.sep).join("/") };
+}
+
+async function runGitSafe(args = []) {
+  const { stdout } = await execFileAsync("git", args, {
+    cwd: activeProjectDir,
+    timeout: 4500,
+    maxBuffer: 1024 * 768,
+    windowsHide: true,
+  });
+  return String(stdout || "");
+}
+
+function describeGitStatusCode(xy) {
+  if (xy === "??") return "Nuevo";
+  if (xy.includes("D")) return "Eliminado";
+  if (xy.includes("R")) return "Renombrado";
+  if (xy.includes("A")) return "Agregado";
+  if (xy.includes("U")) return "Conflicto";
+  return "Modificado";
+}
+
+async function getWorkspaceSummary() {
+  const projectName = path.basename(activeProjectDir) || activeProjectDir;
+  const base = {
+    ok: true,
+    projectDir: activeProjectDir,
+    projectName,
+    storageDir: BRIDGE_DATA_DIR,
+    isGitRepo: false,
+    branch: null,
+    ahead: 0,
+    behind: 0,
+    changes: [],
+    updatedAt: Date.now(),
+  };
+
+  try {
+    const inside = (await runGitSafe(["rev-parse", "--is-inside-work-tree"])).trim();
+    if (inside !== "true") return base;
+    base.isGitRepo = true;
+
+    const statusOut = await runGitSafe(["status", "--porcelain=v1", "-b", "--untracked-files=all"]);
+    const lines = statusOut.split(/\r?\n/).filter(Boolean);
+    const changesMap = new Map();
+
+    for (const line of lines) {
+      if (line.startsWith("## ")) {
+        const header = line.slice(3).trim();
+        const branchPart = header.split("...")[0].replace(/^No commits yet on\s+/i, "").trim();
+        base.branch = branchPart || "HEAD";
+        const aheadMatch = header.match(/ahead (\d+)/);
+        const behindMatch = header.match(/behind (\d+)/);
+        if (aheadMatch) base.ahead = Number(aheadMatch[1]);
+        if (behindMatch) base.behind = Number(behindMatch[1]);
+        continue;
+      }
+
+      if (line.length < 4) continue;
+      const xy = line.slice(0, 2);
+      let filePath = line.slice(3).trim();
+      if (filePath.includes(" -> ")) {
+        filePath = filePath.split(" -> ").pop().trim();
+      }
+      filePath = filePath.replace(/^"|"$/g, "");
+      if (!filePath) continue;
+
+      changesMap.set(filePath, {
+        path: filePath,
+        code: xy.trim() || "M",
+        statusLabel: describeGitStatusCode(xy),
+        staged: xy[0] !== " " && xy[0] !== "?",
+        unstaged: xy[1] !== " ",
+        isUntracked: xy === "??",
+        insertions: 0,
+        deletions: 0,
+      });
+    }
+
+    const parseNumstat = (raw) => {
+      for (const l of raw.split(/\r?\n/)) {
+        const parts = l.split("\t");
+        if (parts.length < 3) continue;
+        const ins = parts[0] === "-" ? 0 : Number(parts[0]) || 0;
+        const del = parts[1] === "-" ? 0 : Number(parts[1]) || 0;
+        const p = parts.slice(2).join("\t").trim();
+        const item = changesMap.get(p);
+        if (item) {
+          item.insertions += ins;
+          item.deletions += del;
+        }
+      }
+    };
+
+    try {
+      parseNumstat(await runGitSafe(["diff", "--numstat"]));
+      parseNumstat(await runGitSafe(["diff", "--cached", "--numstat"]));
+    } catch {
+      // Repositorio sin HEAD inicial o diff parcial
+    }
+
+    base.changes = Array.from(changesMap.values()).slice(0, 120);
+    return base;
+  } catch {
+    return base;
+  }
+}
+
+async function getWorkspaceDiff(relPath) {
+  const safe = resolveSafeWorkspacePath(relPath);
+  if (!safe) {
+    return { ok: false, error: "Ruta fuera del proyecto activo o inválida." };
+  }
+
+  let diffText = "";
+  let isUntracked = false;
+
+  try {
+    const statusLine = (await runGitSafe(["status", "--porcelain=v1", "--", safe.relative])).trim();
+    isUntracked = statusLine.startsWith("??");
+
+    if (isUntracked) {
+      if (fs.existsSync(safe.full) && fs.statSync(safe.full).isFile()) {
+        const stat = fs.statSync(safe.full);
+        if (stat.size > 512 * 1024) {
+          diffText = `+++ ${safe.relative}\n@@ Archivo nuevo (${Math.round(stat.size / 1024)} KB, vista previa omitida por tamaño) @@`;
+        } else {
+          const buf = fs.readFileSync(safe.full);
+          if (buf.includes(0)) {
+            diffText = `+++ ${safe.relative}\n@@ Archivo binario nuevo (${stat.size} bytes) @@`;
+          } else {
+            const rawLines = buf.toString("utf8").split(/\r?\n/);
+            const shown = rawLines.slice(0, 220);
+            diffText =
+              `--- /dev/null\n+++ b/${safe.relative}\n@@ -0,0 +1,${shown.length} @@\n` +
+              shown.map((l) => `+${l}`).join("\n");
+            if (rawLines.length > 220) {
+              diffText += `\n... (+${rawLines.length - 220} líneas adicionales)`;
+            }
+          }
+        }
+      }
+    } else {
+      try {
+        diffText = await runGitSafe(["diff", "HEAD", "--", safe.relative]);
+      } catch {
+        const unstaged = await runGitSafe(["diff", "--", safe.relative]).catch(() => "");
+        const staged = await runGitSafe(["diff", "--cached", "--", safe.relative]).catch(() => "");
+        diffText = [staged, unstaged].filter(Boolean).join("\n");
+      }
+    }
+  } catch (err) {
+    return { ok: false, error: err?.message || "No se pudo calcular el diff de Git." };
+  }
+
+  let truncated = false;
+  if (Buffer.byteLength(diffText, "utf8") > MAX_DIFF_BYTES) {
+    diffText = `${diffText.slice(0, MAX_DIFF_BYTES)}\n... [diff truncado a 64 KB]`;
+    truncated = true;
+  }
+
+  return {
+    ok: true,
+    path: safe.relative,
+    diff: diffText,
+    isUntracked,
+    truncated,
+  };
+}
+
+function getWorkspaceFileSnippet(relPath, maxLines = 48) {
+  const safe = resolveSafeWorkspacePath(relPath);
+  if (!safe) {
+    return { ok: false, error: "Ruta inválida o fuera del workspace." };
+  }
+  try {
+    if (!fs.existsSync(safe.full) || !fs.statSync(safe.full).isFile()) {
+      return { ok: false, error: "Archivo no encontrado." };
+    }
+    const stat = fs.statSync(safe.full);
+    if (stat.size > 512 * 1024) {
+      return { ok: false, error: "Archivo demasiado grande para vista previa." };
+    }
+    const buf = fs.readFileSync(safe.full);
+    if (buf.includes(0)) {
+      return { ok: false, error: "Archivo binario." };
+    }
+    const allLines = buf.toString("utf8").split(/\r?\n/);
+    const limit = Math.max(8, Math.min(120, Number(maxLines) || 48));
+    return {
+      ok: true,
+      path: safe.relative,
+      lines: allLines.slice(0, limit),
+      totalLines: allLines.length,
+    };
+  } catch (err) {
+    return { ok: false, error: err?.message || "Error leyendo archivo." };
+  }
 }
 
 async function readJsonBody(req) {
@@ -454,6 +771,8 @@ async function handleHealth(_req, res) {
       spatialSource: spatialState.source,
       spatialUpdatedAt: spatialState.updatedAt,
       pendingSpatialCommands: spatialCommandQueue.length,
+      projectDir: activeProjectDir,
+      whiteboardNotesCount: spatialState.whiteboard.notes.length,
     }),
   );
 }
@@ -579,6 +898,252 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Workspace Git y lectura segura (solo lectura, validada dentro de activeProjectDir)
+  if (reqPath === "/api/office/workspace" || reqPath === "/office/workspace") {
+    if (req.method === "GET") {
+      const summary = await getWorkspaceSummary();
+      sendJson(res, 200, summary);
+      return;
+    }
+  }
+
+  if (reqPath === "/api/office/workspace/dir" || reqPath === "/office/workspace/dir") {
+    if (req.method === "POST") {
+      try {
+        const body = await readJsonBody(req);
+        const rawDir = String(body?.dir || body?.projectDir || "").trim();
+        if (!isValidExistingDir(rawDir)) {
+          sendJson(res, 400, {
+            ok: false,
+            error: "La carpeta indicada no existe o no es accesible en este equipo.",
+          });
+          return;
+        }
+        activeProjectDir = path.resolve(rawDir);
+        saveBridgeConfig();
+        loadPersistedWhiteboard(activeProjectDir);
+
+        const summary = await getWorkspaceSummary();
+        broadcastCustomEvent({
+          type: "office.workspace.updated",
+          properties: { workspace: summary },
+        });
+        broadcastCustomEvent({
+          type: "office.whiteboard.updated",
+          properties: { whiteboard: spatialState.whiteboard, projectDir: activeProjectDir },
+        });
+        sendJson(res, 200, {
+          ...summary,
+          whiteboard: spatialState.whiteboard,
+        });
+      } catch {
+        sendJson(res, 400, { ok: false, error: "JSON inválido en workspace/dir" });
+      }
+      return;
+    }
+  }
+
+  if (reqPath === "/api/office/workspace/diff" || reqPath === "/office/workspace/diff") {
+    if (req.method === "GET") {
+      const targetPath = searchParams.get("path") || "";
+      const result = await getWorkspaceDiff(targetPath);
+      sendJson(res, result.ok ? 200 : 400, result);
+      return;
+    }
+  }
+
+  if (reqPath === "/api/office/workspace/file" || reqPath === "/office/workspace/file") {
+    if (req.method === "GET") {
+      const targetPath = searchParams.get("path") || "";
+      const maxLines = Number(searchParams.get("maxLines") || 48);
+      const result = getWorkspaceFileSnippet(targetPath, maxLines);
+      sendJson(res, result.ok ? 200 : 400, result);
+      return;
+    }
+  }
+
+  // Pizarra de Arquitectura bidireccional persistente fuera de git
+  if (reqPath === "/api/office/whiteboard" || reqPath === "/office/whiteboard") {
+    if (req.method === "GET") {
+      sendJson(res, 200, {
+        ok: true,
+        projectDir: activeProjectDir,
+        notes: spatialState.whiteboard.notes,
+        updatedAt: spatialState.whiteboard.updatedAt,
+      });
+      return;
+    }
+
+    if (req.method === "POST") {
+      try {
+        const body = await readJsonBody(req);
+        const text = String(body?.text || body?.note || body?.nota || "").trim();
+        if (!text) {
+          sendJson(res, 400, { ok: false, error: "La nota no puede estar vacía." });
+          return;
+        }
+        const now = Date.now();
+        spatialCommandSeq += 1;
+        const isHuman = body?.authorType === "human" || body?.agentId === "user" || !body?.agentId;
+        const resolvedAgent = isHuman ? "user" : (resolveAgentId(body?.agentId) || "architect");
+        const meta = !isHuman ? AGENT_META[resolvedAgent] : null;
+        const noteRecord = {
+          id: `wb_${now}_${spatialCommandSeq}`,
+          agentId: resolvedAgent,
+          agentName: isHuman
+            ? String(body?.agentName || "Tech Lead (Tú)").trim().slice(0, 32)
+            : (meta?.name || resolvedAgent),
+          authorType: isHuman ? "human" : "agent",
+          color: isHuman ? "#D97706" : (meta?.color || "#8B5CF6"),
+          text: text.slice(0, 240),
+          createdAt: now,
+        };
+
+        spatialState.whiteboard.notes = mergeWhiteboardNotes(
+          spatialState.whiteboard.notes,
+          [noteRecord],
+        );
+        spatialState.whiteboard.updatedAt = now;
+        savePersistedWhiteboard();
+
+        broadcastCustomEvent({
+          type: "office.whiteboard.updated",
+          properties: {
+            whiteboard: spatialState.whiteboard,
+            note: noteRecord,
+            projectDir: activeProjectDir,
+          },
+        });
+
+        sendJson(res, 200, {
+          ok: true,
+          note: noteRecord,
+          notes: spatialState.whiteboard.notes,
+          whiteboard: spatialState.whiteboard,
+        });
+      } catch {
+        sendJson(res, 400, { ok: false, error: "JSON inválido en whiteboard" });
+      }
+      return;
+    }
+  }
+
+  if (reqPath === "/api/office/whiteboard/archive" || reqPath === "/office/whiteboard/archive") {
+    if (req.method === "POST") {
+      try {
+        const body = await readJsonBody(req);
+        const clearAll = Boolean(body?.clearAll);
+        const noteId = String(body?.id || "").trim();
+
+        if (clearAll) {
+          for (const n of spatialState.whiteboard.notes) {
+            if (n?.id) deletedWhiteboardIds.add(n.id);
+          }
+          spatialState.whiteboard.notes = [];
+          spatialState.whiteboard.updatedAt = Date.now();
+        } else if (noteId) {
+          deletedWhiteboardIds.add(noteId);
+          spatialState.whiteboard.notes = spatialState.whiteboard.notes.filter(
+            (n) => n.id !== noteId,
+          );
+          spatialState.whiteboard.updatedAt = Date.now();
+        }
+
+        savePersistedWhiteboard();
+        broadcastCustomEvent({
+          type: "office.whiteboard.updated",
+          properties: {
+            whiteboard: spatialState.whiteboard,
+            projectDir: activeProjectDir,
+          },
+        });
+
+        sendJson(res, 200, {
+          ok: true,
+          notes: spatialState.whiteboard.notes,
+          whiteboard: spatialState.whiteboard,
+        });
+      } catch {
+        sendJson(res, 400, { ok: false, error: "JSON inválido en whiteboard/archive" });
+      }
+      return;
+    }
+  }
+
+  // Revisión entre pares real (MCP pedir_revision_a -> 3D DESK_REVIEW + contexto al hilo destino)
+  if (reqPath === "/api/office/peer-review" || reqPath === "/office/peer-review") {
+    if (req.method === "GET") {
+      sendJson(res, 200, { ok: true, reviews: recentPeerReviews });
+      return;
+    }
+    if (req.method === "POST") {
+      try {
+        const body = await readJsonBody(req);
+        const fromAgentId = resolveAgentId(body?.fromAgentId || body?.agente);
+        const toAgentId = resolveAgentId(body?.toAgentId || body?.destinatario);
+        const context = String(body?.context || body?.contexto || "").trim().slice(0, 600);
+        const files = Array.isArray(body?.files || body?.archivos)
+          ? (body.files || body.archivos).map((f) => String(f || "").trim()).filter(Boolean).slice(0, 10)
+          : [];
+
+        if (!fromAgentId || !toAgentId || fromAgentId === toAgentId || !context) {
+          sendJson(res, 400, {
+            ok: false,
+            error: "Se requieren fromAgentId, toAgentId distintos y contexto para pedir revisión.",
+          });
+          return;
+        }
+
+        const now = Date.now();
+        spatialCommandSeq += 1;
+        const fromMeta = AGENT_META[fromAgentId];
+        const toMeta = AGENT_META[toAgentId];
+        const review = {
+          id: `pr_${now}_${spatialCommandSeq}`,
+          fromAgentId,
+          fromAgentName: fromMeta?.name || fromAgentId,
+          toAgentId,
+          toAgentName: toMeta?.name || toAgentId,
+          context,
+          files,
+          createdAt: now,
+        };
+        recentPeerReviews.unshift(review);
+        if (recentPeerReviews.length > 30) recentPeerReviews.length = 30;
+
+        const command = {
+          id: `sc_${now}_${spatialCommandSeq}`,
+          type: "peer_review",
+          agentId: fromAgentId,
+          agentName: fromMeta?.name || fromAgentId,
+          targetAgentId: toAgentId,
+          targetAgentName: toMeta?.name || toAgentId,
+          context,
+          files,
+          createdAt: now,
+        };
+        spatialCommandQueue.push(command);
+        if (spatialCommandQueue.length > MAX_SPATIAL_COMMANDS) {
+          spatialCommandQueue = spatialCommandQueue.slice(-MAX_SPATIAL_COMMANDS);
+        }
+
+        broadcastCustomEvent({
+          type: "office.peer_review",
+          properties: { review, command },
+        });
+        broadcastCustomEvent({
+          type: "office.spatial.command",
+          properties: { command, whiteboard: spatialState.whiteboard },
+        });
+
+        sendJson(res, 200, { ok: true, review, command, clients: sseClients.size });
+      } catch {
+        sendJson(res, 400, { ok: false, error: "JSON inválido en peer-review" });
+      }
+      return;
+    }
+  }
+
   // Conciencia espacial 3D: sincronización de estado (frontend 3D <-> puente <-> MCP)
   if (reqPath === "/api/office/spatial-state" || reqPath === "/office/spatial-state") {
     if (req.method === "GET") {
@@ -607,10 +1172,14 @@ const server = http.createServer(async (req, res) => {
         const incomingNotes = Array.isArray(body?.whiteboard?.notes)
           ? body.whiteboard.notes
           : [];
+        const prevCount = spatialState.whiteboard.notes.length;
         spatialState.whiteboard.notes = mergeWhiteboardNotes(
           spatialState.whiteboard.notes,
           incomingNotes,
         );
+        if (spatialState.whiteboard.notes.length !== prevCount) {
+          savePersistedWhiteboard();
+        }
         spatialState.whiteboard.updatedAt =
           spatialState.whiteboard.notes[0]?.createdAt || spatialState.whiteboard.updatedAt;
         spatialState.updatedAt = Number(body?.updatedAt) || now;
@@ -685,8 +1254,9 @@ const server = http.createServer(async (req, res) => {
             id: noteId,
             agentId,
             agentName: meta.name,
+            authorType: "agent",
             color: meta.color,
-            text: noteText.slice(0, 220),
+            text: noteText.slice(0, 240),
             createdAt: now,
           };
 
@@ -695,6 +1265,7 @@ const server = http.createServer(async (req, res) => {
             [noteRecord],
           );
           spatialState.whiteboard.updatedAt = now;
+          savePersistedWhiteboard();
 
           command = {
             id: commandId,

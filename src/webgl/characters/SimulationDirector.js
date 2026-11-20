@@ -1,5 +1,6 @@
 import { checkpointManager } from "../interaction/CheckpointManager.js";
 import { officeEventBus, OFFICE_EVENTS } from "../../events/OfficeEventBus.js";
+import { taskBoardManager } from "../../state/officeWorkspace.js";
 import { VisualActionQueue } from "./VisualActionQueue.js";
 
 const SOLO_DESTINATIONS = [
@@ -93,6 +94,8 @@ export class SimulationDirector {
     this.spatialService = null;
     this.activeDelegation = null; // { hostAgentId, participants: Set }
     this._lastOpenCodeStatus = null;
+    this.isOpenCodeConnected = false;
+    this._liveTvSyncAccum = 0;
     this.visualQueue = new VisualActionQueue({
       meetingHoldMs: 5000,
       meetingExtendMs: 5000,
@@ -949,15 +952,48 @@ export class SimulationDirector {
     this.unsubscribers.push(
       officeEventBus.on(OFFICE_EVENTS.OPENCODE_CONNECTION, (payload) => {
         const nextStatus = payload?.status || null;
-        if (
+        if (nextStatus === "connected") {
+          const wasConnected = this.isOpenCodeConnected;
+          this.isOpenCodeConnected = true;
+          this.monitorSystem?.setLiveMode(true);
+          if (!wasConnected) {
+            taskBoardManager.clearDemoTasks();
+            for (const agent of this.characterManager?.characters || []) {
+              if (!this.isAgentLiveBusy(agent.config.id)) {
+                agent.currentActionLabel = "Disponible";
+              }
+            }
+          }
+          this._pushLiveTeamSnapshotToTV();
+        } else if (
           nextStatus === "disconnected" &&
           this._lastOpenCodeStatus &&
           this._lastOpenCodeStatus !== "disconnected"
         ) {
+          this.isOpenCodeConnected = false;
+          this.monitorSystem?.setLiveMode(false);
           this.clearAllLiveClaims();
         }
         if (nextStatus) {
           this._lastOpenCodeStatus = nextStatus;
+        }
+      }),
+
+      officeEventBus.on(OFFICE_EVENTS.OPENCODE_TOOL_ACTIVITY, (payload) => {
+        if (!payload?.agentId) return;
+        this.monitorSystem?.setAgentLiveActivity(payload.agentId, payload);
+        if (payload.status === "error") {
+          const agent = this.characterManager.getAgent(payload.agentId);
+          if (agent && typeof agent.showContextBubble === "function") {
+            const label = payload.label || "Error en comando";
+            agent.showContextBubble(`${label} falló`, 4200);
+          }
+        }
+      }),
+
+      officeEventBus.on(OFFICE_EVENTS.OFFICE_WORKSPACE_UPDATED, (payload) => {
+        if (payload) {
+          this.monitorSystem?.setLiveWorkspaceSummary(payload);
         }
       }),
 
@@ -1511,13 +1547,35 @@ export class SimulationDirector {
             agent.applyActionProfile("typing");
             this.monitorSystem?.setAgentScreenState(agentId, {
               mode: "WORKING",
-              taskLabel: "Tecleando código",
+              taskLabel: this.isOpenCodeConnected ? "Disponible" : "Tecleando código",
               partnerName: null,
             });
-            timer.workCooldown = 12 + Math.random() * 8;
+            timer.workCooldown = 14 + Math.random() * 10;
             continue;
           }
 
+          if (this.isOpenCodeConnected) {
+            // MODO LIVE REAL: nunca emitir tareas simuladas ni code reviews falsos.
+            // Los agentes libres descansan de forma natural en la oficina o permanecen disponibles.
+            const roll = Math.random();
+            if (roll < 0.54) {
+              timer.workCooldown = 18 + Math.random() * 14;
+            } else if (roll < 0.68 && this.triggerPairChat(agentId)) {
+              timer.workCooldown = 22 + Math.random() * 12;
+            } else {
+              const availablePool = SOLO_DESTINATIONS.filter((d) =>
+                checkpointManager.isAvailable(d.checkpointId),
+              );
+              const pool =
+                availablePool.length > 0 ? availablePool : SOLO_DESTINATIONS;
+              const pick = pool[Math.floor(Math.random() * pool.length)];
+              this.sendAgentTo(agentId, pick.checkpointId, pick.action);
+              timer.workCooldown = 20 + Math.random() * 14;
+            }
+            continue;
+          }
+
+          // MODO DEMO OFFLINE: exhibición autónoma completa
           const roll = Math.random();
           if (roll < 0.22) {
             const isSuccess = Math.random() < 0.65;
@@ -1555,17 +1613,46 @@ export class SimulationDirector {
         }
         timer.interactCooldown -= scaledDelta;
         if (timer.interactCooldown <= 0) {
-          timer.workCooldown = 12 + Math.random() * 10;
+          timer.workCooldown = this.isOpenCodeConnected
+            ? 18 + Math.random() * 12
+            : 12 + Math.random() * 10;
           agent.returnHome();
         }
       } else if (agent.state === "WAITING") {
         timer.waitCooldown -= scaledDelta;
         if (timer.waitCooldown <= 0) {
-          timer.workCooldown = 10 + Math.random() * 8;
+          timer.workCooldown = 12 + Math.random() * 8;
           agent.abandonWaitingAndReturnHome();
         }
       }
     }
+
+    if (this.isOpenCodeConnected) {
+      this._liveTvSyncAccum += delta;
+      if (this._liveTvSyncAccum >= 1.25) {
+        this._liveTvSyncAccum = 0;
+        this._pushLiveTeamSnapshotToTV();
+      }
+    }
+  }
+
+  _pushLiveTeamSnapshotToTV() {
+    if (!this.monitorSystem || !this.characterManager) return;
+    const team = {};
+    for (const agent of this.characterManager.characters) {
+      const id = agent.config.id;
+      const busy = this.isAgentLiveBusy(id);
+      team[id] = {
+        state: agent.state,
+        isLiveBusy: busy,
+        actionLabel: busy
+          ? agent.currentActionLabel || "Trabajando"
+          : agent.state === "INTERACTING"
+            ? agent.currentActionLabel || "En pausa"
+            : "Disponible",
+      };
+    }
+    this.monitorSystem.setLiveTeamSnapshot(team);
   }
 
   destroy() {

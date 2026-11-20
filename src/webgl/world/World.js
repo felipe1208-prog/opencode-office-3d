@@ -1,3 +1,4 @@
+import * as THREE from "three";
 import { Floor } from "../environment/Floor.js";
 import { DioramaShell } from "../environment/DioramaShell.js";
 import { CarpetSystem } from "../environment/CarpetSystem.js";
@@ -10,12 +11,89 @@ import { CoffeeArea } from "../zones/CoffeeArea.js";
 import { PingPongArea } from "../zones/PingPongArea.js";
 import { LoungeArea } from "../zones/LoungeArea.js";
 import { CharacterManager } from "../characters/CharacterManager.js";
+import { AGENT_RAYCAST_LAYER } from "../characters/CharacterModel.js";
 import { SimulationDirector } from "../characters/SimulationDirector.js";
 import { MonitorScreenSystem } from "./MonitorScreenSystem.js";
 import { NightLightingRig } from "./NightLightingRig.js";
 import { SpatialAwarenessService } from "./SpatialAwarenessService.js";
 import { MaterialPool, batchStaticZones } from "../utils/SceneOptimizer.js";
 import { officeEventBus, OFFICE_EVENTS } from "../../events/OfficeEventBus.js";
+import { agentProfileManager } from "../../state/officeWorkspace.js";
+
+const INTERACTIVE_PROP_SPECS = [
+  {
+    id: "prop-whiteboard",
+    propKind: "whiteboard",
+    agentId: null,
+    label: "Pizarra de Arquitectura",
+    hint: "Leer y fijar decisiones del equipo",
+    position: [1.85, 2.05, -8.92],
+    size: [2.28, 1.48, 0.28],
+    focusTarget: [1.85, 2.0, -8.9],
+    focusCamPos: [1.85, 3.1, -2.5],
+  },
+  {
+    id: "prop-meeting-table",
+    propKind: "meeting-table",
+    agentId: null,
+    label: "Mesa de Reuniones",
+    hint: "Convocar Standup rápido con el equipo",
+    position: [0.0, 0.72, -6.0],
+    size: [4.45, 0.72, 1.88],
+    focusTarget: [0.0, 0.9, -6.0],
+    focusCamPos: [5.4, 6.4, -0.4],
+  },
+  {
+    id: "prop-monitor-architect",
+    propKind: "monitor",
+    agentId: "architect",
+    hint: "Abrir Inspector Git y actividad técnica",
+    position: [-8.4, 0.98, -5.26],
+    size: [1.26, 0.62, 0.52],
+    focusTarget: [-8.4, 1.0, -5.26],
+    focusCamPos: [-4.2, 4.4, -1.2],
+  },
+  {
+    id: "prop-monitor-frontend",
+    propKind: "monitor",
+    agentId: "frontend",
+    hint: "Abrir Inspector Git y actividad técnica",
+    position: [-6.7, 0.96, 4.98],
+    size: [1.14, 0.56, 0.46],
+    focusTarget: [-6.7, 0.98, 4.98],
+    focusCamPos: [-3.2, 4.2, 8.8],
+  },
+  {
+    id: "prop-monitor-qa",
+    propKind: "monitor",
+    agentId: "qa",
+    hint: "Abrir Inspector Git y actividad técnica",
+    position: [-5.3, 0.96, 4.98],
+    size: [1.14, 0.56, 0.46],
+    focusTarget: [-5.3, 0.98, 4.98],
+    focusCamPos: [-1.8, 4.2, 8.8],
+  },
+  {
+    id: "prop-monitor-backend",
+    propKind: "monitor",
+    agentId: "backend",
+    hint: "Abrir Inspector Git y actividad técnica",
+    position: [-5.3, 0.96, 5.42],
+    size: [1.14, 0.56, 0.46],
+    focusTarget: [-5.3, 0.98, 5.42],
+    focusCamPos: [-1.8, 4.2, 9.2],
+  },
+  {
+    id: "prop-monitor-systems",
+    propKind: "monitor",
+    agentId: "systems",
+    hint: "Abrir Inspector Git y actividad técnica",
+    position: [-6.7, 0.96, 5.42],
+    size: [1.14, 0.56, 0.46],
+    focusTarget: [-6.7, 0.98, 5.42],
+    focusCamPos: [-3.2, 4.2, 9.2],
+  },
+];
 
 export class World {
   constructor(experience, { onAgentUpdate = null, onDirectorChange = null } = {}) {
@@ -62,6 +140,26 @@ export class World {
       { materialPool: this.materialPool },
     );
 
+    // 2.6 Proxies invisibles de raycasting para mobiliario interactivo (sin coste de renderizado)
+    this.interactivePropGroup = new THREE.Group();
+    this.interactivePropGroup.name = "interactive-prop-proxies";
+    this.interactivePropProxies = [];
+    this.interactivePropMaterial = new THREE.MeshBasicMaterial({ visible: false });
+    this._initInteractivePropProxies();
+    this.scene.add(this.interactivePropGroup);
+
+    this.unsubProfileProxySync = officeEventBus.on(
+      OFFICE_EVENTS.AGENT_PROFILE_UPDATED,
+      ({ agentId, profile } = {}) => {
+        if (!agentId || !profile) return;
+        for (const proxy of this.interactivePropProxies) {
+          if (proxy.userData.propKind === "monitor" && proxy.userData.agentId === agentId) {
+            proxy.userData.label = `Monitor · ${profile.name}`;
+          }
+        }
+      },
+    );
+
     // 3. Personajes, Sockets, Burbujas y Director conectado al Event Bus
     this.characters = new CharacterManager(this.experience, (agentId, snap) => {
       this.monitorSystem.syncFromAgentSnapshots({ [agentId]: snap });
@@ -88,6 +186,47 @@ export class World {
     this.director.setSpatialService(this.spatialService);
   }
 
+  _initInteractivePropProxies() {
+    for (const spec of INTERACTIVE_PROP_SPECS) {
+      const geo = new THREE.BoxGeometry(spec.size[0], spec.size[1], spec.size[2]);
+      const proxy = new THREE.Mesh(geo, this.interactivePropMaterial);
+      proxy.name = spec.id;
+      proxy.position.set(spec.position[0], spec.position[1], spec.position[2]);
+      proxy.layers.set(AGENT_RAYCAST_LAYER);
+      proxy.castShadow = false;
+      proxy.receiveShadow = false;
+
+      let resolvedLabel = spec.label;
+      if (spec.propKind === "monitor" && spec.agentId) {
+        const profile = agentProfileManager.getProfile(spec.agentId);
+        resolvedLabel = `Monitor · ${profile?.name || spec.agentId}`;
+      }
+
+      proxy.userData = {
+        targetType: "prop",
+        propId: spec.id,
+        propKind: spec.propKind,
+        agentId: spec.agentId || null,
+        label: resolvedLabel,
+        hint: spec.hint,
+        focusTarget: spec.focusTarget,
+        focusCamPos: spec.focusCamPos,
+      };
+      this.interactivePropGroup.add(proxy);
+      this.interactivePropProxies.push(proxy);
+    }
+  }
+
+  getInteractivePropSpec(propKind, agentId = null) {
+    return (
+      this.interactivePropProxies.find(
+        (p) =>
+          p.userData.propKind === propKind &&
+          (!agentId || p.userData.agentId === agentId),
+      )?.userData || null
+    );
+  }
+
   setDayNightFactor(factor) {
     this.nightRig?.update(factor);
     this.monitorSystem?.setDayNightFactor(factor);
@@ -100,6 +239,12 @@ export class World {
   }
 
   destroy() {
+    this.unsubProfileProxySync?.();
+    for (const proxy of this.interactivePropProxies) {
+      proxy.geometry?.dispose();
+    }
+    this.interactivePropMaterial?.dispose();
+    this.interactivePropProxies = [];
     this.spatialService?.destroy();
     this.director?.destroy();
     this.characters?.destroy();

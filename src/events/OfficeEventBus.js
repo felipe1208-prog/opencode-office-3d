@@ -17,6 +17,9 @@ export const OFFICE_EVENTS = {
   OFFICE_SPATIAL_STATE: "office:spatial_state",
   OFFICE_SPATIAL_COMMAND: "office:spatial_command",
   OFFICE_WHITEBOARD_UPDATED: "office:whiteboard_updated",
+  OPENCODE_TOOL_ACTIVITY: "opencode:tool_activity",
+  OFFICE_WORKSPACE_UPDATED: "office:workspace_updated",
+  OFFICE_PEER_REVIEW: "office:peer_review",
 };
 
 const MAX_HISTORY = 30;

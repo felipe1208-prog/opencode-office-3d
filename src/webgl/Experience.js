@@ -123,12 +123,16 @@ export class Experience {
       this.onSelect = callbacksOrOnSelect;
       this.onAgentUpdate = legacyOnStatus;
       this.onDirectorChange = null;
+      this.onPropSelect = null;
+      this.onHoverTarget = null;
     } else {
       const opts = callbacksOrOnSelect || {};
       this.onSelect = opts.onSelect || null;
       this.onAgentUpdate = opts.onAgentUpdate || null;
       this.onDirectorChange = opts.onDirectorChange || null;
       this.onCameraViewChanged = opts.onCameraViewChanged || null;
+      this.onPropSelect = opts.onPropSelect || null;
+      this.onHoverTarget = opts.onHoverTarget || null;
     }
 
     this.selectedAgentId = null;
@@ -172,8 +176,16 @@ export class Experience {
     this.invalidateStaticShadows();
     this.updateLighting(0);
 
-    this.raycaster = new RaycasterHandler(this, (agentId) => {
-      this.handleStationSelect(agentId, { focusCamera: Boolean(agentId) });
+    this.raycaster = new RaycasterHandler(this, {
+      onSelect: (agentId) => {
+        this.handleStationSelect(agentId, { focusCamera: Boolean(agentId) });
+      },
+      onPropSelect: (propHit) => {
+        this.handlePropSelect(propHit, { focusCamera: true });
+      },
+      onHover: (hoverInfo) => {
+        this.onHoverTarget?.(hoverInfo);
+      },
     });
 
     this.unsubLightingBus = officeEventBus.on(
@@ -241,6 +253,21 @@ export class Experience {
 
     if (this.onSelect) {
       this.onSelect(this.selectedAgentId);
+    }
+  }
+
+  handlePropSelect(propHit, { focusCamera = true } = {}) {
+    if (!propHit) return;
+    if (focusCamera && propHit.focusTarget) {
+      this.camera.focusOnPoint(propHit.focusTarget, propHit.focusCamPos || null);
+    }
+    this.onPropSelect?.(propHit);
+  }
+
+  focusProp(propKind, agentId = null) {
+    const spec = this.world?.getInteractivePropSpec(propKind, agentId);
+    if (spec?.focusTarget) {
+      this.camera.focusOnPoint(spec.focusTarget, spec.focusCamPos || null);
     }
   }
 

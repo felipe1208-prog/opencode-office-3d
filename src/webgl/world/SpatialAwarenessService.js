@@ -881,6 +881,44 @@ export class SpatialAwarenessService {
       return true;
     }
 
+    if (command.type === "peer_review") {
+      const targetId = this.resolveAgentIdentifier(
+        command.targetAgentId || command.destinatario || command.toAgentId,
+      );
+      const targetAgent = targetId ? this.characterManager?.getAgent(targetId) : null;
+      if (!targetAgent || targetId === agentId) return false;
+
+      const targetName = targetAgent.config?.name || targetId;
+      const reviewCp = PEER_REVIEW_CHECKPOINT[targetId];
+      const destCp =
+        reviewCp && checkpointManager.isAvailable(reviewCp)
+          ? reviewCp
+          : this._resolveDestination(agentId, targetId)?.checkpointId;
+
+      this.director.holdAgentForSpatialIntent?.(agentId, 22000);
+      agent.setContextualBubble(`Pidiendo revisión a ${targetName}`, {
+        color: agent.config?.color || "#E09F5A",
+        durationMs: 4200,
+      });
+      targetAgent.setContextualBubble(`Revisando con ${agent.config?.name || agentId}`, {
+        color: targetAgent.config?.color || "#8B5CF6",
+        durationMs: 4200,
+      });
+
+      if (destCp) {
+        this.director.sendAgentTo(agentId, destCp, "deskReview", {
+          onSeated: () => {
+            if (targetAgent.model?.position) {
+              agent.lookAtWorldPosition(targetAgent.model.position);
+            }
+            this.tickSync({ force: true });
+          },
+        });
+      }
+      this.tickSync({ force: true });
+      return true;
+    }
+
     return false;
   }
 

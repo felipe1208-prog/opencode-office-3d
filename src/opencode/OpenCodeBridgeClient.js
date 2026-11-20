@@ -37,6 +37,8 @@ const TOOL_LABELS_ES = {
   observar_oficina: "Observando oficina",
   moverse_a: "Caminando en oficina",
   escribir_en_pizarra: "Escribiendo en pizarra",
+  leer_pizarra: "Consultando pizarra",
+  pedir_revision_a: "Pidiendo revisión",
 };
 
 function resolveToolLabelEs(rawToolName) {
@@ -277,6 +279,11 @@ export class OpenCodeBridgeClient {
     this.pendingAgentBuffer = new Map();
     this.pendingFlushTimers = new Map();
 
+    // Registro técnico acotado por agente (para Inspector flotante y Monitores 3D reales)
+    this.toolActivityByAgent = new Map();
+    this.fileSnippetCache = new Map();
+    this.workspaceSummary = null;
+
     // Sincronización espacial 3D <-> puente local (:4097) para MCP
     this.lastSpatialSnapshot = null;
     this.spatialPollTimer = null;
@@ -323,6 +330,7 @@ export class OpenCodeBridgeClient {
           ? Math.max(5, Math.min(60, saved.idleCooldownSec))
           : 15,
       autoReconnect: saved?.autoReconnect !== false,
+      autoConnect: Boolean(saved?.autoConnect),
       aliases: mergedAliases,
     };
   }
@@ -364,6 +372,9 @@ export class OpenCodeBridgeClient {
     }
     if (typeof patch.autoReconnect === "boolean") {
       this.config.autoReconnect = patch.autoReconnect;
+    }
+    if (typeof patch.autoConnect === "boolean") {
+      this.config.autoConnect = patch.autoConnect;
     }
     if (patch.aliases && typeof patch.aliases === "object") {
       for (const [id, val] of Object.entries(patch.aliases)) {
@@ -708,6 +719,116 @@ export class OpenCodeBridgeClient {
 
     this._emitSessionLog(sid);
     return existing;
+  }
+
+  _recordToolActivity({
+    agentId = "architect",
+    sessionId = null,
+    callKey = null,
+    toolName = "tool",
+    target = null,
+    rawInput = null,
+    status = "running",
+    outputExcerpt = "",
+    errorMessage = null,
+  } = {}) {
+    const canonical = this.resolveAgentId(agentId) || agentId || "architect";
+    if (!this.toolActivityByAgent.has(canonical)) {
+      this.toolActivityByAgent.set(canonical, []);
+    }
+    const list = this.toolActivityByAgent.get(canonical);
+    const rawPath =
+      rawInput?.path || rawInput?.filePath || rawInput?.file || null;
+    const commandStr =
+      typeof rawInput?.command === "string" ? rawInput.command.trim() : null;
+    const label = resolveToolLabelEs(toolName);
+    const cleanOutput = String(outputExcerpt || "").trim().slice(0, 800);
+    const cleanError = errorMessage ? String(errorMessage).trim().slice(0, 400) : null;
+
+    let rec = callKey ? list.find((item) => item.callKey === callKey) : null;
+    if (!rec) {
+      rec = {
+        id: `act_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        callKey: callKey || null,
+        agentId: canonical,
+        sessionId: sessionId || this.activeSessionId || null,
+        toolName,
+        label,
+        target: target || shortFileName(rawPath) || commandStr || null,
+        rawPath: typeof rawPath === "string" ? rawPath.trim() : null,
+        command: commandStr,
+        status,
+        outputExcerpt: cleanOutput,
+        errorMessage: cleanError,
+        snippetLines: null,
+        timestamp: Date.now(),
+      };
+      list.unshift(rec);
+      if (list.length > 40) list.length = 40;
+    } else {
+      rec.status = status;
+      if (target) rec.target = target;
+      if (rawPath && !rec.rawPath) rec.rawPath = String(rawPath).trim();
+      if (commandStr && !rec.command) rec.command = commandStr;
+      if (cleanOutput) rec.outputExcerpt = cleanOutput;
+      if (cleanError) rec.errorMessage = cleanError;
+      rec.timestamp = Date.now();
+    }
+
+    officeEventBus.emit(
+      OFFICE_EVENTS.OPENCODE_TOOL_ACTIVITY,
+      { ...rec },
+      "opencode-sse",
+    );
+
+    const isFileTool =
+      rec.rawPath &&
+      /^(read|view|edit|write|multiedit|apply_patch)$/.test(toolName);
+    if (isFileTool && status !== "error") {
+      this._hydrateFileSnippetForMonitor(canonical, rec.rawPath, rec);
+    }
+    return rec;
+  }
+
+  async _hydrateFileSnippetForMonitor(agentId, rawPath, activityRecord) {
+    const key = String(rawPath || "").trim();
+    if (!key) return;
+    const cached = this.fileSnippetCache.get(key);
+    const now = Date.now();
+    if (cached && now - cached.fetchedAt < 4000) {
+      if (Array.isArray(cached.lines) && cached.lines.length > 0) {
+        activityRecord.snippetLines = cached.lines;
+        officeEventBus.emit(
+          OFFICE_EVENTS.OPENCODE_TOOL_ACTIVITY,
+          { ...activityRecord, snippetLines: cached.lines },
+          "workspace-snippet",
+        );
+      }
+      return;
+    }
+
+    const res = await this.fetchWorkspaceFileSnippet(key, 24).catch(() => null);
+    if (res?.ok && Array.isArray(res.lines) && res.lines.length > 0) {
+      this.fileSnippetCache.set(key, { lines: res.lines, fetchedAt: Date.now() });
+      activityRecord.snippetLines = res.lines;
+      officeEventBus.emit(
+        OFFICE_EVENTS.OPENCODE_TOOL_ACTIVITY,
+        { ...activityRecord, snippetLines: res.lines },
+        "workspace-snippet",
+      );
+    }
+  }
+
+  getToolActivity(agentId = null) {
+    if (agentId) {
+      const canonical = this.resolveAgentId(agentId) || agentId;
+      return (this.toolActivityByAgent.get(canonical) || []).map((item) => ({ ...item }));
+    }
+    const merged = [];
+    for (const list of this.toolActivityByAgent.values()) {
+      for (const item of list) merged.push({ ...item });
+    }
+    return merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).slice(0, 60);
   }
 
   _findUnassignedChildForDelegation(parentSessionId, subagentId = null) {
@@ -2317,6 +2438,48 @@ export class OpenCodeBridgeClient {
       return null;
     }
 
+    if (eventType === "office.whiteboard.updated") {
+      const notes = props?.whiteboard?.notes || props?.notes;
+      if (Array.isArray(notes)) {
+        this._syncWhiteboardFromBridge(notes);
+      }
+      return null;
+    }
+
+    if (eventType === "office.workspace.updated") {
+      const workspace = props?.workspace || props;
+      if (workspace && typeof workspace === "object") {
+        this.workspaceSummary = workspace;
+        this.fileSnippetCache.clear();
+        officeEventBus.emit(OFFICE_EVENTS.OFFICE_WORKSPACE_UPDATED, workspace, "opencode-sse");
+      }
+      return null;
+    }
+
+    if (eventType === "office.peer_review") {
+      const review = props?.review || props;
+      if (review && review.fromAgentId && review.toAgentId) {
+        officeEventBus.emit(OFFICE_EVENTS.OFFICE_PEER_REVIEW, review, "opencode-sse");
+        const targetSid =
+          this.getPreferredSessionForAgent(review.toAgentId) ||
+          this.activeSessionId;
+        if (targetSid) {
+          const filesLine =
+            Array.isArray(review.files) && review.files.length > 0
+              ? `\nArchivos: ${review.files.join(", ")}`
+              : "";
+          this._appendSessionLogEntry(targetSid, {
+            kind: "text",
+            agentId: review.fromAgentId,
+            content: `Solicitud de revisión para ${review.toAgentName || review.toAgentId}: ${review.context}${filesLine}`,
+            status: "done",
+            timestamp: review.createdAt || Date.now(),
+          });
+        }
+      }
+      return review?.toAgentId || null;
+    }
+
     // --- OpenCode API v2: Flujo session.step.* / session.tool.* / session.*.delta ---
     if (eventType === "session.step.started") {
       if (sessionId) {
@@ -2449,6 +2612,27 @@ export class OpenCodeBridgeClient {
         isDelegation,
         subagentId: isDelegation ? agentId : null,
         childSessionId,
+        errorMessage: isError
+          ? props.error?.data?.message || props.error?.message || props.message || null
+          : null,
+      });
+
+      this._recordToolActivity({
+        agentId: isDelegation && parentAgentForTask ? parentAgentForTask : agentId,
+        sessionId: targetSid,
+        callKey,
+        toolName,
+        target: logTarget,
+        rawInput: input,
+        status: isError ? "error" : isFinished ? "done" : "running",
+        outputExcerpt:
+          typeof props.output === "string"
+            ? props.output
+            : typeof props.state?.output === "string"
+              ? props.state.output
+              : typeof props.result === "string"
+                ? props.result
+                : "",
         errorMessage: isError
           ? props.error?.data?.message || props.error?.message || props.message || null
           : null,
@@ -3204,6 +3388,23 @@ export class OpenCodeBridgeClient {
           subagentId: isDelegation ? agentId : null,
           childSessionId,
           status: isErr ? "error" : isDone ? "done" : "running",
+          errorMessage: isErr ? part.state?.error || part.error || null : null,
+        });
+
+        this._recordToolActivity({
+          agentId: isDelegation && parentAgent ? parentAgent : agentId,
+          sessionId: targetSid,
+          callKey,
+          toolName,
+          target: logTarget,
+          rawInput: input,
+          status: isErr ? "error" : isDone ? "done" : "running",
+          outputExcerpt:
+            typeof part.state?.output === "string"
+              ? part.state.output
+              : typeof part.output === "string"
+                ? part.output
+                : "",
           errorMessage: isErr ? part.state?.error || part.error || null : null,
         });
 
@@ -6384,6 +6585,8 @@ export class OpenCodeBridgeClient {
       if (this.lastSpatialSnapshot) {
         this.syncSpatialState(this.lastSpatialSnapshot, { force: true });
       }
+      this.fetchWhiteboard().catch(() => null);
+      this.fetchWorkspaceSummary().catch(() => null);
 
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
@@ -6673,6 +6876,105 @@ export class OpenCodeBridgeClient {
     } finally {
       this.spatialPollInFlight = false;
     }
+  }
+
+  async _bridgeFetchJson(path, options = {}) {
+    const bridgeUrl = this._getSpatialBridgeUrl();
+    if (!bridgeUrl) return { ok: false, error: "URL de puente no configurada." };
+    try {
+      const resp = await fetch(`${bridgeUrl}${path}`, {
+        ...options,
+        headers: {
+          Accept: "application/json",
+          ...(options.body ? { "Content-Type": "application/json" } : {}),
+          ...(options.headers || {}),
+        },
+        signal: AbortSignal.timeout(options.timeoutMs || 4500),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        return {
+          ok: false,
+          status: resp.status,
+          error: data?.error || `Error HTTP ${resp.status}`,
+        };
+      }
+      return data;
+    } catch (err) {
+      return {
+        ok: false,
+        offline: true,
+        error: err?.message || "Puente local (:4097) no disponible.",
+      };
+    }
+  }
+
+  async fetchWorkspaceSummary() {
+    const data = await this._bridgeFetchJson("/api/office/workspace", { method: "GET" });
+    if (data?.ok) {
+      this.workspaceSummary = data;
+      officeEventBus.emit(OFFICE_EVENTS.OFFICE_WORKSPACE_UPDATED, data, "workspace-bridge");
+    }
+    return data;
+  }
+
+  async setWorkspaceDirectory(dir) {
+    const data = await this._bridgeFetchJson("/api/office/workspace/dir", {
+      method: "POST",
+      body: JSON.stringify({ dir }),
+    });
+    if (data?.ok) {
+      this.workspaceSummary = data;
+      this.fileSnippetCache.clear();
+      if (Array.isArray(data?.whiteboard?.notes)) {
+        this._syncWhiteboardFromBridge(data.whiteboard.notes);
+      }
+      officeEventBus.emit(OFFICE_EVENTS.OFFICE_WORKSPACE_UPDATED, data, "workspace-bridge");
+    }
+    return data;
+  }
+
+  async fetchWorkspaceDiff(relPath) {
+    const qs = encodeURIComponent(String(relPath || "").trim());
+    return this._bridgeFetchJson(`/api/office/workspace/diff?path=${qs}`, { method: "GET" });
+  }
+
+  async fetchWorkspaceFileSnippet(relPath, maxLines = 40) {
+    const qs = encodeURIComponent(String(relPath || "").trim());
+    return this._bridgeFetchJson(
+      `/api/office/workspace/file?path=${qs}&maxLines=${encodeURIComponent(maxLines)}`,
+      { method: "GET", timeoutMs: 2500 },
+    );
+  }
+
+  async fetchWhiteboard() {
+    const data = await this._bridgeFetchJson("/api/office/whiteboard", { method: "GET" });
+    if (data?.ok && Array.isArray(data.notes)) {
+      this._syncWhiteboardFromBridge(data.notes);
+    }
+    return data;
+  }
+
+  async addWhiteboardNote({ text, authorType = "human", agentName = "Tech Lead (Tú)" } = {}) {
+    const data = await this._bridgeFetchJson("/api/office/whiteboard", {
+      method: "POST",
+      body: JSON.stringify({ text, authorType, agentName }),
+    });
+    if (data?.ok && Array.isArray(data?.whiteboard?.notes)) {
+      this._syncWhiteboardFromBridge(data.whiteboard.notes);
+    }
+    return data;
+  }
+
+  async archiveWhiteboardNote({ id = null, clearAll = false } = {}) {
+    const data = await this._bridgeFetchJson("/api/office/whiteboard/archive", {
+      method: "POST",
+      body: JSON.stringify({ id, clearAll }),
+    });
+    if (data?.ok && Array.isArray(data?.whiteboard?.notes)) {
+      this._syncWhiteboardFromBridge(data.whiteboard.notes);
+    }
+    return data;
   }
 
   dispose() {

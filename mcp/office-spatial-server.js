@@ -130,6 +130,52 @@ const TOOLS = [
       required: ["agente", "nota"],
     },
   },
+  {
+    name: "leer_pizarra",
+    description:
+      "Consulta desde cualquier lugar de la oficina todas las notas vigentes y decisiones de arquitectura publicadas en la Pizarra de Arquitectura (tanto por compañeros como por el Tech Lead humano).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agente: {
+          type: "string",
+          description: "ID opcional del agente que consulta la pizarra (architect, frontend, qa, backend, systems).",
+          enum: AGENT_ENUM,
+        },
+      },
+    },
+  },
+  {
+    name: "pedir_revision_a",
+    description:
+      "Solicita una revisión técnica o validación real a un compañero del equipo: el avatar camina hasta el escritorio del destinatario en 3D y registra la solicitud con contexto y archivos en su hilo para que pueda actuar sobre ella.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agente: {
+          type: "string",
+          description: "ID del agente que solicita la revisión (architect, frontend, qa, backend, systems).",
+          enum: AGENT_ENUM,
+        },
+        destinatario: {
+          type: "string",
+          description: "ID del compañero al que se solicita revisión (architect, frontend, qa, backend, systems).",
+          enum: AGENT_ENUM,
+        },
+        contexto: {
+          type: "string",
+          description:
+            "Resumen concreto de lo que necesitas revisar o validar (ej. contrato API, esquema, test o componente UI).",
+        },
+        archivos: {
+          type: "array",
+          items: { type: "string" },
+          description: "Lista opcional de rutas de archivos relevantes para la revisión.",
+        },
+      },
+      required: ["agente", "destinatario", "contexto"],
+    },
+  },
 ];
 
 let detectedContentLengthFraming = false;
@@ -388,6 +434,93 @@ async function executeTool(name, args = {}) {
           {
             type: "text",
             text: `${cmd.agentName || agentId} se dirige a la Sala de Reuniones y publicó la nota en la Pizarra de Arquitectura: "${cmd.note || nota}" (${total} nota(s) visibles en pizarra).`,
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: formatBridgeOfflineError(err) }],
+      };
+    }
+  }
+
+  if (name === "leer_pizarra") {
+    try {
+      const res = await fetchBridgeJson("/api/office/whiteboard", { method: "GET" });
+      const notes = Array.isArray(res?.notes) ? res.notes : [];
+      const proj = res?.projectDir ? ` (${res.projectDir})` : "";
+      if (notes.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `La Pizarra de Arquitectura${proj} no tiene notas activas en este momento.`,
+            },
+          ],
+        };
+      }
+      const lines = [`Pizarra de Arquitectura${proj} (${notes.length} nota(s) vigentes):`];
+      for (const n of notes) {
+        const hhmm = formatClock(n.createdAt);
+        const author = n.authorType === "human" ? `${n.agentName || "Tech Lead (Usuario)"} [Humano]` : (n.agentName || n.agentId);
+        lines.push(`- [${author}${hhmm ? ` · ${hhmm}` : ""}] ${n.text}`);
+      }
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: formatBridgeOfflineError(err) }],
+      };
+    }
+  }
+
+  if (name === "pedir_revision_a") {
+    const fromAgentId = resolveAgentId(args.agente ?? args.agent ?? args.agentId);
+    const toAgentId = resolveAgentId(args.destinatario ?? args.to ?? args.target ?? args.reviewer);
+    const contexto = String(args.contexto ?? args.context ?? args.message ?? "").trim();
+    const archivos = Array.isArray(args.archivos ?? args.files)
+      ? (args.archivos ?? args.files).map((f) => String(f || "").trim()).filter(Boolean).slice(0, 10)
+      : [];
+
+    if (!fromAgentId) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Agente emisor inválido "${args.agente || ""}". Usa: ${AGENT_ENUM.join(", ")}.` }],
+      };
+    }
+    if (!toAgentId || toAgentId === fromAgentId) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Destinatario inválido "${args.destinatario || ""}". Debe ser otro miembro distinto de ${fromAgentId}.` }],
+      };
+    }
+    if (!contexto) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "Debes incluir un resumen en `contexto` explicando qué revisar." }],
+      };
+    }
+
+    try {
+      const res = await fetchBridgeJson("/api/office/peer-review", {
+        method: "POST",
+        body: JSON.stringify({
+          fromAgentId,
+          toAgentId,
+          context: contexto,
+          files: archivos,
+        }),
+      });
+      const review = res?.review || {};
+      const filesSuffix = archivos.length > 0 ? ` (archivos: ${archivos.join(", ")})` : "";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Solicitud de revisión enviada de ${review.fromAgentName || fromAgentId} hacia ${review.toAgentName || toAgentId}${filesSuffix}. El avatar se acerca a su escritorio en 3D y el contexto quedó compartido en su hilo.`,
           },
         ],
       };
