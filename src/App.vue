@@ -33,6 +33,10 @@ import {
   RefreshCw,
   Activity,
   CheckCircle2,
+  Sun,
+  Sunset,
+  Moon,
+  Clock,
 } from "@lucide/vue";
 import { Resources } from "./webgl/core/Resources";
 import { Experience } from "./webgl/Experience";
@@ -85,6 +89,7 @@ const showDiagErrors = ref(false);
 const retryingEntryId = ref(null);
 
 const audioMode = ref(ambientAudio.getMode());
+const lightingMode = ref("accelerated"); // 'accelerated' | 'realtime' | 'day' | 'dusk' | 'night'
 const DESKTOP_NOTIF_KEY = "oficina3d:desktop_notifications:v1";
 function readDesktopNotifPref() {
   try {
@@ -423,6 +428,14 @@ const audioModeLabel = computed(() => {
   return "Audio: Solo avisos sutiles";
 });
 
+const lightingModeLabel = computed(() => {
+  if (lightingMode.value === "realtime") return "Luz solar: Sincronizada con reloj local";
+  if (lightingMode.value === "day") return "Luz solar: Día fijo";
+  if (lightingMode.value === "dusk") return "Luz solar: Atardecer fijo";
+  if (lightingMode.value === "night") return "Luz solar: Noche fija";
+  return "Luz solar: Ciclo circadiano acelerado";
+});
+
 const workspaceChangedCount = computed(() =>
   Array.isArray(workspaceSummary.value?.changes)
     ? workspaceSummary.value.changes.length
@@ -745,6 +758,19 @@ function handleCycleAudioMode() {
 
 function handleSetAudioMode(mode) {
   ambientAudio.setMode(mode);
+}
+
+const LIGHTING_CYCLE_ORDER = ["accelerated", "realtime", "day", "dusk", "night"];
+
+function handleSetLightingMode(mode) {
+  lightingMode.value = mode;
+  experience?.setLightingMode?.(mode);
+}
+
+function handleCycleLightingMode() {
+  const idx = LIGHTING_CYCLE_ORDER.indexOf(lightingMode.value);
+  const next = LIGHTING_CYCLE_ORDER[(idx + 1) % LIGHTING_CYCLE_ORDER.length];
+  handleSetLightingMode(next);
 }
 
 async function handleToggleDesktopNotifications() {
@@ -1627,6 +1653,21 @@ onBeforeUnmount(() => {
       class="absolute top-4 right-4 z-30 flex flex-col items-end gap-2.5 pointer-events-none"
     >
       <div class="flex items-center gap-2 pointer-events-auto">
+        <!-- Botón discreto de Ciclo Solar Circadiano (Acelerado / Reloj Real / Día / Tarde / Noche) -->
+        <button
+          type="button"
+          @click="handleCycleLightingMode"
+          :title="lightingModeLabel"
+          :aria-label="lightingModeLabel"
+          class="hud-glass p-2 rounded-xl text-xs font-medium text-[#DCD5CC] hover:text-[#FFFDF9] flex items-center justify-center transition-transform duration-150 active:scale-95 cursor-pointer"
+        >
+          <Clock v-if="lightingMode === 'realtime'" class="w-3.5 h-3.5 text-[#E09F5A]" />
+          <Sunset v-else-if="lightingMode === 'dusk'" class="w-3.5 h-3.5 text-[#F59E0B]" />
+          <Moon v-else-if="lightingMode === 'night'" class="w-3.5 h-3.5 text-[#93C5FD]" />
+          <Sun v-else-if="lightingMode === 'day'" class="w-3.5 h-3.5 text-[#FBBF24]" />
+          <Sun v-else class="w-3.5 h-3.5 text-[#C8C0B5]" />
+        </button>
+
         <!-- Botón discreto de Audio (Solo avisos / Ambiente / Silencio) -->
         <button
           type="button"
@@ -2922,6 +2963,74 @@ onBeforeUnmount(() => {
                   class="accent-[#E09F5A] w-4 h-4 cursor-pointer"
                 />
               </label>
+
+              <div class="pt-2 border-t border-white/[0.07] space-y-1.5">
+                <div class="text-xs font-medium text-[#F6EFE6]">
+                  Ciclo solar e iluminación
+                </div>
+                <div class="grid grid-cols-5 gap-1 p-1 rounded-xl bg-black/30 border border-white/[0.07]">
+                  <button
+                    type="button"
+                    @click="handleSetLightingMode('accelerated')"
+                    :class="[
+                      'px-1.5 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer whitespace-nowrap',
+                      lightingMode === 'accelerated'
+                        ? 'bg-white/[0.12] text-[#FFFDF9]'
+                        : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
+                    ]"
+                  >
+                    Acelerado
+                  </button>
+                  <button
+                    type="button"
+                    @click="handleSetLightingMode('realtime')"
+                    :class="[
+                      'px-1.5 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer whitespace-nowrap',
+                      lightingMode === 'realtime'
+                        ? 'bg-white/[0.12] text-[#FFFDF9]'
+                        : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
+                    ]"
+                  >
+                    Hora real
+                  </button>
+                  <button
+                    type="button"
+                    @click="handleSetLightingMode('day')"
+                    :class="[
+                      'px-1.5 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer whitespace-nowrap',
+                      lightingMode === 'day'
+                        ? 'bg-white/[0.12] text-[#FFFDF9]'
+                        : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
+                    ]"
+                  >
+                    Día
+                  </button>
+                  <button
+                    type="button"
+                    @click="handleSetLightingMode('dusk')"
+                    :class="[
+                      'px-1.5 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer whitespace-nowrap',
+                      lightingMode === 'dusk'
+                        ? 'bg-white/[0.12] text-[#FFFDF9]'
+                        : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
+                    ]"
+                  >
+                    Tarde
+                  </button>
+                  <button
+                    type="button"
+                    @click="handleSetLightingMode('night')"
+                    :class="[
+                      'px-1.5 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer whitespace-nowrap',
+                      lightingMode === 'night'
+                        ? 'bg-white/[0.12] text-[#FFFDF9]'
+                        : 'text-[#B5AEA4] hover:text-[#F3EFE8]',
+                    ]"
+                  >
+                    Noche
+                  </button>
+                </div>
+              </div>
 
               <div class="pt-2 border-t border-white/[0.07] space-y-1.5">
                 <div class="text-xs font-medium text-[#F6EFE6]">

@@ -19,12 +19,14 @@ export class CharacterLocomotion {
     this.sensorRange = 1.05;
     this.greetingRange = 1.48;
     this.avoidanceForce = new THREE.Vector3();
+    this.lookAheadYawOffset = 0;
     this._lastGreetedPeer = new Map(); // peerId -> timestamp ms
   }
 
   setPath(waypoints, onArrival = null) {
     this.waypoints = waypoints;
     this.currentWaypointIndex = 0;
+    this.lookAheadYawOffset = 0;
     this.onArrival = onArrival;
   }
 
@@ -90,7 +92,7 @@ export class CharacterLocomotion {
     if (this.currentWaypointIndex >= this.waypoints.length) return;
 
     const isFinal = this.currentWaypointIndex === this.waypoints.length - 1;
-    const arrivalRadius = isFinal ? 0.14 : 0.24;
+    const arrivalRadius = isFinal ? 0.12 : 0.26;
 
     const target = this.waypoints[this.currentWaypointIndex];
     _dir.subVectors(target, this.model.position);
@@ -100,6 +102,7 @@ export class CharacterLocomotion {
     if (distance < arrivalRadius) {
       this.currentWaypointIndex++;
       if (this.currentWaypointIndex >= this.waypoints.length) {
+        this.lookAheadYawOffset = 0;
         if (this.onArrival) {
           const cb = this.onArrival;
           this.onArrival = null;
@@ -124,7 +127,33 @@ export class CharacterLocomotion {
     while (diff > Math.PI) diff -= Math.PI * 2;
     this.model.rotation.y += diff * (1 - Math.exp(-9.5 * delta));
 
-    const step = Math.min(this.speed * delta, isFinal ? distance : this.speed * delta);
+    // Anticipación visual de curva: mirar hacia el siguiente waypoint antes de girar el torso
+    if (!isFinal && distance < 0.95 && this.waypoints[this.currentWaypointIndex + 1]) {
+      const nextWp = this.waypoints[this.currentWaypointIndex + 1];
+      const nextAngle = Math.atan2(
+        nextWp.x - this.model.position.x,
+        nextWp.z - this.model.position.z,
+      );
+      let lookDiff = nextAngle - this.model.rotation.y;
+      while (lookDiff < -Math.PI) lookDiff += Math.PI * 2;
+      while (lookDiff > Math.PI) lookDiff -= Math.PI * 2;
+      this.lookAheadYawOffset = THREE.MathUtils.clamp(lookDiff * 0.65, -0.58, 0.58);
+    } else {
+      this.lookAheadYawOffset = THREE.MathUtils.clamp(diff * 0.65, -0.55, 0.55);
+    }
+
+    // Desaceleración progresiva en los últimos 0.6m antes de llegar a una silla o estación
+    let effectiveSpeed = this.speed;
+    if (isFinal && distance < 0.6) {
+      const ratio = THREE.MathUtils.clamp(
+        (distance - arrivalRadius) / (0.6 - arrivalRadius),
+        0,
+        1,
+      );
+      effectiveSpeed = this.speed * THREE.MathUtils.lerp(0.45, 1.0, ratio);
+    }
+
+    const step = Math.min(effectiveSpeed * delta, isFinal ? distance : effectiveSpeed * delta);
     this.model.position.x += _steerDir.x * step;
     this.model.position.z += _steerDir.z * step;
   }

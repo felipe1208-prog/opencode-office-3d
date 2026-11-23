@@ -13,6 +13,8 @@ import { LoungeArea } from "../zones/LoungeArea.js";
 import { CharacterManager } from "../characters/CharacterManager.js";
 import { AGENT_RAYCAST_LAYER } from "../characters/CharacterModel.js";
 import { SimulationDirector } from "../characters/SimulationDirector.js";
+import { PropPersistenceManager } from "../characters/PropPersistenceManager.js";
+import { AmbientAudioSystem } from "../audio/AmbientAudioSystem.js";
 import { MonitorScreenSystem } from "./MonitorScreenSystem.js";
 import { NightLightingRig } from "./NightLightingRig.js";
 import { SpatialAwarenessService } from "./SpatialAwarenessService.js";
@@ -161,17 +163,26 @@ export class World {
       },
     );
 
-    // 3. Personajes, Sockets, Burbujas y Director conectado al Event Bus
+    // 3. Personajes, Sockets, Persistencia Física de Objetos, Burbujas y Director conectado al Event Bus
     this.characters = new CharacterManager(this.experience, (agentId, snap) => {
       this.monitorSystem.syncFromAgentSnapshots({ [agentId]: snap });
       if (onAgentUpdate) onAgentUpdate(agentId, snap);
     });
+    this.propPersistence = new PropPersistenceManager(
+      this.scene,
+      this.resources,
+      this.characters,
+    );
     this.director = new SimulationDirector(this.characters, {
       onDirectorChange,
       monitorSystem: this.monitorSystem,
       pingPongArea: this.pingPong,
       coffeeArea: this.coffeeArea,
+      propPersistence: this.propPersistence,
     });
+
+    // 3.5 Sistema de Audio Espacial Sutil (Web Audio API posicional)
+    this.ambientAudioSystem = new AmbientAudioSystem(this.experience);
 
     // 4. Servicio ligero de conciencia espacial (<= 2 Hz, fuera del bucle rAF)
     this.spatialService = new SpatialAwarenessService({
@@ -241,6 +252,8 @@ export class World {
     if (this.coffeeArea) this.coffeeArea.update(delta);
     if (this.director) this.director.update(delta);
     if (this.characters) this.characters.update(delta);
+    if (this.monitorSystem) this.monitorSystem.update(delta);
+    if (this.ambientAudioSystem) this.ambientAudioSystem.update(delta);
   }
 
   destroy() {
@@ -252,6 +265,7 @@ export class World {
     this.interactivePropProxies = [];
     this.spatialService?.destroy();
     this.director?.destroy();
+    this.propPersistence?.dispose?.();
     this.characters?.destroy();
     this.supervisor?.dispose?.();
     this.pingPong?.dispose?.();

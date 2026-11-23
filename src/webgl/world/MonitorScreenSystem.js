@@ -741,6 +741,30 @@ export class MonitorScreenSystem {
     }
   }
 
+  /**
+   * Refresco periódico de baja frecuencia (~2.4 Hz, cada 0.42s) para animar
+   * el cursor del IDE, barrido de líneas de código, ondas de razonamiento y reloj de pausa
+   * sin penalizar el framerate de 60 FPS.
+   */
+  update(delta) {
+    this._animAccum = (this._animAccum || 0) + delta;
+    if (this._animAccum < 0.42) return;
+    this._animAccum = 0;
+    this._globalAnimStep = ((this._globalAnimStep || 0) + 1) % 1200;
+
+    let idxOffset = 0;
+    for (const entry of this.stationScreens.values()) {
+      idxOffset += 1;
+      if (entry.mode === "WORKING" || entry.mode === "THINKING") {
+        entry.animStep = (this._globalAnimStep + idxOffset) % 12;
+        this._redrawStation(entry);
+      } else if (entry.mode === "AWAY" && this._globalAnimStep % 24 === 0) {
+        entry.animStep = Math.floor(this._globalAnimStep / 24);
+        this._redrawStation(entry);
+      }
+    }
+  }
+
   _redrawStation(entry) {
     const wsKey = this.isLiveMode
       ? `${this.liveWorkspace.projectName}|${this.liveWorkspace.branch}|${this.liveWorkspace.changedCount}`
@@ -748,7 +772,8 @@ export class MonitorScreenSystem {
     const liveKey = this.isLiveMode
       ? `${entry.liveToolName || ""}|${entry.liveStatus || ""}|${entry.liveTarget || ""}|${entry.liveUpdatedAt}|${entry.liveSnippetLines?.length || 0}|${entry.liveOutputLines?.length || 0}|${entry.liveErrorText || ""}`
       : "";
-    const renderKey = `${this.isLiveMode ? "L" : "D"}|${entry.mode}|${entry.taskLabel || ""}|${entry.taskFile || ""}|${entry.partnerName || ""}|${entry.agentConfig?.name || ""}|${entry.agentConfig?.color || ""}|${wsKey}|${liveKey}`;
+    const animStep = entry.animStep || 0;
+    const renderKey = `${this.isLiveMode ? "L" : "D"}|${entry.mode}|${entry.taskLabel || ""}|${entry.taskFile || ""}|${entry.partnerName || ""}|${entry.agentConfig?.name || ""}|${entry.agentConfig?.color || ""}|${wsKey}|${liveKey}|${animStep}`;
     if (renderKey === entry.lastRenderKey) {
       entry.dirty = false;
       return false;
@@ -768,7 +793,7 @@ export class MonitorScreenSystem {
     );
     const accent = agentConfig?.color || "#38BDF8";
     const snippet = ROLE_SNIPPETS[agentConfig?.id] || ROLE_SNIPPETS.frontend;
-    const pulseStep = this.tickCounter % 6;
+    const pulseStep = (animStep || this.tickCounter) % 6;
 
     // === MONITOR IZQUIERDO ===
     ctx.fillStyle = "#111824";

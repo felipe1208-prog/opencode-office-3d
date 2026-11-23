@@ -120,6 +120,36 @@ export class AgentStatusBubble {
     ctx.textBaseline = "middle";
     ctx.fillText(this.agentConfig.name, 60, y + 24);
 
+    // Micro-icono / etiqueta contextual discreta en esquina superior derecha
+    if (badgeTag) {
+      const tagStr = String(badgeTag).trim();
+      ctx.font = "600 17px 'Plus Jakarta Sans', system-ui, sans-serif";
+      const tw = Math.max(30, ctx.measureText(tagStr).width + 16);
+      const tx = x + rw - tw - 12;
+      const ty = y + 10;
+      const th = 26;
+      const tr = 8;
+
+      ctx.fillStyle = "rgba(255, 255, 255, 0.09)";
+      ctx.beginPath();
+      ctx.moveTo(tx + tr, ty);
+      ctx.lineTo(tx + tw - tr, ty);
+      ctx.quadraticCurveTo(tx + tw, ty, tx + tw, ty + tr);
+      ctx.lineTo(tx + tw, ty + th - tr);
+      ctx.quadraticCurveTo(tx + tw, ty + th, tx + tw - tr, ty + th);
+      ctx.lineTo(tx + tr, ty + th);
+      ctx.quadraticCurveTo(tx, ty + th, tx, ty + th - tr);
+      ctx.lineTo(tx, ty + tr);
+      ctx.quadraticCurveTo(tx, ty, tx + tr, ty);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = "#F5F1EA";
+      ctx.textAlign = "center";
+      ctx.fillText(tagStr, tx + tw / 2, ty + th / 2 + 1);
+      ctx.textAlign = "left";
+    }
+
     // Subtítulo humano adaptativo
     const maxTextWidth = w - 82;
     let fontSize = 20;

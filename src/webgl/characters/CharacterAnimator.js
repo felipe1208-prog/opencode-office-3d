@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { ANIMATION_DEFS } from "./agents.config.js";
+import { ProceduralIK } from "./ProceduralIK.js";
 
 export class CharacterAnimator {
   constructor(model, resources) {
@@ -12,18 +13,24 @@ export class CharacterAnimator {
     this.onClipChanged = null;
     this.oneShotCallbacks = new Map();
 
-    // Capa procedural post-mixer (cero asignaciones por frame)
+    // Semillas aleatorias individuales para desincronización total entre los 5 agentes
+    this.timeOffset = Math.random() * 17.3;
+    this.breathFreqScale = 0.88 + Math.random() * 0.24;
+
+    // Capa procedural post-mixer + Cinemática Inversa (cero asignaciones por frame)
     this.bones = {};
     this.validNodeNames = new Set();
+    this.ik = new ProceduralIK();
     this.proceduralMode = null;
-    this.procTime = Math.random() * 10;
+    this.procTime = this.timeOffset;
     this.modeBlend = 0;
+    this.isCarryingDrink = false;
+    this.isThinkingPose = false;
+    this.thinkingBlend = 0;
 
     // Gaze / seguimiento suave de cabeza (en radianes relativos al cuerpo)
     this.targetHeadYaw = 0;
     this.targetHeadPitch = 0;
-    this.currentHeadYaw = 0;
-    this.currentHeadPitch = 0;
 
     // Contexto dinámico externo (rally de ping-pong, saludo de pasillo)
     this.rallySide = null; // "north" | "south" | null
@@ -87,9 +94,17 @@ export class CharacterAnimator {
     }
   }
 
+  setCarryingDrink(carrying) {
+    this.isCarryingDrink = Boolean(carrying);
+  }
+
+  setThinkingPose(thinking) {
+    this.isThinkingPose = Boolean(thinking);
+  }
+
   setHeadGazeTarget(yawRad = 0, pitchRad = 0) {
-    this.targetHeadYaw = THREE.MathUtils.clamp(yawRad, -0.58, 0.58);
-    this.targetHeadPitch = THREE.MathUtils.clamp(pitchRad, -0.3, 0.28);
+    this.targetHeadYaw = THREE.MathUtils.clamp(yawRad, -0.785, 0.785);
+    this.targetHeadPitch = THREE.MathUtils.clamp(pitchRad, -0.436, 0.436);
   }
 
   setPingPongRallyState({ active = false, phase = 0, side = null } = {}) {
@@ -219,7 +234,15 @@ export class CharacterAnimator {
       this.currentAction.fadeOut(duration);
     }
 
-    nextAction.reset().fadeIn(duration).play();
+    nextAction.reset();
+    // Desincronización orgánica en clips cíclicos para que ningún par de agentes se mueva al unísono
+    if (nextAction.loop === THREE.LoopRepeat) {
+      const clipDur = nextAction.getClip()?.duration || 2.0;
+      if (clipDur > 0.4) {
+        nextAction.time = (this.timeOffset * 0.73) % clipDur;
+      }
+    }
+    nextAction.fadeIn(duration).play();
     this.currentAction = nextAction;
     this.currentAnimName = name;
 
@@ -239,7 +262,7 @@ export class CharacterAnimator {
     this.modeBlend = Math.min(1, this.modeBlend + delta * 3.8);
     const w = this.modeBlend;
 
-    // 1. Respiración sutil orgánica en torso (evitando durante one-shots bruscos)
+    // 1. Respiración sutil orgánica desincronizada en torso
     const isOneShot =
       this.currentAnimName === "sitToStand" ||
       this.currentAnimName === "standToSit" ||
@@ -247,7 +270,8 @@ export class CharacterAnimator {
       this.currentAnimName === "sittingDisbelief";
 
     if (!isOneShot && b.spine1) {
-      const breathFreq = this.proceduralMode === "pingPongRally" ? 3.2 : 1.75;
+      const baseFreq = this.proceduralMode === "pingPongRally" ? 3.2 : 1.75;
+      const breathFreq = baseFreq * this.breathFreqScale;
       const breathAmp = this.proceduralMode === "pingPongRally" ? 0.022 : 0.013;
       b.spine1.rotation.x += Math.sin(t * breathFreq) * breathAmp;
     }
@@ -265,7 +289,15 @@ export class CharacterAnimator {
       }
     }
 
-    // 3. Seguimiento suave de mirada (cabeza + cuello)
+    // 2.5 Estabilizador de antebrazo izquierdo al transportar taza o vaso caminando
+    this.ik.applyCarryDrinkStabilizer(
+      b,
+      this.isCarryingDrink && this.currentAnimName === "walking",
+      t,
+      delta,
+    );
+
+    // 3. Seguimiento suave de mirada (Look-At IK en cuello + cabeza con Quaternion.slerp)
     let autoYaw = 0;
     let autoPitch = 0;
     const mode = this.proceduralMode;
@@ -279,7 +311,6 @@ export class CharacterAnimator {
         autoPitch = Math.max(0, Math.sin(t * 2.1)) * 0.095;
         autoYaw = Math.sin(t * 0.68) * 0.08;
       } else if (mode === "presentingSweep") {
-        // Barrido visual hacia toda la mesa de reuniones
         autoYaw = Math.sin(t * 0.72) * 0.32;
         autoPitch = 0.04 + Math.sin(t * 1.4) * 0.03;
       } else if (mode === "relaxedWatch") {
@@ -300,64 +331,77 @@ export class CharacterAnimator {
       }
     }
 
-    const desiredYaw = THREE.MathUtils.clamp(
-      this.targetHeadYaw + autoYaw + greetYaw,
-      -0.62,
-      0.62,
-    );
-    const desiredPitch = THREE.MathUtils.clamp(
-      this.targetHeadPitch + autoPitch + greetPitch,
-      -0.34,
-      0.34,
-    );
-    this.currentHeadYaw = THREE.MathUtils.damp(
-      this.currentHeadYaw,
-      desiredYaw,
-      7.5,
-      delta,
-    );
-    this.currentHeadPitch = THREE.MathUtils.damp(
-      this.currentHeadPitch,
-      desiredPitch,
-      7.5,
-      delta,
-    );
-
     if (!isOneShot) {
-      if (b.neck) {
-        b.neck.rotation.y += this.currentHeadYaw * 0.42;
-        b.neck.rotation.x += this.currentHeadPitch * 0.38;
-      }
-      if (b.head) {
-        b.head.rotation.y += this.currentHeadYaw * 0.58;
-        b.head.rotation.x += this.currentHeadPitch * 0.62;
-      }
+      this.ik.applyLookAtSlerp(
+        b,
+        this.targetHeadYaw + autoYaw + greetYaw,
+        this.targetHeadPitch + autoPitch + greetPitch,
+        delta,
+      );
     }
 
     if (isOneShot || !mode) return;
 
     // 4. Acciones procedurales dedicadas sobre tren superior, brazos y manos
     if (mode === "typingScan") {
-      // Ciclo realista de programador: tecleo continuo + desplazamiento periódico de mano derecha al mouse
-      const mouseCycle = Math.sin(t * 0.68);
-      const onMouse = THREE.MathUtils.smoothstep(mouseCycle, 0.38, 0.78) * w;
-      const keyFlutterL = Math.sin(t * 13.5) * 0.065 * w;
-      const keyFlutterR = Math.cos(t * 14.2) * 0.065 * (1 - onMouse * 0.7) * w;
-      const mouseClick = Math.pow(Math.max(0, Math.sin(t * 4.8)), 6) * 0.14 * onMouse;
+      this.thinkingBlend = THREE.MathUtils.damp(
+        this.thinkingBlend,
+        this.isThinkingPose ? 1 : 0,
+        5.5,
+        delta,
+      );
+      const thinkW = this.thinkingBlend * w;
+      const typeW = (1 - this.thinkingBlend) * w;
 
-      if (b.rightArm) {
-        b.rightArm.rotation.z -= 0.14 * onMouse;
-        b.rightArm.rotation.y -= 0.11 * onMouse;
+      // A) Postura pensativa (mano en la barbilla / leve inclinación leyendo código en THINKING)
+      if (thinkW > 0.01) {
+        if (b.spine1) {
+          b.spine1.rotation.x -= 0.065 * thinkW;
+        }
+        if (b.rightArm) {
+          b.rightArm.rotation.x -= 0.42 * thinkW;
+          b.rightArm.rotation.y += 0.24 * thinkW;
+        }
+        if (b.rightForeArm) {
+          b.rightForeArm.rotation.y -= 0.68 * thinkW;
+          b.rightForeArm.rotation.x -= 0.22 * thinkW;
+        }
+        if (b.head) {
+          b.head.rotation.z += 0.055 * thinkW;
+        }
       }
-      if (b.rightForeArm) {
-        b.rightForeArm.rotation.y -= 0.16 * onMouse;
-        b.rightForeArm.rotation.x += Math.sin(t * 2.4) * 0.03 * onMouse;
-      }
-      if (b.rightHandIndex1) {
-        b.rightHandIndex1.rotation.x += keyFlutterR + mouseClick;
-      }
-      if (b.leftHandIndex1) {
-        b.leftHandIndex1.rotation.x += keyFlutterL;
+
+      // B) Ciclo realista de programador: ráfagas de tecleo + uso del mouse + micro-estiramiento de cuello
+      if (typeW > 0.01) {
+        const mouseCycle = Math.sin(t * 0.68);
+        const onMouse = THREE.MathUtils.smoothstep(mouseCycle, 0.38, 0.78) * typeW;
+        const burstEnv = 0.65 + 0.35 * Math.sin(t * 1.9);
+        const keyFlutterL = Math.sin(t * 13.5) * 0.068 * burstEnv * typeW;
+        const keyFlutterR =
+          Math.cos(t * 14.2) * 0.068 * burstEnv * (1 - onMouse * 0.75) * typeW;
+        const mouseClick =
+          Math.pow(Math.max(0, Math.sin(t * 4.8)), 6) * 0.14 * onMouse;
+
+        // Micro-giro relajante de cuello/hombros cada ~24s
+        const neckRoll = Math.pow(Math.max(0, Math.sin(t * 0.26)), 10) * typeW;
+        if (neckRoll > 0.01 && b.head) {
+          b.head.rotation.z += Math.sin(t * 2.8) * 0.085 * neckRoll;
+        }
+
+        if (b.rightArm) {
+          b.rightArm.rotation.z -= 0.14 * onMouse;
+          b.rightArm.rotation.y -= 0.11 * onMouse;
+        }
+        if (b.rightForeArm) {
+          b.rightForeArm.rotation.y -= 0.16 * onMouse;
+          b.rightForeArm.rotation.x += Math.sin(t * 2.4) * 0.03 * onMouse;
+        }
+        if (b.rightHandIndex1) {
+          b.rightHandIndex1.rotation.x += keyFlutterR + mouseClick;
+        }
+        if (b.leftHandIndex1) {
+          b.leftHandIndex1.rotation.x += keyFlutterL;
+        }
       }
       return;
     }

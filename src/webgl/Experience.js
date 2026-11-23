@@ -156,8 +156,10 @@ export class Experience {
 
     this.dayNightCycle = 0.0;
     this.targetDayNight = 0.0;
+    this.lightingMode = "accelerated"; // 'accelerated' | 'realtime' | 'day' | 'dusk' | 'night'
     this.isAutoCycle = true;
     this.autoClock = 0;
+    this._realtimeCheckAccum = 0;
     this.lightingAppliedOnce = false;
     this._lastShadowSunPos = DAY_SUN_POS.clone();
     this.isPageHidden = typeof document !== "undefined" ? Boolean(document.hidden) : false;
@@ -191,10 +193,7 @@ export class Experience {
     this.unsubLightingBus = officeEventBus.on(
       OFFICE_EVENTS.OFFICE_LIGHTING,
       ({ mode }) => {
-        if (mode === "day") this.setDayNightFactor(0.0, false);
-        else if (mode === "dusk") this.setDayNightFactor(0.44, false);
-        else if (mode === "night") this.setDayNightFactor(0.84, false);
-        else if (mode === "auto") this.setDayNightFactor(0.0, true);
+        if (mode) this.setLightingMode(mode);
       },
     );
 
@@ -354,6 +353,57 @@ export class Experience {
     this.world?.director?.returnAllHome();
   }
 
+  setLightingMode(mode = "accelerated") {
+    const normalized = mode === "auto" ? "accelerated" : mode;
+    this.lightingMode = normalized;
+    if (normalized === "day") {
+      this.setDayNightFactor(0.0, false);
+    } else if (normalized === "dusk") {
+      this.setDayNightFactor(DUSK_FACTOR, false);
+    } else if (normalized === "night") {
+      this.setDayNightFactor(NIGHT_FACTOR, false);
+    } else if (normalized === "realtime") {
+      this.isAutoCycle = false;
+      this.targetDayNight = this._computeRealtimeDayNightFactor();
+      this.lightingAppliedOnce = false;
+    } else {
+      this.lightingMode = "accelerated";
+      this.isAutoCycle = true;
+      this.lightingAppliedOnce = false;
+    }
+    return this.lightingMode;
+  }
+
+  getLightingMode() {
+    return this.lightingMode || "accelerated";
+  }
+
+  _computeRealtimeDayNightFactor(date = new Date()) {
+    const hours = date.getHours() + date.getMinutes() / 60;
+    // 06:30 -> 08:30: Amanecer fresco hacia día brillante (0.38 -> 0.0)
+    if (hours >= 6.5 && hours < 8.5) {
+      const k = (hours - 6.5) / 2.0;
+      return THREE.MathUtils.lerp(0.38, 0.0, k);
+    }
+    // 08:30 -> 16:30: Día soleado de estudio (0.0 -> 0.16)
+    if (hours >= 8.5 && hours < 16.5) {
+      const k = (hours - 8.5) / 8.0;
+      return THREE.MathUtils.lerp(0.0, 0.16, k);
+    }
+    // 16:30 -> 19:30: Atardecer dorado con sombras largas (0.16 -> 0.56)
+    if (hours >= 16.5 && hours < 19.5) {
+      const k = (hours - 16.5) / 3.0;
+      return THREE.MathUtils.lerp(0.16, 0.56, k);
+    }
+    // 19:30 -> 22:00: Anochecer progresivo con lámparas interiores encendidas (0.56 -> 0.84)
+    if (hours >= 19.5 && hours < 22.0) {
+      const k = (hours - 19.5) / 2.5;
+      return THREE.MathUtils.lerp(0.56, NIGHT_FACTOR, k);
+    }
+    // 22:00 -> 06:30: Noche de oficina acogedora (0.84 -> 0.88)
+    return NIGHT_FACTOR;
+  }
+
   setDayNightFactor(factor, auto = false) {
     this.targetDayNight = THREE.MathUtils.clamp(factor, 0.0, 1.0);
     this.isAutoCycle = auto;
@@ -361,7 +411,13 @@ export class Experience {
   }
 
   updateLighting(delta) {
-    if (this.isAutoCycle) {
+    if (this.lightingMode === "realtime") {
+      this._realtimeCheckAccum += delta;
+      if (this._realtimeCheckAccum >= 5.0 || !this.lightingAppliedOnce) {
+        this._realtimeCheckAccum = 0;
+        this.targetDayNight = this._computeRealtimeDayNightFactor();
+      }
+    } else if (this.isAutoCycle) {
       this.autoClock += delta * 0.08;
       this.targetDayNight = (Math.sin(this.autoClock - Math.PI / 2) + 1) * 0.5 * 0.85;
     } else if (

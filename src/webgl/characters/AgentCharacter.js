@@ -51,6 +51,8 @@ export class AgentCharacter {
     this.contextualBubble = null;
     this._contextualBubbleTimer = null;
     this._unsubTurnGranted = null;
+    this.mood = "focused";
+    this.carryingDrinkProp = null;
 
     this.pendingTimers = new Set();
 
@@ -170,7 +172,18 @@ export class AgentCharacter {
     this.syncBubble();
   }
 
-  setContextualBubble(text, { color = null, durationMs = 3600 } = {}) {
+  setCarryingDrinkProp(propKey) {
+    this.carryingDrinkProp = propKey || null;
+    this.animator.setCarryingDrink(Boolean(this.carryingDrinkProp));
+    if (this.carryingDrinkProp && this.state === "TRAVELING") {
+      this.propSockets.attach(this.carryingDrinkProp, {
+        handOverride: "left",
+        carryPose: true,
+      });
+    }
+  }
+
+  setContextualBubble(text, { color = null, durationMs = 3600, badge = null } = {}) {
     if (this._contextualBubbleTimer) {
       clearTimeout(this._contextualBubbleTimer);
       this._contextualBubbleTimer = null;
@@ -185,6 +198,7 @@ export class AgentCharacter {
     this.contextualBubble = {
       text: clean.length > 42 ? `${clean.slice(0, 41)}…` : clean,
       color: color || this.config.color,
+      badge: badge || null,
       expiresAt: Date.now() + safeDuration,
     };
     this.syncBubble();
@@ -222,12 +236,14 @@ export class AgentCharacter {
 
     let text = null;
     let color = this.taskAccentColor || this.config.color;
+    let badgeTag = null;
     const rawLabel = String(this.currentActionLabel || "").trim();
     const rawTask = String(this.taskTitle || "").trim();
 
     if (this.hasPendingUserQuestion) {
       text = "Tiene una pregunta para ti";
       color = "#FCD34D";
+      badgeTag = "💡";
     } else if (
       this.contextualBubble &&
       this.contextualBubble.text &&
@@ -235,15 +251,21 @@ export class AgentCharacter {
     ) {
       text = this.contextualBubble.text;
       color = this.contextualBubble.color || color;
+      badgeTag = this.contextualBubble.badge || null;
     } else if (this.socialMode === "PAIR_CHAT" && this.socialPartnerName) {
+      const isPingPong = String(this.currentCheckpointId || "").startsWith("pingpong");
+      badgeTag = isPingPong ? "🏓" : "☕";
       if (this.state === "TRAVELING") {
         text = `Yendo a charlar con ${this.socialPartnerName}`;
       } else if (this.socialPhase === "APPROACHING") {
         text = `Esperando a ${this.socialPartnerName}`;
       } else {
-        text = `Conversando con ${this.socialPartnerName}`;
+        text = isPingPong
+          ? `Ping-Pong con ${this.socialPartnerName}`
+          : `Conversando con ${this.socialPartnerName}`;
       }
     } else if (this.socialMode === "DESK_REVIEW" && this.socialPartnerName) {
+      badgeTag = "🌿";
       if (this.state === "TRAVELING") {
         text = `Yendo a revisar con ${this.socialPartnerName}`;
       } else if (this.socialPhase === "APPROACHING") {
@@ -253,6 +275,7 @@ export class AgentCharacter {
       }
       color = "#7DD3FC";
     } else if (this.socialMode === "MEETING") {
+      badgeTag = "💡";
       if (this.state === "TRAVELING") {
         text = "Yendo a la sala";
       } else if (this.socialPhase === "APPROACHING") {
@@ -271,6 +294,7 @@ export class AgentCharacter {
       this.currentActionKey === "sittingTalking"
     ) {
       text = "Comentando con el equipo";
+      badgeTag = "☕";
     } else if (
       /esperando respuesta|permiso|pregunta|confirmación|delegando|fallo/i.test(
         `${rawTask} ${rawLabel}`,
@@ -280,21 +304,25 @@ export class AgentCharacter {
     ) {
       if (/delegando/i.test(`${rawTask} ${rawLabel}`)) {
         text = "Delegando tarea al equipo";
+        badgeTag = "🌿";
       } else if (/permiso/i.test(`${rawTask} ${rawLabel}`)) {
         text = "Necesita tu permiso";
+        badgeTag = "💡";
       } else if (/fallo/i.test(`${rawTask} ${rawLabel}`)) {
         text = "Revisando un inconveniente";
         color = "#FB7185";
+        badgeTag = "🐛";
       } else {
         text = "Tiene una pregunta para ti";
         color = "#FCD34D";
+        badgeTag = "💡";
       }
     }
 
     const shouldShow = Boolean(this.bubblesEnabled && text);
     this.bubble.setVisible(shouldShow);
     if (shouldShow) {
-      this.bubble.setStatus(text, color);
+      this.bubble.setStatus(text, color, badgeTag);
     }
   }
 
@@ -411,7 +439,10 @@ export class AgentCharacter {
     onSeated?.();
   }
 
-  applyActionProfile(actionKey, { customLabel = null } = {}) {
+  applyActionProfile(
+    actionKey,
+    { customLabel = null, overrideProp = null } = {},
+  ) {
     const profile = ACTION_PROFILES[actionKey] || {
       anim: actionKey,
       prop: null,
@@ -424,7 +455,7 @@ export class AgentCharacter {
 
     this.currentActionKey = actionKey;
     this.currentActionLabel = customLabel || profile.label;
-    this.propSockets.attach(profile.prop || null, {
+    this.propSockets.attach(overrideProp || profile.prop || null, {
       secondaryPropKey: profile.secondaryProp || null,
       handOverride: profile.handOverride || null,
     });
@@ -557,7 +588,16 @@ export class AgentCharacter {
     this.gazeWorldTarget = null;
     this.currentActionLabel = "Desplazándose por oficina";
     this.locomotion.setPath([]);
-    this.propSockets.detachAll();
+    if (this.carryingDrinkProp) {
+      this.propSockets.attach(this.carryingDrinkProp, {
+        handOverride: "left",
+        carryPose: true,
+      });
+      this.animator.setCarryingDrink(true);
+    } else {
+      this.propSockets.detachAll();
+      this.animator.setCarryingDrink(false);
+    }
     this.animator.setProceduralMode(null);
     this.animator.setHeadGazeTarget(0, 0);
     this.animator.setPingPongRallyState({ active: false });
@@ -981,13 +1021,14 @@ export class AgentCharacter {
         this.isSeated &&
         !this.isTransitioningSeat &&
         this.state !== "TRAVELING",
+      mood: this.mood,
     };
   }
 
   notifyStateChange() {
     if (!this.onUpdate) return;
     const snap = this.getSnapshot();
-    const signature = `${snap.state}|${snap.animation}|${snap.actionLabel}|${snap.taskTitle || ""}|${snap.socialMode || ""}|${snap.socialPhase || ""}|${snap.socialPartnerName || ""}|${snap.propKey || ""}|${snap.zone}|${snap.checkpointId}|${snap.isSeated ? 1 : 0}|${snap.isPhysicallyAtDesk ? 1 : 0}|${snap.name}|${snap.role}|${snap.color}`;
+    const signature = `${snap.state}|${snap.animation}|${snap.actionLabel}|${snap.taskTitle || ""}|${snap.socialMode || ""}|${snap.socialPhase || ""}|${snap.socialPartnerName || ""}|${snap.propKey || ""}|${snap.zone}|${snap.checkpointId}|${snap.isSeated ? 1 : 0}|${snap.isPhysicallyAtDesk ? 1 : 0}|${snap.name}|${snap.role}|${snap.color}|${snap.mood || ""}`;
     if (signature === this._lastEmittedSignature) {
       return;
     }
@@ -998,23 +1039,39 @@ export class AgentCharacter {
   update(delta, allCharacters = []) {
     const dt = Math.min(delta, 0.05);
 
-    // Actualizar objetivo relativo de mirada procedural (cabeza/cuello) hacia compañero o pelota
-    if (this.gazeWorldTarget && this.model && this.state !== "TRAVELING") {
-      const dx = this.gazeWorldTarget.x - this.model.position.x;
-      const dz = this.gazeWorldTarget.z - this.model.position.z;
-      if (dx * dx + dz * dz > 0.01) {
-        const worldYaw = Math.atan2(dx, dz);
-        let relYaw = worldYaw - this.model.rotation.y;
-        while (relYaw < -Math.PI) relYaw += Math.PI * 2;
-        while (relYaw > Math.PI) relYaw -= Math.PI * 2;
-        const targetY =
-          typeof this.gazeWorldTarget.y === "number"
-            ? this.gazeWorldTarget.y
-            : this.model.position.y + 1.1;
-        const horizDist = Math.max(0.4, Math.hypot(dx, dz));
-        const eyeY = this.model.position.y + (this.isSeated ? 1.12 : 1.56);
-        const relPitch = -Math.atan2(targetY - eyeY, horizDist) * 0.55;
-        this.animator.setHeadGazeTarget(relYaw, relPitch);
+    this.animator.setThinkingPose(this.state === "THINKING");
+
+    if (this.state === "TRAVELING") {
+      // Anticipación de camino: mirar ligeramente hacia la curva / siguiente waypoint
+      this.animator.setHeadGazeTarget(
+        this.locomotion.lookAheadYawOffset || 0,
+        0,
+      );
+    } else if (this.model) {
+      // Objetivo de mirada explícito (reunión, charla, ping-pong) o seguimiento automático de compañero que pasa (< 2.5m)
+      const activeTarget =
+        this.gazeWorldTarget ||
+        this.animator.ik.updatePasserbyTracking(this, allCharacters, dt);
+
+      if (activeTarget) {
+        const dx = activeTarget.x - this.model.position.x;
+        const dz = activeTarget.z - this.model.position.z;
+        if (dx * dx + dz * dz > 0.01) {
+          const worldYaw = Math.atan2(dx, dz);
+          let relYaw = worldYaw - this.model.rotation.y;
+          while (relYaw < -Math.PI) relYaw += Math.PI * 2;
+          while (relYaw > Math.PI) relYaw -= Math.PI * 2;
+          const targetY =
+            typeof activeTarget.y === "number"
+              ? activeTarget.y
+              : this.model.position.y + 1.1;
+          const horizDist = Math.max(0.4, Math.hypot(dx, dz));
+          const eyeY = this.model.position.y + (this.isSeated ? 1.12 : 1.56);
+          const relPitch = -Math.atan2(targetY - eyeY, horizDist) * 0.55;
+          this.animator.setHeadGazeTarget(relYaw, relPitch);
+        }
+      } else {
+        this.animator.setHeadGazeTarget(0, 0);
       }
     }
 

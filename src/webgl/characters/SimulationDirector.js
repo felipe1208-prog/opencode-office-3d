@@ -1,7 +1,11 @@
+import * as THREE from "three";
 import { checkpointManager } from "../interaction/CheckpointManager.js";
 import { officeEventBus, OFFICE_EVENTS } from "../../events/OfficeEventBus.js";
 import { taskBoardManager } from "../../state/officeWorkspace.js";
 import { VisualActionQueue } from "./VisualActionQueue.js";
+import { BehavioralEngine } from "./BehavioralEngine.js";
+
+const WHITEBOARD_WORLD_TARGET = { x: 1.85, y: 1.95, z: -8.92 };
 
 const SOLO_DESTINATIONS = [
   { checkpointId: "kitchen-espresso", action: "makeCoffee" },
@@ -88,6 +92,7 @@ export class SimulationDirector {
       monitorSystem = null,
       pingPongArea = null,
       coffeeArea = null,
+      propPersistence = null,
     } = {},
   ) {
     this.characterManager = characterManager;
@@ -95,6 +100,11 @@ export class SimulationDirector {
     this.monitorSystem = monitorSystem;
     this.pingPongArea = pingPongArea;
     this.coffeeArea = coffeeArea;
+    this.propPersistence = propPersistence;
+    this.behavioralEngine = new BehavioralEngine(
+      this.characterManager,
+      this.propPersistence,
+    );
 
     this.paused = false;
     this.speedMultiplier = 1; // 1 | 1.5 | 2
@@ -359,11 +369,19 @@ export class SimulationDirector {
       }
 
       if (barrier.kind === "delegation" || barrier.kind === "team_meeting") {
+        const hostP = list.find((p) => p.role === "host") || list[0];
+        const hostAgent = this.characterManager.getAgent(hostP?.agentId);
+        const hostPointingAtBoard =
+          p.role === "host" ? isSpeaker : activeIdx === 0 && speakerIndex % 2 === 1;
+
         if (p.role === "host") {
           const action = isSpeaker ? "presenting" : "talking";
           agent.applyActionProfile(action, {
             customLabel: barrier.topic,
           });
+          agent.setGazeWorldTarget(
+            hostPointingAtBoard ? WHITEBOARD_WORLD_TARGET : null,
+          );
         } else {
           const action = isSpeaker
             ? "listening"
@@ -373,6 +391,17 @@ export class SimulationDirector {
           agent.applyActionProfile(action, {
             customLabel: barrier.topic,
           });
+          // Los asistentes miran a la pizarra cuando @architect señala un diagrama, o al orador activo
+          const activeSpeakerAgent = this.characterManager.getAgent(
+            list[activeIdx]?.agentId,
+          );
+          agent.setGazeWorldTarget(
+            hostPointingAtBoard
+              ? WHITEBOARD_WORLD_TARGET
+              : activeSpeakerAgent?.model?.position ||
+                  hostAgent?.model?.position ||
+                  null,
+          );
         }
       }
     });
@@ -922,6 +951,13 @@ export class SimulationDirector {
     const agent = this.characterManager.getAgent(agentId);
     if (!agent) return false;
 
+    // Interrupción rápida y natural: depositar cualquier prop físico (taza/vaso) en su sitio
+    this.propPersistence?.interruptForLiveTask(agentId);
+    this.behavioralEngine?.recordTaskEvent(agentId, {
+      type: "task",
+      status: "started",
+    });
+
     this.liveOwnership.set(agentId, {
       active: true,
       idleCooldown: 0,
@@ -952,12 +988,56 @@ export class SimulationDirector {
     return true;
   }
 
+  _triggerEmotionalReaction(agent, { status = "passed", label = null } = {}) {
+    if (!agent) return;
+    const agentId = agent.config.id;
+    this.behavioralEngine?.recordTaskEvent(agentId, {
+      type: "task",
+      status,
+    });
+
+    if (status === "passed") {
+      agent.setContextualBubble(label || "¡Objetivo completado!", {
+        color: "#34D399",
+        badge: "✨",
+        durationMs: 4000,
+      });
+
+      // Si hay un compañero libre sentado cerca (< 3.4m en DevArea), gira la cabeza y felicita
+      for (const peer of this.characterManager.characters) {
+        if (peer.config.id === agentId || !peer.isPhysicallyAtDesk()) continue;
+        if (this.isAgentLiveBusy(peer.config.id) || peer.socialMode) continue;
+        const d = peer.model.position.distanceTo(agent.model.position);
+        if (d < 3.4) {
+          peer.setGazeWorldTarget(agent.model.position);
+          peer.setContextualBubble("¡Buen merge!", {
+            color: "#34D399",
+            badge: "✨",
+            durationMs: 2600,
+          });
+          peer.scheduleTimer(() => {
+            if (!peer.socialMode) peer.setGazeWorldTarget(null);
+          }, 2600);
+          break;
+        }
+      }
+    } else if (status === "failed") {
+      agent.setContextualBubble(label || "Revisando incidente", {
+        color: "#FB7185",
+        badge: "🐛",
+        durationMs: 4200,
+      });
+    }
+  }
+
   releaseAgentFromLiveTask(
     agentId,
     { status = "passed", label = null, file = null, idleCooldownSec = 15 } = {},
   ) {
     const agent = this.characterManager.getAgent(agentId);
     if (!agent) return false;
+
+    this._triggerEmotionalReaction(agent, { status, label });
 
     const isUrgent =
       status === "failed" &&
@@ -1063,15 +1143,32 @@ export class SimulationDirector {
       officeEventBus.on(OFFICE_EVENTS.OPENCODE_TOOL_ACTIVITY, (payload) => {
         if (!payload?.agentId) return;
         this.monitorSystem?.setAgentLiveActivity(payload.agentId, payload);
+        this.behavioralEngine?.recordTaskEvent(payload.agentId, {
+          type: "tool",
+          status: payload.status || "running",
+        });
         if (payload.status === "error") {
           const agent = this.characterManager.getAgent(payload.agentId);
           if (agent && typeof agent.setContextualBubble === "function") {
             const label = payload.label || "Error en comando";
             agent.setContextualBubble(`${label} falló`, {
               color: "#FB7185",
+              badge: "🐛",
               durationMs: 4200,
             });
           }
+        }
+      }),
+
+      officeEventBus.on(OFFICE_EVENTS.OFFICE_PEER_REVIEW, (payload) => {
+        const fromId = payload?.fromAgentId || payload?.reviewerId;
+        const toId = payload?.toAgentId || payload?.hostAgentId;
+        if (fromId && toId && fromId !== toId) {
+          this.triggerDeskReview(
+            toId,
+            fromId,
+            payload?.summary || "Revisión entre especialistas",
+          );
         }
       }),
 
@@ -1129,6 +1226,10 @@ export class SimulationDirector {
         const timer = this.agentTimers.get(payload.agentId);
         if (timer) {
           timer.workCooldown = 14 + Math.random() * 6;
+        }
+
+        if (payload.status === "passed" || payload.status === "failed") {
+          this._triggerEmotionalReaction(agent, payload);
         }
 
         let screenMode = "WORKING";
@@ -1633,6 +1734,8 @@ export class SimulationDirector {
 
     const scaledDelta = delta * this.speedMultiplier;
     this.visualQueue.tick(scaledDelta * 1000, this.queueHandlers);
+    this.propPersistence?.update(scaledDelta, this);
+    this.behavioralEngine?.update(scaledDelta, this);
 
     for (const agent of this.characterManager.characters) {
       const agentId = agent.config.id;
@@ -1676,46 +1779,22 @@ export class SimulationDirector {
 
           if (this.isOpenCodeConnected) {
             // MODO LIVE REAL: nunca emitir tareas simuladas ni code reviews falsos.
-            // Los agentes libres hacen micro-pausas orgánicas o descansan por la oficina.
-            const roll = Math.random();
-            if (roll < 0.42) {
-              timer.workCooldown = 18 + Math.random() * 14;
-            } else if (roll < 0.56 && this._isAgentPhysicallyAtDesk(agent)) {
-              const microAction = Math.random() < 0.52 ? "stretchBreak" : "coffeeSipDesk";
-              agent.applyActionProfile(microAction);
-              agent.scheduleTimer(() => {
-                if (
-                  agent.currentActionKey === microAction &&
-                  this._isAgentPhysicallyAtDesk(agent) &&
-                  !this.isAgentLiveBusy(agentId)
-                ) {
-                  agent.applyActionProfile("typing", {
-                    customLabel: "Disponible",
-                  });
-                }
-              }, 5200);
-              timer.workCooldown = 16 + Math.random() * 10;
-            } else if (roll < 0.68 && this.triggerPairChat(agentId)) {
-              timer.workCooldown = 22 + Math.random() * 12;
-            } else if (roll < 0.74 && this.triggerPingPongMatch()) {
-              timer.workCooldown = 24 + Math.random() * 12;
-            } else {
-              const availablePool = SOLO_DESTINATIONS.filter((d) =>
-                checkpointManager.isAvailable(d.checkpointId),
-              );
-              const pool =
-                availablePool.length > 0 ? availablePool : SOLO_DESTINATIONS;
-              const pick = pool[Math.floor(Math.random() * pool.length)];
-              this.sendAgentTo(agentId, pick.checkpointId, pick.action);
-              timer.workCooldown = 20 + Math.random() * 14;
+            // El Motor de Utilidad (BehavioralEngine) decide micro-pausas, hidratación o socialización.
+            if (Math.random() < 0.35) {
+              timer.workCooldown = 16 + Math.random() * 12;
+              continue;
             }
+            const acted = this.behavioralEngine?.evaluateAndAct(agent, this);
+            timer.workCooldown = acted
+              ? 20 + Math.random() * 14
+              : 14 + Math.random() * 10;
             continue;
           }
 
-          // MODO DEMO OFFLINE: exhibición autónoma completa
+          // MODO DEMO OFFLINE: exhibición autónoma impulsada por Utility AI + eventos de repositorio
           const roll = Math.random();
-          if (roll < 0.2) {
-            const isSuccess = Math.random() < 0.65;
+          if (roll < 0.18) {
+            const isSuccess = Math.random() < 0.68;
             const sample =
               SAMPLE_TASKS[Math.floor(Math.random() * SAMPLE_TASKS.length)];
             officeEventBus.emit(
@@ -1728,25 +1807,13 @@ export class SimulationDirector {
               },
               "mock-director",
             );
-            timer.workCooldown = 11 + Math.random() * 7;
-          } else if (roll < 0.3 && this._isAgentPhysicallyAtDesk(agent)) {
-            const microAction = Math.random() < 0.5 ? "stretchBreak" : "coffeeSipDesk";
-            agent.applyActionProfile(microAction);
-            agent.scheduleTimer(() => {
-              if (
-                agent.currentActionKey === microAction &&
-                this._isAgentPhysicallyAtDesk(agent)
-              ) {
-                agent.applyActionProfile("typing");
-              }
-            }, 5200);
-            timer.workCooldown = 12 + Math.random() * 8;
-          } else if (roll < 0.44 && this.triggerPairChat(agentId)) {
-            timer.workCooldown = 14 + Math.random() * 8;
-          } else if (roll < 0.54 && this.triggerDeskReview(agentId)) {
-            timer.workCooldown = 15 + Math.random() * 8;
-          } else if (roll < 0.62 && this.triggerPingPongMatch()) {
-            timer.workCooldown = 18 + Math.random() * 8;
+            timer.workCooldown = 12 + Math.random() * 7;
+            continue;
+          }
+
+          const acted = this.behavioralEngine?.evaluateAndAct(agent, this);
+          if (acted) {
+            timer.workCooldown = 14 + Math.random() * 9;
           } else {
             const availablePool = SOLO_DESTINATIONS.filter((d) =>
               checkpointManager.isAvailable(d.checkpointId),
@@ -1755,7 +1822,7 @@ export class SimulationDirector {
               availablePool.length > 0 ? availablePool : SOLO_DESTINATIONS;
             const pick = pool[Math.floor(Math.random() * pool.length)];
             this.sendAgentTo(agentId, pick.checkpointId, pick.action);
-            timer.workCooldown = 12 + Math.random() * 8;
+            timer.workCooldown = 13 + Math.random() * 8;
           }
         }
       } else if (agent.state === "INTERACTING") {
@@ -1779,7 +1846,7 @@ export class SimulationDirector {
     }
 
     // Sincronizar props ambientales reactivos (pelota ping-pong, arcade, vapor de cafeteras)
-    this._syncInteractiveEnvironmentProps();
+    this._syncInteractiveEnvironmentProps(scaledDelta);
 
     if (this.isOpenCodeConnected) {
       this._liveTvSyncAccum += delta;
@@ -1790,7 +1857,7 @@ export class SimulationDirector {
     }
   }
 
-  _syncInteractiveEnvironmentProps() {
+  _syncInteractiveEnvironmentProps(delta = 0.016) {
     let espressoActive = false;
     let dripActive = false;
     let sinkActive = false;
@@ -1821,6 +1888,18 @@ export class SimulationDirector {
           side,
         });
         agent.setGazeWorldTarget(rallyState.ballPos);
+
+        // Desplazamiento lateral sincronizado de los jugadores siguiendo la pelota 3D
+        if (rallyState.ballPos) {
+          const lateralOffset = (rallyState.ballPos.x - 7.5) * (side === "north" ? 0.85 : 0.78);
+          const targetPlayerX = 7.5 + THREE.MathUtils.clamp(lateralOffset, -0.34, 0.34);
+          agent.model.position.x = THREE.MathUtils.damp(
+            agent.model.position.x,
+            targetPlayerX,
+            7.5,
+            delta,
+          );
+        }
       } else if (agent.animator.rallyActive) {
         agent.animator.setPingPongRallyState({ active: false });
       }

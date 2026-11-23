@@ -339,7 +339,7 @@ export class PropSocketManager {
     return group;
   }
 
-  _mountPropOnHand(propKey, handOverride = null) {
+  _mountPropOnHand(propKey, handOverride = null, carryPose = false) {
     if (!propKey) return false;
     const node = this.props.get(propKey);
     const def = PROP_DEFS[propKey];
@@ -351,13 +351,17 @@ export class PropSocketManager {
       targetSocket.add(node);
     }
 
-    if (targetHand === "left" && def.leftOffset) {
+    if (carryPose && def.carryOffset) {
+      node.position.set(...def.carryOffset);
+    } else if (targetHand === "left" && def.leftOffset) {
       node.position.set(...def.leftOffset);
     } else if (def.offset) {
       node.position.set(...def.offset);
     }
 
-    if (targetHand === "left" && def.leftRotation) {
+    if (carryPose && def.carryRotation) {
+      node.rotation.set(...def.carryRotation);
+    } else if (targetHand === "left" && def.leftRotation) {
       node.rotation.set(...def.leftRotation);
     } else if (def.rotation) {
       node.rotation.set(...def.rotation);
@@ -367,13 +371,16 @@ export class PropSocketManager {
     return true;
   }
 
-  attach(propKey, { secondaryPropKey = null, handOverride = null } = {}) {
-    const signature = `${propKey || ""}:${handOverride || ""}+${secondaryPropKey || ""}`;
+  attach(
+    propKey,
+    { secondaryPropKey = null, handOverride = null, carryPose = false } = {},
+  ) {
+    const signature = `${propKey || ""}:${handOverride || ""}:${carryPose ? "carry" : "std"}+${secondaryPropKey || ""}`;
     if (this._activeSignature === signature) return;
     this.detachAll();
     if (!propKey && !secondaryPropKey) return;
 
-    if (propKey && this._mountPropOnHand(propKey, handOverride)) {
+    if (propKey && this._mountPropOnHand(propKey, handOverride, carryPose)) {
       this.activePropKey = propKey;
     }
 
@@ -387,7 +394,7 @@ export class PropSocketManager {
           : primaryHand === "right"
             ? "left"
             : "right";
-      this._mountPropOnHand(secondaryPropKey, secHand);
+      this._mountPropOnHand(secondaryPropKey, secHand, false);
       this.secondaryPropKey = secondaryPropKey;
     }
 
