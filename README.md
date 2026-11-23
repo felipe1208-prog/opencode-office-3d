@@ -167,9 +167,9 @@ Antes de guardarlo, ajusta únicamente estos dos valores:
 
 Abre **3 terminales**: la primera dentro de la carpeta del proyecto donde vas a programar, y la segunda y tercera dentro de la carpeta de esta oficina.
 
-**Terminal 1 — Servidor de OpenCode** *(dentro de la carpeta de tu proyecto)*:
+**Terminal 1 — Servidor de OpenCode** *(dentro de la carpeta de tu proyecto — incluye logs en vivo para ver herramientas y respuestas del modelo)*:
 ```bash
-opencode serve --port 4096 --hostname 127.0.0.1
+opencode serve --port 4096 --hostname 127.0.0.1 --print-logs --log-level DEBUG
 ```
 
 **Terminal 2 — Puente local de la oficina** *(dentro de `oficina-virtual-3d`)*:
@@ -244,6 +244,7 @@ Gracias al servidor MCP incluido (`office-spatial`) y a Tavily, los 5 agentes cu
 
 - **OpenCode no lee `opencode.json` en Windows:** Comprueba que el archivo esté guardado en **UTF-8 sin BOM** y que la ruta hacia `office-spatial-server.js` use diagonales `/` (o doble barra invertida `\\`).
 - **El botón *Conectar* marca error o no ve sesiones:** Verifica que las 3 terminales estén activas (`opencode serve` en `:4096`, `npm run opencode:bridge` en `:4097` y `npm run dev` en `:3000`) y selecciona el modo **Puente local (:4097)** dentro de **OpenCode → Ajustes**.
+- **Un agente parece bloqueado, corre en otra carpeta o falla el modelo gratuito:** Abre **Ajustes → Conexión → Diagnóstico en vivo** para comprobar que la carpeta del puente coincida con la que reporta OpenCode, verificar el estado del enlace SSE y consultar los últimos errores del puente. Las sesiones creadas en otras carpetas se filtran automáticamente para abrir siempre una sesión limpia en tu proyecto, y ante límites de cuota o errores del servidor el agente se libera mostrando el motivo real junto a un botón **Reintentar**.
 - **El Inspector de Git muestra otra carpeta:** Abre **Ajustes → Proyecto** y pega la ruta exacta del repositorio donde lanzaste `opencode serve`.
 - **Un agente no puede buscar en internet:** Revisa que hayas pegado tu clave válida de [tavily.com](https://tavily.com) en `TAVILY_API_KEY` dentro de `opencode.json` y reinicia `opencode serve`.
 - **¿Quieres más detalles técnicos de configuración?** Consulta también la guía complementaria [`GUIA_CONFIGURACION_OPENCODE.md`](GUIA_CONFIGURACION_OPENCODE.md).

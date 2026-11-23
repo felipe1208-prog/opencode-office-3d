@@ -55,9 +55,9 @@ opencode attach http://127.0.0.1:4096
 
 ### Opción B — Con Puente Local Node (CORS + Basic Auth + MCP Espacial)
 
-1. Arranca OpenCode en local:
+1. Arranca OpenCode en local dentro de la carpeta de tu proyecto:
    ```bash
-   opencode serve --port 4096
+   opencode serve --port 4096 --hostname 127.0.0.1 --print-logs --log-level DEBUG
    ```
 2. Arranca el puente incluido en este repositorio:
    ```bash

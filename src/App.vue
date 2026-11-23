@@ -30,6 +30,9 @@ import {
   GitBranch,
   FolderOpen,
   Bell,
+  RefreshCw,
+  Activity,
+  CheckCircle2,
 } from "@lucide/vue";
 import { Resources } from "./webgl/core/Resources";
 import { Experience } from "./webgl/Experience";
@@ -76,6 +79,10 @@ const workspaceDirInput = ref("");
 const workspaceDirFeedback = ref(null);
 const isApplyingWorkspaceDir = ref(false);
 const toolActivityList = ref([]);
+const bridgeDiagnostics = ref(null);
+const isLoadingDiagnostics = ref(false);
+const showDiagErrors = ref(false);
+const retryingEntryId = ref(null);
 
 const audioMode = ref(ambientAudio.getMode());
 const DESKTOP_NOTIF_KEY = "oficina3d:desktop_notifications:v1";
@@ -852,11 +859,65 @@ async function handleApplyWorkspaceDir() {
         ? `Proyecto activo: ${res.projectName} (rama ${res.branch || "HEAD"})`
         : `Carpeta activa actualizada: ${res.projectName}`,
     };
+    handleRefreshDiagnostics();
   } else {
     workspaceDirFeedback.value = {
       ok: false,
       text: res.error || "No se pudo cambiar la carpeta del proyecto.",
     };
+  }
+}
+
+async function handleRefreshDiagnostics() {
+  if (isLoadingDiagnostics.value) return;
+  isLoadingDiagnostics.value = true;
+  try {
+    bridgeDiagnostics.value = await openCodeBridge.fetchBridgeDiagnostics();
+  } finally {
+    isLoadingDiagnostics.value = false;
+  }
+}
+
+function formatDiagTime(ts) {
+  if (!ts) return "Sin registro";
+  try {
+    return new Date(ts).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
+
+async function handleRetryFailedPrompt(entry) {
+  const payload = entry?.retryPayload;
+  if (!payload?.text || isSendingPrompt.value) return;
+  retryingEntryId.value = entry.id || "retry";
+  isSendingPrompt.value = true;
+  commandFeedback.value = null;
+  const targetAgent = payload.agentId || commandForm.agent || "architect";
+  const targetSid = payload.sessionId || activeLogSessionId.value || null;
+  try {
+    const res = await openCodeBridge.sendPrompt({
+      sessionId: targetSid,
+      agent: targetAgent,
+      text: payload.text,
+      useActiveFallback: false,
+    });
+    if (res.ok) {
+      if (res.sessionId) commandForm.sessionId = res.sessionId;
+      nextTick(() => scrollLogToBottom(true));
+    } else {
+      commandFeedback.value = {
+        ok: false,
+        text: res.error || "No se pudo reintentar la instrucción",
+      };
+    }
+  } finally {
+    isSendingPrompt.value = false;
+    retryingEntryId.value = null;
   }
 }
 
@@ -1160,6 +1221,9 @@ function handleDismissInquiry(inquiry) {
 function openSettingsModal(tab = "connection") {
   settingsTab.value = tab;
   isSettingsModalOpen.value = true;
+  if (tab === "connection") {
+    handleRefreshDiagnostics();
+  }
 }
 
 function dismissBlockedAlert(task) {
@@ -2498,12 +2562,36 @@ onBeforeUnmount(() => {
               <div v-else class="text-xs text-[#B5AEA4]">Escribiendo...</div>
             </div>
 
-            <!-- Error legible -->
+            <!-- Error legible con botón directo Reintentar -->
             <div
               v-else-if="entry.kind === 'error'"
-              class="rounded-xl bg-[#FB7185]/12 border border-[#FB7185]/30 px-3 py-2 text-xs text-[#FECDD3] select-text"
+              class="rounded-xl bg-[#FB7185]/12 border border-[#FB7185]/30 px-3 py-2.5 text-xs text-[#FECDD3] space-y-2 select-text"
             >
-              {{ entry.content }}
+              <div class="flex items-start gap-2">
+                <AlertTriangle class="w-3.5 h-3.5 text-[#FB7185] shrink-0 mt-0.5" />
+                <div class="min-w-0 flex-1 break-words leading-relaxed">
+                  {{ entry.content }}
+                </div>
+              </div>
+              <div
+                v-if="entry.retryPayload?.text && openCodeState.status === 'connected'"
+                class="flex items-center justify-end"
+              >
+                <button
+                  type="button"
+                  :disabled="isSendingPrompt"
+                  @click="handleRetryFailedPrompt(entry)"
+                  class="px-2.5 py-1 rounded-lg bg-[#FB7185]/20 hover:bg-[#FB7185]/30 border border-[#FB7185]/40 text-[11px] font-medium text-[#FFE4E6] flex items-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-45"
+                >
+                  <RotateCcw
+                    :class="[
+                      'w-3 h-3',
+                      retryingEntryId === entry.id ? 'animate-spin' : '',
+                    ]"
+                  />
+                  <span>{{ retryingEntryId === entry.id ? "Reintentando..." : "Reintentar" }}</span>
+                </button>
+              </div>
             </div>
           </template>
 
@@ -2948,6 +3036,186 @@ onBeforeUnmount(() => {
               </div>
               <div v-if="openCodeState.lastError" class="text-[#FDA4AF]">
                 {{ openCodeState.lastError }}
+              </div>
+            </div>
+
+            <!-- Diagnóstico rápido en vivo (directorio, SSE y últimos errores del puente) -->
+            <div class="rounded-xl bg-black/20 border border-white/[0.08] p-3.5 space-y-2.5 text-xs">
+              <div class="flex items-center justify-between gap-2">
+                <div class="flex items-center gap-1.5 font-medium text-[#F6EFE6]">
+                  <Activity class="w-3.5 h-3.5 text-[#E09F5A]" />
+                  <span>Diagnóstico en vivo</span>
+                </div>
+                <button
+                  type="button"
+                  :disabled="isLoadingDiagnostics"
+                  @click="handleRefreshDiagnostics"
+                  class="px-2.5 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.08] text-[11px] font-medium text-[#EAE4DC] flex items-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-50"
+                >
+                  <RefreshCw
+                    :class="['w-3 h-3', isLoadingDiagnostics ? 'animate-spin' : '']"
+                  />
+                  <span>{{ isLoadingDiagnostics ? "Comprobando..." : "Comprobar ahora" }}</span>
+                </button>
+              </div>
+
+              <div v-if="bridgeDiagnostics && !bridgeDiagnostics.offline" class="space-y-2">
+                <!-- Verificación de carpeta puente vs OpenCode -->
+                <div class="rounded-lg bg-black/25 border border-white/[0.06] p-2.5 space-y-1.5">
+                  <div class="flex items-center justify-between gap-2 text-[11px]">
+                    <span class="text-[#A39B90]">Proyecto activo en puente</span>
+                    <span
+                      v-if="bridgeDiagnostics.directoryMatches === true"
+                      class="text-[#34D399] flex items-center gap-1 font-medium whitespace-nowrap"
+                    >
+                      <CheckCircle2 class="w-3 h-3" />
+                      <span>Sincronizado con :4096</span>
+                    </span>
+                    <span
+                      v-else-if="bridgeDiagnostics.directoryMatches === false"
+                      class="text-[#FBBF24] flex items-center gap-1 font-medium whitespace-nowrap"
+                    >
+                      <AlertTriangle class="w-3 h-3" />
+                      <span>Carpeta distinta en :4096</span>
+                    </span>
+                    <span v-else class="text-[#A39B90] whitespace-nowrap">
+                      {{ bridgeDiagnostics.upstreamOk ? "Enlazado por cabecera" : "Sin respuesta de :4096" }}
+                    </span>
+                  </div>
+                  <div class="font-mono text-[11px] text-[#EAE4DC] break-all select-text">
+                    {{ bridgeDiagnostics.bridgeProjectDir || "No configurado" }}
+                  </div>
+                  <div
+                    v-if="bridgeDiagnostics.openCodeDirectory"
+                    class="pt-1 border-t border-white/[0.06] text-[11px]"
+                  >
+                    <span class="text-[#A39B90]">Reportado por OpenCode: </span>
+                    <span
+                      :class="[
+                        'font-mono break-all select-text',
+                        bridgeDiagnostics.directoryMatches === false
+                          ? 'text-[#FDE68A]'
+                          : 'text-[#C8C0B5]',
+                      ]"
+                    >
+                      {{ bridgeDiagnostics.openCodeDirectory }}
+                    </span>
+                  </div>
+                </div>
+
+                <!-- Estado SSE y sesiones filtradas -->
+                <div class="grid grid-cols-2 sm:grid-cols-3 gap-2 text-[11px] tabular-nums">
+                  <div class="rounded-lg bg-black/20 border border-white/[0.06] px-2.5 py-1.5">
+                    <div class="text-[#8C847A]">Stream SSE</div>
+                    <div
+                      :class="[
+                        'font-medium mt-0.5',
+                        openCodeState.status === 'connected'
+                          ? 'text-[#34D399]'
+                          : openCodeState.status === 'connecting'
+                            ? 'text-[#FBBF24]'
+                            : 'text-[#FDA4AF]',
+                      ]"
+                    >
+                      {{
+                        openCodeState.status === "connected"
+                          ? `Activo (${formatDiagTime(bridgeDiagnostics.lastSseEventAt || openCodeState.lastChunkAt)})`
+                          : openCodeState.status === "connecting"
+                            ? "Reconectando..."
+                            : "Inactivo"
+                      }}
+                    </div>
+                  </div>
+                  <div class="rounded-lg bg-black/20 border border-white/[0.06] px-2.5 py-1.5">
+                    <div class="text-[#8C847A]">Sesiones proyecto</div>
+                    <div class="font-medium text-[#F3EFE8] mt-0.5">
+                      {{ openCodeState.sessionsCount }}
+                      <span
+                        v-if="openCodeState.filteredOutSessionsCount > 0"
+                        class="text-[#A39B90] font-normal"
+                      >
+                        ({{ openCodeState.filteredOutSessionsCount }} externas ocultas)
+                      </span>
+                    </div>
+                  </div>
+                  <div class="rounded-lg bg-black/20 border border-white/[0.06] px-2.5 py-1.5 col-span-2 sm:col-span-1">
+                    <div class="text-[#8C847A]">Errores puente</div>
+                    <div
+                      :class="[
+                        'font-medium mt-0.5',
+                        (bridgeDiagnostics.recentErrors?.length || 0) > 0
+                          ? 'text-[#FDA4AF]'
+                          : 'text-[#34D399]',
+                      ]"
+                    >
+                      {{ bridgeDiagnostics.recentErrors?.length || 0 }} recientes
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Comando recomendado con trazas DEBUG -->
+                <div class="rounded-lg bg-black/25 border border-white/[0.06] px-2.5 py-2 flex items-center justify-between gap-2">
+                  <div class="min-w-0">
+                    <div class="text-[10px] text-[#A39B90]">
+                      Comando recomendado para ver logs en vivo en la terminal de OpenCode:
+                    </div>
+                    <div class="font-mono text-[10px] text-[#F6C894] truncate select-text mt-0.5">
+                      {{ bridgeDiagnostics.recommendedCommand || OPENCODE_CLI_COMMANDS.serveDebug }}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    @click="copySnippet('serveDebug', bridgeDiagnostics.recommendedCommand || OPENCODE_CLI_COMMANDS.serveDebug)"
+                    class="px-2 py-1 rounded-lg bg-white/[0.07] hover:bg-white/[0.12] text-[10px] text-[#F3EFE8] flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <Check v-if="copiedKey === 'serveDebug'" class="w-3 h-3 text-[#34D399]" />
+                    <Copy v-else class="w-3 h-3" />
+                    <span>{{ copiedKey === "serveDebug" ? "Copiado" : "Copiar" }}</span>
+                  </button>
+                </div>
+
+                <!-- Errores recientes colapsables -->
+                <div
+                  v-if="bridgeDiagnostics.recentErrors?.length > 0"
+                  class="rounded-lg bg-[#FB7185]/[0.07] border border-[#FB7185]/25 overflow-hidden"
+                >
+                  <button
+                    type="button"
+                    @click="showDiagErrors = !showDiagErrors"
+                    class="w-full px-2.5 py-1.5 flex items-center justify-between text-[11px] text-[#FECDD3] hover:bg-white/[0.04] cursor-pointer"
+                  >
+                    <span>
+                      Últimos errores del puente ({{ bridgeDiagnostics.recentErrors.length }})
+                    </span>
+                    <ChevronDown
+                      :class="[
+                        'w-3.5 h-3.5 transition-transform',
+                        showDiagErrors ? 'rotate-180' : '',
+                      ]"
+                    />
+                  </button>
+                  <div
+                    v-if="showDiagErrors"
+                    class="px-2.5 pb-2 space-y-1.5 max-h-36 overflow-y-auto border-t border-[#FB7185]/20 pt-1.5"
+                  >
+                    <div
+                      v-for="errItem in bridgeDiagnostics.recentErrors"
+                      :key="errItem.id"
+                      class="font-mono text-[10px] text-[#FFE4E6] flex items-start justify-between gap-2"
+                    >
+                      <span class="break-all">
+                        [{{ errItem.status }}] {{ errItem.method }} {{ errItem.path }} · {{ errItem.detail }}
+                      </span>
+                      <span class="text-[#FDA4AF]/75 shrink-0 tabular-nums">
+                        {{ formatDiagTime(errItem.timestamp) }}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div v-else class="text-[11px] text-[#A39B90]">
+                Inicia el puente local (<span class="font-mono text-[#F6C894]">npm run opencode:bridge</span>) y pulsa <strong>Comprobar ahora</strong> para inspeccionar el estado real de OpenCode.
               </div>
             </div>
           </div>

@@ -59,6 +59,8 @@ export const OPENCODE_JSON_SNIPPET = `{
 export const OPENCODE_CLI_COMMANDS = {
   serveDirect:
     "opencode serve --port 4096 --cors http://localhost:3000 --cors http://127.0.0.1:3000",
+  serveDebug:
+    "opencode serve --port 4096 --hostname 127.0.0.1 --print-logs --log-level DEBUG",
   runBridge: "npm run opencode:bridge",
   attachTui: "opencode attach http://127.0.0.1:4096",
 };
@@ -177,9 +179,9 @@ Herramientas disponibles para los 5 agentes:
 
 ### Opción B — Mediante Puente Local Node (puerto 4097, recomendado para CORS, Basic Auth y MCP Espacial)
 
-1. Inicia \`opencode serve\` (opcionalmente protegido con \`OPENCODE_SERVER_USERNAME\` y \`OPENCODE_SERVER_PASSWORD\`):
+1. Inicia \`opencode serve\` dentro de la carpeta de tu proyecto (con logs detallados para ver herramientas y errores del proveedor en vivo; opcionalmente protegido con \`OPENCODE_SERVER_USERNAME\` y \`OPENCODE_SERVER_PASSWORD\`):
    \`\`\`bash
-   opencode serve --port 4096
+   ${OPENCODE_CLI_COMMANDS.serveDebug}
    \`\`\`
 2. En otra terminal dentro del proyecto de la Oficina Virtual 3D, arranca el puente local sin dependencias externas:
    \`\`\`bash
@@ -205,6 +207,7 @@ Herramientas disponibles para los 5 agentes:
 - **No responde \`Probar conexión\`:** verifica que \`opencode serve\` esté escuchando en el puerto \`4096\` y que hayas iniciado con \`--cors\` incluyendo tu origen exacto (o usa \`npm run opencode:bridge\`).
 - **Error \`401 Unauthorized\`:** introduce el mismo usuario y contraseña de \`OPENCODE_SERVER_USERNAME\` / \`OPENCODE_SERVER_PASSWORD\` en el panel **OpenCode**.
 - **Los eventos llegan todos al mismo avatar:** revisa que tus subagentes usen los IDs \`frontend\`, \`qa\`, \`backend\`, \`systems\` o agrega los nombres reales de tus agentes en **OpenCode → Mapeo (5 Agentes)**.
+- **Un agente parece bloqueado o abre archivos de otra carpeta:** abre **Ajustes → Conexión → Diagnóstico en vivo** para confirmar que la carpeta del puente coincida con la que reporta OpenCode, revisar el estado del flujo SSE y consultar errores recientes del proveedor (como límites de uso gratuitos). Si una tarea falla por límite o desconexión, el agente se libera automáticamente y verás el botón **Reintentar** en su hilo.
 - **Las herramientas MCP espaciales dicen puente sin conexión:** ejecuta \`npm run opencode:bridge\` desde la carpeta del proyecto para activar \`http://127.0.0.1:4097\`.
 `;
 }

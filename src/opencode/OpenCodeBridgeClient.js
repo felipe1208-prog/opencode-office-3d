@@ -271,6 +271,8 @@ export class OpenCodeBridgeClient {
     this.activeStreamEntryIds = new Map();
     this.emittedDelegations = new Set();
     this.busySessionStartedAt = new Map();
+    this.busyPollFailCounts = new Map();
+    this.sessionLastPromptMap = new Map();
     this.busyMonitorTimer = null;
     this.reconcilingReleaseSessions = new Set();
 
@@ -283,6 +285,9 @@ export class OpenCodeBridgeClient {
     this.toolActivityByAgent = new Map();
     this.fileSnippetCache = new Map();
     this.workspaceSummary = null;
+    this.activeProjectDir = "";
+    this.filteredOutSessionsCount = 0;
+    this.lastDiagnostics = null;
 
     // Sincronización espacial 3D <-> puente local (:4097) para MCP
     this.lastSpatialSnapshot = null;
@@ -555,6 +560,7 @@ export class OpenCodeBridgeClient {
       subagentId: entry.subagentId || null,
       childSessionId: entry.childSessionId || null,
       reviewMeta: entry.reviewMeta || null,
+      retryPayload: entry.retryPayload || null,
       content: String(entry.content || ""),
       status: entry.status || "done",
       timestamp: entry.timestamp || Date.now(),
@@ -1076,6 +1082,10 @@ export class OpenCodeBridgeClient {
       lastError: this.lastError,
       eventsReceived: this.eventsReceived,
       lastEventAt: this.lastEventAt,
+      lastChunkAt: this.lastChunkAt,
+      activeProjectDir: this.activeProjectDir || this.workspaceSummary?.projectDir || "",
+      filteredOutSessionsCount: this.filteredOutSessionsCount,
+      busySessionsCount: this.busySessions.size,
       activeAgents: Array.from(this.activeAgents),
       sessionsCount: this.sessionsById.size,
       activeSessionId: this.activeSessionId,
@@ -2204,10 +2214,71 @@ export class OpenCodeBridgeClient {
     }
   }
 
+  _normalizeDirPath(dir) {
+    const raw = String(dir || "").trim();
+    if (!raw) return "";
+    let norm = raw.replace(/\\/g, "/").replace(/\/+$/, "");
+    if (/^[a-zA-Z]:\//.test(norm) || /^[a-zA-Z]:$/.test(norm)) {
+      norm = norm.toLowerCase();
+    }
+    return norm;
+  }
+
+  _extractSessionDirectory(sessionObj) {
+    if (!sessionObj || typeof sessionObj !== "object") return "";
+    return String(
+      sessionObj.directory ||
+        sessionObj.cwd ||
+        sessionObj.worktree ||
+        sessionObj.project?.worktree ||
+        sessionObj.metadata?.directory ||
+        "",
+    ).trim();
+  }
+
+  _isSessionInActiveProject(sessionObj) {
+    const activeNorm = this._normalizeDirPath(
+      this.activeProjectDir || this.workspaceSummary?.projectDir || "",
+    );
+    if (!activeNorm) return true;
+    const sessNorm = this._normalizeDirPath(this._extractSessionDirectory(sessionObj));
+    if (!sessNorm) return true;
+    return sessNorm === activeNorm;
+  }
+
+  _buildRetryPayload(sessionId, agentId, explicitText = null) {
+    const last = sessionId ? this.sessionLastPromptMap.get(sessionId) : null;
+    const text = String(explicitText || last?.text || "").trim();
+    if (!text) return null;
+    return {
+      agentId: this.resolveAgentId(agentId || last?.agentId) || "architect",
+      sessionId: sessionId || null,
+      text,
+    };
+  }
+
+  _findLatestTurnErrorInLogs(sessionId, sinceTs = 0) {
+    const list = this.sessionLogsById.get(sessionId) || [];
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const e = list[i];
+      if (!e) continue;
+      if (sinceTs && e.timestamp && e.timestamp < sinceTs - 2000) break;
+      if (e.kind === "error" && e.content) {
+        return { message: e.content, existingEntry: e };
+      }
+      if (e.kind === "tool" && e.status === "error" && e.content) {
+        if (/free usage limit|subagent failed|rate limit|quota|502|timeout/i.test(e.content)) {
+          return { message: e.content, existingEntry: null };
+        }
+      }
+    }
+    return null;
+  }
+
   _startBusyMonitor() {
     if (this.busyMonitorTimer || typeof window === "undefined") return;
     this.busyMonitorTimer = setInterval(() => {
-      if (this.busySessions.size === 0 || this.status !== "connected") {
+      if (this.busySessions.size === 0 || this.manualDisconnect) {
         this._stopBusyMonitor();
         return;
       }
@@ -2223,20 +2294,53 @@ export class OpenCodeBridgeClient {
   }
 
   async _checkBusySessionsHealth() {
-    if (this.busySessions.size === 0 || this.status !== "connected") return;
+    if (this.busySessions.size === 0 || this.manualDisconnect) return;
     const baseUrl = this.getActiveBaseUrl();
-    const caps = this.capabilities;
-    if (!caps?.sessionStatusPath) return;
+    const statusPath = this.capabilities?.sessionStatusPath || `${this.apiPrefix}/session/status`;
+
+    const handleStatusFetchFailure = (reasonMsg) => {
+      const now = Date.now();
+      for (const [sid, busyAgentId] of Array.from(this.busySessions.entries())) {
+        const startedAt = this.busySessionStartedAt.get(sid) || 0;
+        if (now - startedAt < 5000) continue;
+        const fails = (this.busyPollFailCounts.get(sid) || 0) + 1;
+        this.busyPollFailCounts.set(sid, fails);
+        // Tras 4 intentos fallidos seguidos (~14s) liberar al agente con error visible y botón Reintentar
+        if (fails >= 4) {
+          const msg =
+            reasonMsg ||
+            "Se perdió la conexión con OpenCode (HTTP 502) mientras el especialista trabajaba.";
+          this._appendSessionLogEntry(sid, {
+            kind: "error",
+            agentId: busyAgentId,
+            content: msg,
+            retryPayload: this._buildRetryPayload(sid, busyAgentId),
+            status: "error",
+          });
+          this._releaseSessionNow(sid, busyAgentId, {
+            status: "failed",
+            label: "Conexión interrumpida",
+          });
+        }
+      }
+    };
 
     try {
-      const resp = await fetch(`${baseUrl}${caps.sessionStatusPath}`, {
+      const resp = await fetch(`${baseUrl}${statusPath}`, {
         headers: {
           Accept: "application/json",
           ...this._buildAuthHeaders(),
         },
-        signal: AbortSignal.timeout(2500),
+        signal: AbortSignal.timeout(3000),
       });
-      if (!resp.ok) return;
+      if (!resp.ok) {
+        const errDetail = await this._extractHttpError(
+          resp,
+          `Error HTTP ${resp.status} al consultar estado de sesiones`,
+        );
+        handleStatusFetchFailure(errDetail);
+        return;
+      }
       const ct = (resp.headers.get("content-type") || "").toLowerCase();
       if (!ct.includes("application/json")) return;
       const raw = await resp.json().catch(() => null);
@@ -2245,20 +2349,43 @@ export class OpenCodeBridgeClient {
 
       const now = Date.now();
       for (const [sid, busyAgentId] of Array.from(this.busySessions.entries())) {
+        this.busyPollFailCounts.delete(sid);
         const startedAt = this.busySessionStartedAt.get(sid) || 0;
         if (now - startedAt < 2500) continue;
         const st = statusMap[sid];
         const stillBusy = st?.type === "busy" || st?.type === "running";
         if (!stillBusy) {
           await this.hydrateSessionHistory(sid, { force: true }).catch(() => []);
-          this._releaseSessionNow(sid, busyAgentId, {
-            status: "passed",
-            label: "Tarea finalizada",
-          });
+          const turnErr = this._findLatestTurnErrorInLogs(sid, startedAt);
+          if (turnErr) {
+            if (!turnErr.existingEntry) {
+              this._appendSessionLogEntry(sid, {
+                kind: "error",
+                agentId: busyAgentId,
+                content: turnErr.message,
+                retryPayload: this._buildRetryPayload(sid, busyAgentId),
+                status: "error",
+              });
+            } else if (!turnErr.existingEntry.retryPayload) {
+              turnErr.existingEntry.retryPayload = this._buildRetryPayload(sid, busyAgentId);
+              this._emitSessionLog(sid);
+            }
+            this._releaseSessionNow(sid, busyAgentId, {
+              status: "failed",
+              label: turnErr.message.slice(0, 34),
+            });
+          } else {
+            this._releaseSessionNow(sid, busyAgentId, {
+              status: "passed",
+              label: "Tarea finalizada",
+            });
+          }
         }
       }
-    } catch {
-      // Silencioso; reintenta si sigue busy
+    } catch (err) {
+      handleStatusFetchFailure(
+        err?.message ? `No se pudo verificar estado en OpenCode: ${err.message}` : null,
+      );
     }
   }
 
@@ -2273,6 +2400,7 @@ export class OpenCodeBridgeClient {
       this._cancelSessionIdleTimer(sessionId);
       this.busySessions.delete(sessionId);
       this.busySessionStartedAt.delete(sessionId);
+      this.busyPollFailCounts.delete(sessionId);
       if (this.busySessions.size === 0) {
         this._stopBusyMonitor();
       }
@@ -2463,7 +2591,11 @@ export class OpenCodeBridgeClient {
   }
 
   _upsertSessionRecord(sessionObj) {
-    if (!sessionObj?.id) return;
+    if (!sessionObj?.id) return false;
+    const directory = this._extractSessionDirectory(sessionObj);
+    if (directory && !this._isSessionInActiveProject(sessionObj)) {
+      return false;
+    }
     const prev = this.sessionsById.get(sessionObj.id) || {};
     const agentHint =
       sessionObj.agent ||
@@ -2484,6 +2616,7 @@ export class OpenCodeBridgeClient {
       parentID,
       agent: agentHint,
       title,
+      directory: directory || prev.directory || this.activeProjectDir || "",
       updatedAt,
     });
 
@@ -2500,6 +2633,7 @@ export class OpenCodeBridgeClient {
         title,
       });
     }
+    return true;
   }
 
   /**
@@ -3251,10 +3385,12 @@ export class OpenCodeBridgeClient {
         props.error?.name ||
         props.message ||
         "Error en sesión OpenCode";
-      this._appendSessionLogEntry(sessionId || this.activeSessionId, {
+      const errSid = sessionId || this.activeSessionId;
+      this._appendSessionLogEntry(errSid, {
         kind: "error",
         agentId,
         content: String(errMsg),
+        retryPayload: this._buildRetryPayload(errSid, agentId),
         status: "error",
       });
       this._releaseSessionNow(sessionId, agentId, {
@@ -3347,6 +3483,7 @@ export class OpenCodeBridgeClient {
             kind: "error",
             agentId: agentId || "architect",
             content: String(errMsg),
+            retryPayload: this._buildRetryPayload(sid, agentId || "architect"),
             status: "error",
           });
         }
@@ -4602,10 +4739,7 @@ export class OpenCodeBridgeClient {
         `${this.apiPrefix}/session/{sessionID}/question/{requestID}/reject`,
       ],
       questionRejectSchemas: {},
-      formListPaths: [
-        `${this.apiPrefix}/session/{sessionID}/form`,
-        `${this.apiPrefix}/form`,
-      ],
+      formListPaths: [],
       formReplyPaths: [],
       formReplySchemas: {},
       formRejectPaths: [],
@@ -4927,7 +5061,11 @@ export class OpenCodeBridgeClient {
             headers,
             signal: signal || AbortSignal.timeout(3000),
           });
-          if (resp.status === 404 || resp.status === 405) {
+          if (
+            resp.status === 404 ||
+            resp.status === 405 ||
+            ((resp.status === 500 || resp.status === 502) && /\/form/i.test(template))
+          ) {
             this.deadGetPaths.add(template);
             continue;
           }
@@ -5240,6 +5378,13 @@ export class OpenCodeBridgeClient {
         const errMsg =
           info.error?.data?.message || info.error?.message || info.error?.name || String(info.error);
         if (errMsg) {
+          let lastUserText = null;
+          for (let k = entries.length - 1; k >= 0; k -= 1) {
+            if (entries[k]?.kind === "prompt" && entries[k]?.content) {
+              lastUserText = entries[k].content;
+              break;
+            }
+          }
           entries.push({
             id: `hist_err_${msgId}`,
             sourceKey: `msg:${msgId}:err`,
@@ -5252,6 +5397,7 @@ export class OpenCodeBridgeClient {
             isDelegation: false,
             subagentId: null,
             childSessionId: null,
+            retryPayload: this._buildRetryPayload(sessionId, msgAgent, lastUserText),
             content: errMsg,
             status: "error",
             timestamp: msgTime + 99,
@@ -5633,6 +5779,12 @@ export class OpenCodeBridgeClient {
 
     let targetSessionId =
       sessionId || (useActiveFallback ? this.activeSessionId : null);
+    if (targetSessionId) {
+      const existingRec = this.sessionsById.get(targetSessionId);
+      if (existingRec && !this._isSessionInActiveProject(existingRec)) {
+        targetSessionId = null;
+      }
+    }
     if (!targetSessionId) {
       try {
         const created = await this.createSession({
@@ -5653,6 +5805,13 @@ export class OpenCodeBridgeClient {
       return { ok: false, error: "No se pudo obtener una sesión activa." };
     }
 
+    const resolvedAgentForRetry = this.resolveAgentId(agent) || "architect";
+    this.sessionLastPromptMap.set(targetSessionId, {
+      agentId: resolvedAgentForRetry,
+      text: cleanText,
+      timestamp: Date.now(),
+    });
+
     if (!this.activeSessionId || agent === "architect") {
       this.activeSessionId = targetSessionId;
     }
@@ -5663,6 +5822,7 @@ export class OpenCodeBridgeClient {
       this._upsertSessionRecord({
         id: targetSessionId,
         agent,
+        directory: this.activeProjectDir || this.workspaceSummary?.projectDir || "",
         updatedAt: Date.now(),
       });
       await this._switchSessionAgent(targetSessionId, agent, caps);
@@ -5756,6 +5916,7 @@ export class OpenCodeBridgeClient {
                     kind: "error",
                     agentId: targetAgentId,
                     content: errMsg,
+                    retryPayload: this._buildRetryPayload(targetSessionId, targetAgentId, cleanText),
                     status: "error",
                   });
                   this._releaseSessionNow(targetSessionId, targetAgentId, {
@@ -5849,16 +6010,40 @@ export class OpenCodeBridgeClient {
         }
       }
 
+      const failMsg =
+        lastHttpError ||
+        "No se encontró un endpoint compatible (/prompt o /message)";
+      this._appendSessionLogEntry(targetSessionId, {
+        kind: "error",
+        agentId: resolvedAgentForRetry,
+        content: failMsg,
+        retryPayload: this._buildRetryPayload(targetSessionId, resolvedAgentForRetry, cleanText),
+        status: "error",
+      });
+      this._releaseSessionNow(targetSessionId, resolvedAgentForRetry, {
+        status: "failed",
+        label: failMsg.slice(0, 34),
+      });
       return {
         ok: false,
-        error:
-          lastHttpError ||
-          "No se encontró un endpoint compatible (/prompt o /message)",
+        error: failMsg,
       };
     } catch (err) {
+      const failMsg = err?.message || "No se pudo enviar el prompt a OpenCode";
+      this._appendSessionLogEntry(targetSessionId, {
+        kind: "error",
+        agentId: resolvedAgentForRetry,
+        content: failMsg,
+        retryPayload: this._buildRetryPayload(targetSessionId, resolvedAgentForRetry, cleanText),
+        status: "error",
+      });
+      this._releaseSessionNow(targetSessionId, resolvedAgentForRetry, {
+        status: "failed",
+        label: failMsg.slice(0, 34),
+      });
       return {
         ok: false,
-        error: err?.message || "No se pudo enviar el prompt a OpenCode",
+        error: failMsg,
       };
     } finally {
       this.promptAbortControllers.delete(controller);
@@ -5877,6 +6062,7 @@ export class OpenCodeBridgeClient {
         kind: "error",
         agentId: agentId || "architect",
         content: errMsg,
+        retryPayload: this._buildRetryPayload(sessionId, agentId || "architect"),
         status: "error",
       });
       this._releaseSessionNow(sessionId, agentId || "architect", {
@@ -5912,6 +6098,7 @@ export class OpenCodeBridgeClient {
           kind: "error",
           agentId: agentId || "architect",
           content: String(errMsg),
+          retryPayload: this._buildRetryPayload(sessionId, agentId || "architect"),
           status: "error",
         });
       }
@@ -6591,15 +6778,24 @@ export class OpenCodeBridgeClient {
     };
 
     try {
+      if (this.config.mode === "bridge" && !this.activeProjectDir) {
+        await this.fetchWorkspaceSummary().catch(() => null);
+      }
+
       const probe = await this._probeSessionEndpoint(baseUrl, headers, signal);
       if (probe.isAuthError) {
         throw new Error("Credenciales Basic Auth inválidas (401)");
       }
+      this.filteredOutSessionsCount = 0;
       if (probe.ok) {
         const raw = await probe.resp.json().catch(() => []);
         const data = this._unwrapResponseData(raw);
         const list = Array.isArray(data) ? data : data?.sessions || [];
-        for (const s of list) this._upsertSessionRecord(s);
+        for (const s of list) {
+          if (!this._upsertSessionRecord(s)) {
+            this.filteredOutSessionsCount += 1;
+          }
+        }
       }
 
       const caps = await this._discoverOpenApiCapabilities(baseUrl, signal);
@@ -6614,8 +6810,8 @@ export class OpenCodeBridgeClient {
           const activeRaw = await activeResp.json().catch(() => null);
           const activeSession = this._unwrapResponseData(activeRaw);
           if (activeSession?.id) {
-            this._upsertSessionRecord(activeSession);
-            if (activeSession.status?.type === "busy") {
+            const accepted = this._upsertSessionRecord(activeSession);
+            if (accepted && activeSession.status?.type === "busy") {
               this.activeSessionId = activeSession.id;
             }
           }
@@ -6634,6 +6830,7 @@ export class OpenCodeBridgeClient {
           const statusMap = this._unwrapResponseData(statusRaw);
           if (statusMap && typeof statusMap === "object") {
             for (const [sessionId, st] of Object.entries(statusMap)) {
+              if (!this.sessionsById.has(sessionId)) continue;
               if (st?.type === "busy") {
                 this.activeSessionId = this.activeSessionId || sessionId;
                 const agentId = this._resolveEventAgentId("session.status", {
@@ -6642,6 +6839,8 @@ export class OpenCodeBridgeClient {
                 });
                 if (agentId) {
                   this.busySessions.set(sessionId, agentId);
+                  this.busySessionStartedAt.set(sessionId, Date.now());
+                  this._startBusyMonitor();
                   this._emitLiveKanbanSync({
                     sessionId,
                     agentId,
@@ -7092,10 +7291,43 @@ export class OpenCodeBridgeClient {
     }
   }
 
+  _pruneSessionsOutsideActiveProject() {
+    const activeNorm = this._normalizeDirPath(this.activeProjectDir);
+    if (!activeNorm) return;
+    let removed = 0;
+    for (const [sid, rec] of Array.from(this.sessionsById.entries())) {
+      const recNorm = this._normalizeDirPath(rec?.directory);
+      if (recNorm && recNorm !== activeNorm) {
+        this.sessionsById.delete(sid);
+        this.sessionAgentMap.delete(sid);
+        this.busySessions.delete(sid);
+        this.busySessionStartedAt.delete(sid);
+        this.busyPollFailCounts.delete(sid);
+        if (this.activeSessionId === sid) {
+          this.activeSessionId = null;
+        }
+        removed += 1;
+      }
+    }
+    for (const [agentId, prefSid] of Array.from(this.agentPreferredSessionMap.entries())) {
+      if (prefSid && !this.sessionsById.has(prefSid)) {
+        this.agentPreferredSessionMap.delete(agentId);
+      }
+    }
+    if (removed > 0) {
+      this.filteredOutSessionsCount += removed;
+      this._emitConnectionState();
+    }
+  }
+
   async fetchWorkspaceSummary() {
     const data = await this._bridgeFetchJson("/api/office/workspace", { method: "GET" });
     if (data?.ok) {
       this.workspaceSummary = data;
+      if (data.projectDir) {
+        this.activeProjectDir = String(data.projectDir).trim();
+        this._pruneSessionsOutsideActiveProject();
+      }
       officeEventBus.emit(OFFICE_EVENTS.OFFICE_WORKSPACE_UPDATED, data, "workspace-bridge");
     }
     return data;
@@ -7108,13 +7340,43 @@ export class OpenCodeBridgeClient {
     });
     if (data?.ok) {
       this.workspaceSummary = data;
+      this.activeProjectDir = String(data.projectDir || dir || "").trim();
       this.fileSnippetCache.clear();
+      // Al cambiar de carpeta, limpiar sesiones del proyecto anterior para abrir hilos limpios
+      this.sessionsById.clear();
+      this.agentPreferredSessionMap.clear();
+      this.activeSessionId = null;
+      this.filteredOutSessionsCount = 0;
       if (Array.isArray(data?.whiteboard?.notes)) {
         this._syncWhiteboardFromBridge(data.whiteboard.notes);
       }
       officeEventBus.emit(OFFICE_EVENTS.OFFICE_WORKSPACE_UPDATED, data, "workspace-bridge");
+      this._emitConnectionState();
+      if (this.status === "connected") {
+        // Reconectar SSE con el nuevo contexto de directorio y re-sincronizar sesiones del proyecto
+        this.connect();
+      }
     }
     return data;
+  }
+
+  async fetchBridgeDiagnostics() {
+    const data = await this._bridgeFetchJson("/api/office/diagnostics", {
+      method: "GET",
+      timeoutMs: 5000,
+    });
+    const combined = {
+      ...(data || { ok: false, offline: true }),
+      clientStatus: this.status,
+      clientLastError: this.lastError,
+      clientLastChunkAt: this.lastChunkAt || this.lastEventAt || null,
+      clientEventsReceived: this.eventsReceived,
+      clientActiveSessions: this.sessionsById.size,
+      clientFilteredSessions: this.filteredOutSessionsCount,
+      clientBusySessions: this.busySessions.size,
+    };
+    this.lastDiagnostics = combined;
+    return combined;
   }
 
   async fetchWorkspaceDiff(relPath) {

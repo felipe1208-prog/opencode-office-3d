@@ -13,6 +13,7 @@
  */
 
 import http from "node:http";
+import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -32,12 +33,17 @@ const AUTH_PASS = process.env.OPENCODE_SERVER_PASSWORD || "";
 const sseClients = new Set();
 
 let detectedUpstreamPrefix = "/api";
+let lastSseEventAt = null;
+const recentBridgeErrors = [];
 
+const MAX_BRIDGE_ERRORS = 12;
 const MAX_WHITEBOARD_NOTES = 18;
 const MAX_SPATIAL_COMMANDS = 100;
 const MAX_DIFF_BYTES = 65536;
 const MAX_PEER_REVIEW_ROUNDS = 2;
 const PEER_REVIEW_CHAIN_TTL_MS = 45 * 60 * 1000;
+const RECOMMENDED_OPENCODE_CMD =
+  "opencode serve --port 4096 --hostname 127.0.0.1 --print-logs --log-level DEBUG";
 const BRIDGE_DATA_DIR = path.join(os.homedir(), ".opencode-office-3d");
 const BRIDGE_CONFIG_PATH = path.join(BRIDGE_DATA_DIR, "config.json");
 
@@ -732,12 +738,61 @@ function sendJson(res, statusCode, payload) {
 function applyCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, Cache-Control");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type, Accept, Cache-Control, x-opencode-directory",
+  );
   res.setHeader("Access-Control-Allow-Private-Network", "true");
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 
-function buildUpstreamHeaders(reqHeaders = {}) {
+function normalizeDirPath(dir) {
+  const raw = String(dir || "").trim();
+  if (!raw) return "";
+  let norm = raw.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (/^[a-zA-Z]:\//.test(norm) || /^[a-zA-Z]:$/.test(norm)) {
+    norm = norm.toLowerCase();
+  }
+  return norm;
+}
+
+function encodeDirectoryHeaderValue(dir) {
+  const clean = String(dir || "").trim();
+  if (!clean) return "";
+  // Los headers HTTP deben ser ASCII seguro; OpenCode decodifica URI si lleva %XX
+  return /[^\x20-\x7E]/.test(clean) ? encodeURIComponent(clean) : clean;
+}
+
+function appendDirectoryQuery(urlStr, dir = activeProjectDir) {
+  const cleanDir = String(dir || "").trim();
+  if (!cleanDir) return urlStr;
+  try {
+    const parsed = new URL(urlStr);
+    if (!parsed.searchParams.has("directory")) {
+      parsed.searchParams.set("directory", cleanDir);
+    }
+    return parsed.toString();
+  } catch {
+    return urlStr;
+  }
+}
+
+function recordBridgeError({ method = "GET", path: reqPath = "", status = 502, detail = "" } = {}) {
+  const entry = {
+    id: `err_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: Date.now(),
+    method: String(method || "GET").toUpperCase(),
+    path: String(reqPath || "").slice(0, 140),
+    status: Number(status) || 502,
+    detail: String(detail || "Error de comunicación con OpenCode").slice(0, 260),
+  };
+  recentBridgeErrors.unshift(entry);
+  if (recentBridgeErrors.length > MAX_BRIDGE_ERRORS) {
+    recentBridgeErrors.length = MAX_BRIDGE_ERRORS;
+  }
+}
+
+function buildUpstreamHeaders(reqHeaders = {}, dir = activeProjectDir) {
   const headers = { ...reqHeaders };
   delete headers.host;
   delete headers.connection;
@@ -752,6 +807,11 @@ function buildUpstreamHeaders(reqHeaders = {}) {
     headers.authorization = `Basic ${token}`;
   } else if (lastClientAuthHeader) {
     headers.authorization = lastClientAuthHeader;
+  }
+
+  const targetDir = String(dir || "").trim();
+  if (targetDir && !headers["x-opencode-directory"]) {
+    headers["x-opencode-directory"] = encodeDirectoryHeaderValue(targetDir);
   }
   return headers;
 }
@@ -848,8 +908,9 @@ async function resolveReviewerSessionId(prefix, toAgentId, contextPreview = "") 
   }
 
   const headers = buildUpstreamHeaders({ accept: "application/json" });
+  const activeNorm = normalizeDirPath(activeProjectDir);
   try {
-    const listResp = await fetch(`${OPENCODE_URL}${prefix}/session`, {
+    const listResp = await fetch(appendDirectoryQuery(`${OPENCODE_URL}${prefix}/session`), {
       method: "GET",
       headers,
       signal: AbortSignal.timeout(3000),
@@ -866,6 +927,8 @@ async function resolveReviewerSessionId(prefix, toAgentId, contextPreview = "") 
 
       const matching = list
         .filter((s) => {
+          const sDir = normalizeDirPath(s?.directory || s?.cwd || s?.worktree || s?.project?.worktree);
+          if (activeNorm && sDir && sDir !== activeNorm) return false;
           const sAgent = resolveAgentId(s?.agent || s?.agentId || s?.profile);
           if (sAgent === toAgentId) return true;
           const title = String(s?.title || "").toLowerCase();
@@ -883,7 +946,7 @@ async function resolveReviewerSessionId(prefix, toAgentId, contextPreview = "") 
   }
 
   try {
-    const createResp = await fetch(`${OPENCODE_URL}${prefix}/session`, {
+    const createResp = await fetch(appendDirectoryQuery(`${OPENCODE_URL}${prefix}/session`), {
       method: "POST",
       headers: buildUpstreamHeaders({
         accept: "application/json",
@@ -971,13 +1034,13 @@ async function dispatchPeerReviewToOpenCode({
     { agent: toAgentId, text: promptText },
   ];
   const endpoints = [
-    `${OPENCODE_URL}${prefix}/session/${encodeURIComponent(targetSessionId)}/prompt_async`,
-    `${OPENCODE_URL}${prefix}/session/${encodeURIComponent(targetSessionId)}/prompt`,
+    appendDirectoryQuery(`${OPENCODE_URL}${prefix}/session/${encodeURIComponent(targetSessionId)}/prompt_async`),
+    appendDirectoryQuery(`${OPENCODE_URL}${prefix}/session/${encodeURIComponent(targetSessionId)}/prompt`),
   ];
 
   let lastError = null;
   for (const url of endpoints) {
-    const isAsync = url.endsWith("/prompt_async");
+    const isAsync = url.includes("/prompt_async");
     for (const body of bodies) {
       try {
         const fetchPromise = fetch(url, {
@@ -1050,7 +1113,7 @@ function broadcastCustomEvent(payload) {
 }
 
 async function probeSessionAt(pathPrefix) {
-  const target = `${OPENCODE_URL}${pathPrefix}/session`;
+  const target = appendDirectoryQuery(`${OPENCODE_URL}${pathPrefix}/session`);
   const resp = await fetch(target, {
     headers: buildUpstreamHeaders({ accept: "application/json" }),
     signal: AbortSignal.timeout(2500),
@@ -1119,6 +1182,74 @@ async function probeUpstream() {
   }
 }
 
+async function probeOpenCodeDirectory(prefix = detectedUpstreamPrefix) {
+  const candidates = [
+    `${OPENCODE_URL}${prefix}/path`,
+    `${OPENCODE_URL}${prefix}/project/current`,
+    ...(prefix ? [`${OPENCODE_URL}/path`, `${OPENCODE_URL}/project/current`] : []),
+  ];
+  const headers = buildUpstreamHeaders({ accept: "application/json" });
+  for (const rawUrl of candidates) {
+    try {
+      const resp = await fetch(appendDirectoryQuery(rawUrl), {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(2200),
+      });
+      if (!resp.ok) continue;
+      const ct = (resp.headers.get("content-type") || "").toLowerCase();
+      if (!ct.includes("application/json")) continue;
+      const data = await resp.json().catch(() => null);
+      const unwrapped = data?.data && typeof data.data === "object" ? data.data : data;
+      const found =
+        unwrapped?.directory ||
+        unwrapped?.worktree ||
+        unwrapped?.cwd ||
+        unwrapped?.root ||
+        unwrapped?.project?.worktree ||
+        null;
+      if (typeof found === "string" && found.trim()) {
+        return {
+          directory: found.trim(),
+          source: new URL(rawUrl).pathname,
+        };
+      }
+    } catch {
+      // Probar siguiente candidato
+    }
+  }
+  return { directory: null, source: null };
+}
+
+async function handleDiagnostics(_req, res) {
+  const probe = await probeUpstream();
+  const dirProbe = probe.ok
+    ? await probeOpenCodeDirectory(probe.prefix ?? detectedUpstreamPrefix)
+    : { directory: null, source: null };
+  const bridgeNorm = normalizeDirPath(activeProjectDir);
+  const ocNorm = normalizeDirPath(dirProbe.directory);
+  const directoryMatches = ocNorm ? bridgeNorm === ocNorm : null;
+
+  sendJson(res, 200, {
+    ok: true,
+    bridgeUrl: `http://${BRIDGE_HOST}:${BRIDGE_PORT}`,
+    upstreamUrl: OPENCODE_URL,
+    upstreamPrefix: probe.prefix,
+    upstreamOk: probe.ok,
+    upstreamStatus: probe.status,
+    upstreamError: probe.error,
+    bridgeProjectDir: activeProjectDir,
+    openCodeDirectory: dirProbe.directory,
+    openCodeDirectorySource: dirProbe.source,
+    directoryMatches,
+    sseClientsCount: sseClients.size,
+    lastSseEventAt,
+    recentErrors: recentBridgeErrors.slice(0, MAX_BRIDGE_ERRORS),
+    recommendedCommand: RECOMMENDED_OPENCODE_CMD,
+    timestamp: Date.now(),
+  });
+}
+
 async function handleHealth(_req, res) {
   const probe = await probeUpstream();
 
@@ -1133,6 +1264,8 @@ async function handleHealth(_req, res) {
       upstreamStatus: probe.status,
       upstreamError: probe.error,
       clients: sseClients.size,
+      lastSseEventAt,
+      recentErrorsCount: recentBridgeErrors.length,
       spatialSource: spatialState.source,
       spatialUpdatedAt: spatialState.updatedAt,
       pendingSpatialCommands: spatialCommandQueue.length,
@@ -1143,104 +1276,183 @@ async function handleHealth(_req, res) {
 }
 
 async function proxyHttp(req, res, targetUrl) {
-  const controller = new AbortController();
-  res.on("close", () => {
-    if (!res.writableFinished) {
-      controller.abort();
-    }
-  });
+  const scopedTargetUrl = appendDirectoryQuery(targetUrl, activeProjectDir);
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(scopedTargetUrl);
+  } catch (err) {
+    sendJson(res, 400, { error: "URL upstream inválida", detail: err?.message });
+    return;
+  }
 
+  let body;
   try {
     const chunks = [];
     for await (const chunk of req) {
       chunks.push(chunk);
     }
-    const body = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
-
-    const upstreamResp = await fetch(targetUrl, {
-      method: req.method,
-      headers: buildUpstreamHeaders(req.headers),
-      body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
-      signal: controller.signal,
-    });
-
-    const contentType = upstreamResp.headers.get("content-type") || "application/json";
-    const isSse = contentType.includes("text/event-stream");
-    res.writeHead(upstreamResp.status, {
-      "Content-Type": contentType,
-      "Cache-Control": "no-cache",
-      ...(isSse ? { Connection: "keep-alive", "X-Accel-Buffering": "no" } : {}),
-    });
-
-    if (!upstreamResp.body) {
-      res.end();
-      return;
-    }
-
-    const reader = upstreamResp.body.getReader();
-    if (isSse) {
-      sseClients.add(res);
-    }
-
-    const heartbeat = isSse
-      ? setInterval(() => {
-          try {
-            res.write(": keepalive\n\n");
-          } catch {
-            clearInterval(heartbeat);
-          }
-        }, 15000)
-      : null;
-
-    const decoder = isSse ? new TextDecoder() : null;
-    let sseBuffer = "";
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (res.writableEnded) continue;
-
-        if (!isSse) {
-          res.write(value);
-          continue;
-        }
-
-        // Emitir frames SSE completos por delimitador \n\n para que broadcastCustomEvent
-        // nunca se intercale a mitad de un frame JSON fragmentado entre chunks TCP.
-        sseBuffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-        let boundaryIdx;
-        while ((boundaryIdx = sseBuffer.indexOf("\n\n")) !== -1) {
-          const completeFrame = sseBuffer.slice(0, boundaryIdx + 2);
-          sseBuffer = sseBuffer.slice(boundaryIdx + 2);
-          if (completeFrame) {
-            res.write(completeFrame);
-          }
-        }
-      }
-      if (isSse && sseBuffer && !res.writableEnded) {
-        res.write(sseBuffer.endsWith("\n\n") ? sseBuffer : `${sseBuffer}\n\n`);
-      }
-    } finally {
-      if (heartbeat) clearInterval(heartbeat);
-      if (isSse) sseClients.delete(res);
-      if (!res.writableEnded) res.end();
-    }
-  } catch (err) {
-    if (err?.name === "AbortError") return;
-    if (!res.headersSent) {
-      res.writeHead(502, { "Content-Type": "application/json; charset=utf-8" });
-    }
-    if (!res.writableEnded) {
-      res.end(
-        JSON.stringify({
-          error: "No se pudo conectar con opencode serve",
-          targetUrl,
-          detail: err?.message || "Upstream unavailable",
-        }),
-      );
-    }
+    body = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
+  } catch {
+    return;
   }
+
+  const upstreamHeaders = buildUpstreamHeaders(req.headers, activeProjectDir);
+  if (body && req.method !== "GET" && req.method !== "HEAD") {
+    upstreamHeaders["content-length"] = String(body.length);
+  }
+
+  const transport = parsedUrl.protocol === "https:" ? https : http;
+  const reqPathForLog = parsedUrl.pathname;
+
+  await new Promise((resolve) => {
+    let settled = false;
+    let heartbeat = null;
+    let isSse = false;
+
+    const finish = () => {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = null;
+      }
+      if (isSse) {
+        sseClients.delete(res);
+      }
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    };
+
+    const upstreamReq = transport.request(
+      parsedUrl,
+      {
+        method: req.method,
+        headers: upstreamHeaders,
+        // Sin timeout en el cliente HTTP: evita cortes 502 de Undici en streams SSE o turnos largos
+        timeout: 0,
+      },
+      (upstreamRes) => {
+        const contentType = String(upstreamRes.headers["content-type"] || "application/json");
+        isSse = contentType.includes("text/event-stream");
+        const statusCode = upstreamRes.statusCode || 200;
+
+        if (statusCode >= 500) {
+          recordBridgeError({
+            method: req.method,
+            path: reqPathForLog,
+            status: statusCode,
+            detail: `OpenCode respondió HTTP ${statusCode}`,
+          });
+        }
+
+        if (!res.headersSent) {
+          res.writeHead(statusCode, {
+            "Content-Type": contentType,
+            "Cache-Control": "no-cache",
+            ...(isSse ? { Connection: "keep-alive", "X-Accel-Buffering": "no" } : {}),
+          });
+        }
+
+        if (isSse) {
+          sseClients.add(res);
+          lastSseEventAt = Date.now();
+          heartbeat = setInterval(() => {
+            try {
+              if (!res.writableEnded) {
+                res.write(": keepalive\n\n");
+              }
+            } catch {
+              if (heartbeat) clearInterval(heartbeat);
+            }
+          }, 15000);
+        }
+
+        const decoder = isSse ? new TextDecoder() : null;
+        let sseBuffer = "";
+
+        upstreamRes.on("data", (chunk) => {
+          if (res.writableEnded) return;
+          if (!isSse) {
+            res.write(chunk);
+            return;
+          }
+
+          lastSseEventAt = Date.now();
+          sseBuffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
+          let boundaryIdx;
+          while ((boundaryIdx = sseBuffer.indexOf("\n\n")) !== -1) {
+            const completeFrame = sseBuffer.slice(0, boundaryIdx + 2);
+            sseBuffer = sseBuffer.slice(boundaryIdx + 2);
+            if (completeFrame) {
+              res.write(completeFrame);
+            }
+          }
+        });
+
+        upstreamRes.on("end", () => {
+          if (isSse && sseBuffer && !res.writableEnded) {
+            res.write(sseBuffer.endsWith("\n\n") ? sseBuffer : `${sseBuffer}\n\n`);
+          }
+          if (!res.writableEnded) res.end();
+          finish();
+        });
+
+        upstreamRes.on("error", (streamErr) => {
+          recordBridgeError({
+            method: req.method,
+            path: reqPathForLog,
+            status: 502,
+            detail: streamErr?.message || "Stream upstream interrumpido",
+          });
+          if (!res.writableEnded) res.end();
+          finish();
+        });
+      },
+    );
+
+    upstreamReq.on("socket", (socket) => {
+      socket.setKeepAlive(true, 15000);
+      socket.setTimeout(0);
+    });
+
+    upstreamReq.on("error", (err) => {
+      if (err?.code === "ECONNRESET" && res.destroyed) {
+        finish();
+        return;
+      }
+      recordBridgeError({
+        method: req.method,
+        path: reqPathForLog,
+        status: 502,
+        detail: err?.message || "Upstream unavailable",
+      });
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "application/json; charset=utf-8" });
+      }
+      if (!res.writableEnded) {
+        res.end(
+          JSON.stringify({
+            error: "No se pudo conectar con opencode serve",
+            targetUrl: scopedTargetUrl,
+            detail: err?.message || "Upstream unavailable",
+          }),
+        );
+      }
+      finish();
+    });
+
+    res.on("close", () => {
+      if (!res.writableFinished) {
+        upstreamReq.destroy();
+      }
+      finish();
+    });
+
+    if (body && req.method !== "GET" && req.method !== "HEAD") {
+      upstreamReq.write(body);
+    }
+    upstreamReq.end();
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1261,6 +1473,13 @@ const server = http.createServer(async (req, res) => {
   if (reqPath === "/bridge/health") {
     await handleHealth(req, res);
     return;
+  }
+
+  if (reqPath === "/api/office/diagnostics" || reqPath === "/office/diagnostics") {
+    if (req.method === "GET") {
+      await handleDiagnostics(req, res);
+      return;
+    }
   }
 
   // Workspace Git y lectura segura (solo lectura, validada dentro de activeProjectDir)
@@ -1285,6 +1504,9 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         activeProjectDir = path.resolve(rawDir);
+        for (const k of Object.keys(preferredAgentSessions)) {
+          delete preferredAgentSessions[k];
+        }
         saveBridgeConfig();
         loadPersistedWhiteboard(activeProjectDir);
 
