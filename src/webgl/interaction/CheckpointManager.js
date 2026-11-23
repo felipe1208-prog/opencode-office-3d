@@ -120,23 +120,25 @@ export class CheckpointManager {
 
   getNearestAvailableWaitingSeat(fromPosition) {
     let nearestSeat = null;
-    let minDist = Infinity;
-    const fromVec = new THREE.Vector2(fromPosition.x, fromPosition.z);
+    let minDistSq = Infinity;
+    const fx = fromPosition.x;
+    const fz = fromPosition.z;
 
-    Object.values(this.checkpoints).forEach((cp) => {
+    for (const cp of Object.values(this.checkpoints)) {
       if (
         cp.type === CHECKPOINT_TYPES.WAITING_SEAT &&
         !cp.isOccupied &&
         !cp.reservedBy
       ) {
-        const cpVec = new THREE.Vector2(cp.pos.x, cp.pos.z);
-        const dist = fromVec.distanceTo(cpVec);
-        if (dist < minDist) {
-          minDist = dist;
+        const dx = cp.pos.x - fx;
+        const dz = cp.pos.z - fz;
+        const distSq = dx * dx + dz * dz;
+        if (distSq < minDistSq) {
+          minDistSq = distSq;
           nearestSeat = cp;
         }
       }
-    });
+    }
 
     return nearestSeat;
   }
@@ -145,14 +147,32 @@ export class CheckpointManager {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, []);
     }
-    this.listeners.get(event).push(callback);
+    const list = this.listeners.get(event);
+    list.push(callback);
+    return () => this.off(event, callback);
+  }
+
+  off(event, callback) {
+    const list = this.listeners.get(event);
+    if (!list) return;
+    const idx = list.indexOf(callback);
+    if (idx !== -1) list.splice(idx, 1);
   }
 
   emit(event, data) {
     const list = this.listeners.get(event);
     if (list) {
-      list.forEach((cb) => cb(data));
+      for (const cb of [...list]) cb(data);
     }
+  }
+
+  reset() {
+    this.checkpoints = JSON.parse(JSON.stringify(CHECKPOINTS));
+    this.queues.clear();
+    Object.keys(this.checkpoints).forEach((id) => {
+      this.queues.set(id, []);
+    });
+    this.listeners.clear();
   }
 }
 

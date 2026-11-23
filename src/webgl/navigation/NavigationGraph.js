@@ -132,6 +132,7 @@ export class NavigationGraph {
     this.addNode("meeting-corner-ne", 3.15, -7.75);
     this.addNode("meeting-north-w", -1.45, -7.75);
     this.addNode("meeting-north-e", 1.45, -7.75);
+    this.addNode("meeting-whiteboard-approach", 1.85, -7.95);
     this.addNode("meeting-presenter-aisle", 0.0, -7.75);
 
     this.connect("north-corridor-meeting", "meeting-door");
@@ -145,6 +146,7 @@ export class NavigationGraph {
     this.connect("meeting-south-e", "meeting-corner-se");
     this.connect("meeting-corner-se", "meeting-corner-ne");
     this.connect("meeting-corner-ne", "meeting-north-e");
+    this.connect("meeting-north-e", "meeting-whiteboard-approach");
     this.connect("meeting-north-e", "meeting-presenter-aisle");
 
     // -------------------------------------------------------------
@@ -162,12 +164,14 @@ export class NavigationGraph {
     // 7. COCINA Y COFFEE BAR
     // -------------------------------------------------------------
     this.addNode("kitchen-aisle-cooler", -0.8, 3.8);
+    this.addNode("kitchen-aisle-sink", -0.8, 4.95);
     this.addNode("kitchen-aisle-drip", -0.8, 5.75);
     this.addNode("kitchen-aisle-espresso", -0.8, 6.45);
     this.addNode("kitchen-aisle-fridge", -0.8, 7.35);
 
     this.connect("promenade-kitchen-entry", "kitchen-aisle-cooler");
-    this.connect("kitchen-aisle-cooler", "kitchen-aisle-drip");
+    this.connect("kitchen-aisle-cooler", "kitchen-aisle-sink");
+    this.connect("kitchen-aisle-sink", "kitchen-aisle-drip");
     this.connect("kitchen-aisle-drip", "kitchen-aisle-espresso");
     this.connect("kitchen-aisle-espresso", "kitchen-aisle-fridge");
 
@@ -197,43 +201,60 @@ export class NavigationGraph {
     this.addNode("pingpong-table-north", 7.5, -6.55);
     this.addNode("pingpong-spectator-lounge", 9.8, -4.5);
     this.addNode("pingpong-bench-front", 8.1, -7.55);
+    this.addNode("pingpong-trophy-front", 6.2, -7.2);
 
     this.connect("pingpong-door-inside", "pingpong-arcade-front");
     this.connect("pingpong-arcade-front", "pingpong-vending-front");
     this.connect("pingpong-arcade-front", "pingpong-table-south");
     this.connect("pingpong-door-inside", "pingpong-west-aisle");
     this.connect("pingpong-west-aisle", "pingpong-table-north");
+    this.connect("pingpong-west-aisle", "pingpong-trophy-front");
+    this.connect("pingpong-table-north", "pingpong-trophy-front");
     this.connect("pingpong-table-north", "pingpong-bench-front");
+    this.connect("pingpong-trophy-front", "pingpong-bench-front");
     this.connect("pingpong-table-south", "pingpong-spectator-lounge");
     this.connect("pingpong-spectator-lounge", "pingpong-vending-front");
     this.connect("pingpong-bench-front", "pingpong-spectator-lounge");
 
     // -------------------------------------------------------------
-    // 9. LOUNGE MULTIMEDIA (CIRCULACIÓN PERIMETRAL)
+    // 9. LOUNGE MULTIMEDIA (CIRCULACIÓN INTERIOR FRENTE A SOFÁS Y BUTACAS)
+    //    Evita atravesar respaldos del sofá sur (z=6.16), oeste (x=5.44) y butacas este (x=10.56)
+    //    rodeando limpiamente la mesa de centro (x: 7.32..8.68, z: 3.80..4.50)
     // -------------------------------------------------------------
-    this.addNode("lounge-entry", 5.6, 2.4);
-    this.addNode("lounge-north-aisle", 8.0, 2.4);
-    this.addNode("lounge-east-aisle", 10.65, 4.15);
-    this.addNode("lounge-south-aisle", 8.0, 6.65);
-    this.addNode("lounge-west-aisle", 5.45, 4.15);
+    this.addNode("lounge-entry", 5.6, 2.35);
+    this.addNode("lounge-north-w", 6.65, 3.0);
+    this.addNode("lounge-north-aisle", 8.0, 2.95);
+    this.addNode("lounge-north-e", 9.35, 3.0);
+    this.addNode("lounge-west-aisle", 6.65, 4.15);
+    this.addNode("lounge-east-aisle", 9.35, 4.15);
+    this.addNode("lounge-south-w", 6.65, 5.05);
+    this.addNode("lounge-south-aisle", 8.0, 5.05);
+    this.addNode("lounge-south-e", 9.35, 5.05);
 
     this.connect("promenade-east", "lounge-entry");
-    this.connect("lounge-entry", "lounge-north-aisle");
-    this.connect("lounge-north-aisle", "lounge-east-aisle");
-    this.connect("lounge-east-aisle", "lounge-south-aisle");
-    this.connect("lounge-south-aisle", "lounge-west-aisle");
-    this.connect("lounge-west-aisle", "lounge-entry");
+    this.connect("lounge-entry", "lounge-north-w");
+    this.connect("lounge-north-w", "lounge-north-aisle");
+    this.connect("lounge-north-aisle", "lounge-north-e");
+    this.connect("lounge-north-w", "lounge-west-aisle");
+    this.connect("lounge-west-aisle", "lounge-south-w");
+    this.connect("lounge-south-w", "lounge-south-aisle");
+    this.connect("lounge-south-aisle", "lounge-south-e");
+    this.connect("lounge-north-e", "lounge-east-aisle");
+    this.connect("lounge-east-aisle", "lounge-south-e");
   }
 
   getClosestNodeId(pos) {
     let closestId = null;
-    let minDist = Infinity;
-    const p = new THREE.Vector2(pos.x, pos.z);
+    let minDistSq = Infinity;
+    const px = pos.x;
+    const pz = pos.z;
 
     for (const [id, vec] of this.nodes.entries()) {
-      const dist = p.distanceTo(new THREE.Vector2(vec.x, vec.z));
-      if (dist < minDist) {
-        minDist = dist;
+      const dx = vec.x - px;
+      const dz = vec.z - pz;
+      const distSq = dx * dx + dz * dz;
+      if (distSq < minDistSq) {
+        minDistSq = distSq;
         closestId = id;
       }
     }

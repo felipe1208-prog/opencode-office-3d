@@ -42,7 +42,146 @@ export class PingPongArea {
     // 6. Vegetación perimetral
     this.initVegetation();
 
+    // 7. Elementos dinámicos animados (pelota en juego y brillo arcade — excluidos de static batch)
+    this.rallyActive = false;
+    this.rallyPhase = 0;
+    this.arcadeActive = false;
+    this.arcadePhase = 0;
+    this.rallyBallPos = new THREE.Vector3(7.5, 0.88, -4.5);
+    this.initAnimatedProps();
+
     this.scene.add(this.group);
+  }
+
+  initAnimatedProps() {
+    // Pelota activa de rally sobre la mesa (X: 7.5, Z: -5.82..-3.18, mesa Y = 0.76, red Y = 0.9125)
+    const ballGeo = new THREE.SphereGeometry(0.021, 14, 14);
+    const ballMat = new THREE.MeshStandardMaterial({
+      color: "#FFFBEB",
+      emissive: "#FDE68A",
+      emissiveIntensity: 0.28,
+      roughness: 0.25,
+      metalness: 0.02,
+    });
+    this.rallyBall = new THREE.Mesh(ballGeo, ballMat);
+    this.rallyBall.name = "pingpong-rally-ball";
+    this.rallyBall.position.copy(this.rallyBallPos);
+    this.rallyBall.visible = false;
+    this.rallyBall.castShadow = true;
+    this.rallyBall.userData.noBatch = true;
+    this.group.add(this.rallyBall);
+
+    // Sombra suave proyectada de la pelota sobre la mesa para lectura espacial inmediata
+    const shadowGeo = new THREE.CircleGeometry(0.032, 14);
+    const shadowMat = new THREE.MeshBasicMaterial({
+      color: "#0A192F",
+      transparent: true,
+      opacity: 0.34,
+      depthWrite: false,
+    });
+    this.rallyBallShadow = new THREE.Mesh(shadowGeo, shadowMat);
+    this.rallyBallShadow.rotation.x = -Math.PI / 2;
+    this.rallyBallShadow.position.set(7.5, 0.764, -4.5);
+    this.rallyBallShadow.visible = false;
+    this.rallyBallShadow.userData.noBatch = true;
+    this.group.add(this.rallyBallShadow);
+
+    // Brillo sutil de pantalla arcade mirando al Norte (-Z) hacia el jugador en z = -0.92
+    const glowGeo = new THREE.PlaneGeometry(0.46, 0.34);
+    const glowMat = new THREE.MeshBasicMaterial({
+      color: "#38BDF8",
+      transparent: true,
+      opacity: 0.0,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    this.arcadeGlow = new THREE.Mesh(glowGeo, glowMat);
+    this.arcadeGlow.name = "arcade-active-glow";
+    this.arcadeGlow.position.set(6.2, 1.24, -0.58);
+    this.arcadeGlow.rotation.y = Math.PI;
+    this.arcadeGlow.userData.noBatch = true;
+    this.group.add(this.arcadeGlow);
+  }
+
+  setRallyActive(active) {
+    const next = Boolean(active);
+    if (this.rallyActive === next) return;
+    this.rallyActive = next;
+    if (this.rallyBall) this.rallyBall.visible = next;
+    if (this.rallyBallShadow) this.rallyBallShadow.visible = next;
+    if (next) {
+      this.rallyPhase = 0;
+    }
+  }
+
+  setArcadeActive(active) {
+    this.arcadeActive = Boolean(active);
+  }
+
+  getRallyState() {
+    return {
+      active: this.rallyActive,
+      phase: this.rallyPhase,
+      ballPos: this.rallyBallPos,
+    };
+  }
+
+  update(delta) {
+    const dt = Math.min(delta, 0.05);
+
+    if (this.rallyActive && this.rallyBall) {
+      // Un golpe cada ~0.85s (ciclo ida-vuelta = 2*PI en ~1.7s)
+      this.rallyPhase += dt * 3.65;
+      const cosP = Math.cos(this.rallyPhase); // +1 en lado norte (-5.82), -1 en lado sur (-3.18)
+      const travelZ = -4.5 - cosP * 1.32;
+      const lateralX = 7.5 + Math.sin(this.rallyPhase * 0.5) * 0.34;
+
+      // Arco con doble bote: alto sobre la red (cosP ≈ 0 -> y ≈ 1.12) y bote limpio cerca de cada extremo
+      const absCos = Math.abs(cosP);
+      const netArc = Math.pow(1 - absCos, 0.85) * 0.34;
+      const bounceWave = Math.abs(Math.sin(this.rallyPhase * 2.0)) * 0.14;
+      const ballY = 0.782 + netArc + bounceWave;
+
+      this.rallyBallPos.set(lateralX, ballY, travelZ);
+      this.rallyBall.position.copy(this.rallyBallPos);
+
+      if (this.rallyBallShadow) {
+        this.rallyBallShadow.position.set(lateralX, 0.764, travelZ);
+        const hNorm = Math.min(1, Math.max(0, (ballY - 0.78) / 0.48));
+        const s = 1.0 - hNorm * 0.38;
+        this.rallyBallShadow.scale.set(s, s, 1);
+        this.rallyBallShadow.material.opacity = 0.34 * (1 - hNorm * 0.55);
+      }
+    }
+
+    if (this.arcadeGlow) {
+      this.arcadePhase += dt * 4.5;
+      const targetOpacity = this.arcadeActive
+        ? 0.14 + Math.sin(this.arcadePhase) * 0.05
+        : 0;
+      this.arcadeGlow.material.opacity = THREE.MathUtils.damp(
+        this.arcadeGlow.material.opacity,
+        targetOpacity,
+        6,
+        dt,
+      );
+      if (this.arcadeActive) {
+        this.arcadeGlow.material.color.setHSL(
+          (0.55 + Math.sin(this.arcadePhase * 0.35) * 0.12) % 1,
+          0.85,
+          0.6,
+        );
+      }
+    }
+  }
+
+  dispose() {
+    this.rallyBall?.geometry?.dispose();
+    this.rallyBall?.material?.dispose();
+    this.rallyBallShadow?.geometry?.dispose();
+    this.rallyBallShadow?.material?.dispose();
+    this.arcadeGlow?.geometry?.dispose();
+    this.arcadeGlow?.material?.dispose();
   }
 
   place(assetName, pos, fitOpts, rotY = 0) {

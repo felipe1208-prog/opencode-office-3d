@@ -44,7 +44,118 @@ export class CoffeeArea {
     // 6. Vegetación
     this.initPlants();
 
+    // 7. Vapor cálido sutil sobre cafeteras + chorro de agua reactivo en fregadero
+    this.brewingState = { espresso: false, drip: false, sink: false };
+    this.steamWisps = [];
+    this.sinkStreamMesh = null;
+    this._sinkTime = 0;
+    this.initCoffeeSteam();
+
     this.scene.add(this.group);
+  }
+
+  initCoffeeSteam() {
+    const wispGeo = new THREE.SphereGeometry(0.026, 8, 8);
+    const emitters = [
+      { kind: "espresso", x: -1.46, y: 1.24, z: 6.45 },
+      { kind: "drip", x: -1.46, y: 1.18, z: 5.75 },
+    ];
+
+    for (const emitter of emitters) {
+      for (let i = 0; i < 3; i += 1) {
+        const mat = new THREE.MeshBasicMaterial({
+          color: "#F8F5F0",
+          transparent: true,
+          opacity: 0,
+          depthWrite: false,
+        });
+        const mesh = new THREE.Mesh(wispGeo, mat);
+        mesh.userData.noBatch = true;
+        mesh.position.set(emitter.x, emitter.y, emitter.z);
+        this.group.add(mesh);
+        this.steamWisps.push({
+          mesh,
+          kind: emitter.kind,
+          baseX: emitter.x,
+          baseY: emitter.y,
+          baseZ: emitter.z,
+          phase: (i / 3) + Math.random() * 0.25,
+          driftSign: i % 2 === 0 ? 1 : -1,
+        });
+      }
+    }
+    this._steamGeo = wispGeo;
+
+    // Chorro de agua translúcido bajo la boquilla del grifo cuello de cisne (x = -1.525, z = 4.95)
+    const streamGeo = new THREE.CylinderGeometry(0.0055, 0.009, 0.2, 10);
+    const streamMat = new THREE.MeshBasicMaterial({
+      color: "#7DD3FC",
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+    });
+    this.sinkStreamMesh = new THREE.Mesh(streamGeo, streamMat);
+    this.sinkStreamMesh.position.set(-1.525, 1.0, 4.95);
+    this.sinkStreamMesh.userData.noBatch = true;
+    this.sinkStreamMesh.visible = false;
+    this.group.add(this.sinkStreamMesh);
+  }
+
+  setBrewingState({ espresso = false, drip = false, sink = false } = {}) {
+    this.brewingState.espresso = Boolean(espresso);
+    this.brewingState.drip = Boolean(drip);
+    this.brewingState.sink = Boolean(sink);
+  }
+
+  update(delta) {
+    if (this.steamWisps.length === 0) return;
+    const dt = Math.min(delta, 0.05);
+    this._sinkTime += dt;
+
+    for (let i = 0; i < this.steamWisps.length; i += 1) {
+      const w = this.steamWisps[i];
+      const active =
+        w.kind === "espresso"
+          ? this.brewingState.espresso
+          : this.brewingState.drip;
+      const speed = active ? 0.52 : 0.22;
+      w.phase = (w.phase + dt * speed) % 1;
+
+      const rise = w.phase * (active ? 0.42 : 0.24);
+      const sway = Math.sin(w.phase * Math.PI * 2 + i) * 0.032 * w.driftSign;
+      w.mesh.position.set(w.baseX + sway * 0.6, w.baseY + rise, w.baseZ + sway);
+
+      const scale = 0.55 + w.phase * (active ? 1.45 : 0.85);
+      w.mesh.scale.set(scale, scale * 1.15, scale);
+
+      const env = Math.sin(w.phase * Math.PI);
+      const maxOpacity = active ? 0.28 : 0.06;
+      w.mesh.material.opacity = env * maxOpacity;
+    }
+
+    if (this.sinkStreamMesh) {
+      if (this.brewingState.sink) {
+        this.sinkStreamMesh.visible = true;
+        const pulse = 1 + Math.sin(this._sinkTime * 18) * 0.14;
+        this.sinkStreamMesh.scale.set(pulse, 1, pulse);
+        this.sinkStreamMesh.material.opacity =
+          0.42 + Math.sin(this._sinkTime * 24) * 0.08;
+      } else if (this.sinkStreamMesh.visible) {
+        this.sinkStreamMesh.visible = false;
+        this.sinkStreamMesh.material.opacity = 0;
+      }
+    }
+  }
+
+  dispose() {
+    for (const w of this.steamWisps) {
+      w.mesh.material?.dispose();
+    }
+    this._steamGeo?.dispose();
+    this.steamWisps = [];
+    this.sinkStreamMesh?.geometry?.dispose();
+    this.sinkStreamMesh?.material?.dispose();
+    this.sinkStreamMesh = null;
   }
 
   place(assetName, pos, fitOpts, rotY = 0) {

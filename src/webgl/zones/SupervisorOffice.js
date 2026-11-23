@@ -148,7 +148,7 @@ export class SupervisorOffice {
   initChairs() {
     const bossChair = this.place(
       "chair",
-      { x: -8.4, y: 0, z: -6.5 },
+      { x: -8.4, y: 0, z: -6.08 },
       { height: 1.1 },
       0,
     );
@@ -354,6 +354,8 @@ export class SupervisorOffice {
         }
       });
     }
+
+    if (!tv) return;
 
     // Calcular medidas exactas del chasis del TV colocado
     const tvBox = new THREE.Box3().setFromObject(tv);
@@ -578,6 +580,17 @@ export class SupervisorOffice {
 
     this.screenMesh.visible = true;
     this.hudMesh.visible = true;
+  }
+
+  dispose() {
+    this.cctvRenderTarget?.dispose();
+    this.cctvRenderTarget = null;
+    this.hudTexture?.dispose();
+    this.hudTexture = null;
+    this.screenMesh?.geometry?.dispose();
+    this.screenMesh?.material?.dispose();
+    this.hudMesh?.geometry?.dispose();
+    this.hudMesh?.material?.dispose();
   }
 }
 

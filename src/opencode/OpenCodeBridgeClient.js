@@ -2296,7 +2296,7 @@ export class OpenCodeBridgeClient {
   async _checkBusySessionsHealth() {
     if (this.busySessions.size === 0 || this.manualDisconnect) return;
     const baseUrl = this.getActiveBaseUrl();
-    const statusPath = this.capabilities?.sessionStatusPath || `${this.apiPrefix}/session/status`;
+    const statusPath = this.capabilities?.sessionStatusPath || null;
 
     const handleStatusFetchFailure = (reasonMsg) => {
       const now = Date.now();
@@ -2325,61 +2325,185 @@ export class OpenCodeBridgeClient {
       }
     };
 
+    const evaluateFinishedSession = async (sid, busyAgentId, startedAt) => {
+      await this.hydrateSessionHistory(sid, { force: true }).catch(() => []);
+      const turnErr = this._findLatestTurnErrorInLogs(sid, startedAt);
+      if (turnErr) {
+        if (!turnErr.existingEntry) {
+          this._appendSessionLogEntry(sid, {
+            kind: "error",
+            agentId: busyAgentId,
+            content: turnErr.message,
+            retryPayload: this._buildRetryPayload(sid, busyAgentId),
+            status: "error",
+          });
+        } else if (!turnErr.existingEntry.retryPayload) {
+          turnErr.existingEntry.retryPayload = this._buildRetryPayload(sid, busyAgentId);
+          this._emitSessionLog(sid);
+        }
+        this._releaseSessionNow(sid, busyAgentId, {
+          status: "failed",
+          label: turnErr.message.slice(0, 34),
+        });
+      } else {
+        this._releaseSessionNow(sid, busyAgentId, {
+          status: "passed",
+          label: "Tarea finalizada",
+        });
+      }
+    };
+
     try {
-      const resp = await fetch(`${baseUrl}${statusPath}`, {
+      // 1. Si el servidor anunció explícitamente /session/status en OpenAPI, intentar usarlo
+      if (statusPath) {
+        const resp = await fetch(`${baseUrl}${statusPath}`, {
+          headers: {
+            Accept: "application/json",
+            ...this._buildAuthHeaders(),
+          },
+          signal: AbortSignal.timeout(3000),
+        });
+
+        if (resp.status === 400 || resp.status === 404 || resp.status === 405) {
+          // Esta versión de opencode serve no implementa /session/status (p. ej. enruta "status" a /session/:sessionID)
+          if (this.capabilities) {
+            this.capabilities.sessionStatusPath = null;
+          }
+        } else if (!resp.ok) {
+          const errDetail = await this._extractHttpError(
+            resp,
+            `Error HTTP ${resp.status} al consultar estado de sesiones`,
+          );
+          handleStatusFetchFailure(errDetail);
+          return;
+        } else {
+          const ct = (resp.headers.get("content-type") || "").toLowerCase();
+          if (ct.includes("application/json")) {
+            const raw = await resp.json().catch(() => null);
+            const statusMap = this._unwrapResponseData(raw);
+            if (statusMap && typeof statusMap === "object" && !Array.isArray(statusMap)) {
+              const now = Date.now();
+              for (const [sid, busyAgentId] of Array.from(this.busySessions.entries())) {
+                this.busyPollFailCounts.delete(sid);
+                const startedAt = this.busySessionStartedAt.get(sid) || 0;
+                if (now - startedAt < 2500) continue;
+                const st = statusMap[sid];
+                const stillBusy = st?.type === "busy" || st?.type === "running";
+                if (!stillBusy) {
+                  await evaluateFinishedSession(sid, busyAgentId, startedAt);
+                }
+              }
+              return;
+            }
+          }
+        }
+      }
+
+      // 2. Respaldo compatible: consultar GET /session (y/o GET /session/:id con ses_...) sin tocar /session/status
+      const listResp = await fetch(`${baseUrl}${this.apiPrefix}/session`, {
         headers: {
           Accept: "application/json",
           ...this._buildAuthHeaders(),
         },
-        signal: AbortSignal.timeout(3000),
+        signal: AbortSignal.timeout(3500),
       });
-      if (!resp.ok) {
+      if (!listResp.ok) {
         const errDetail = await this._extractHttpError(
-          resp,
-          `Error HTTP ${resp.status} al consultar estado de sesiones`,
+          listResp,
+          `Error HTTP ${listResp.status} al verificar sesiones activas`,
         );
         handleStatusFetchFailure(errDetail);
         return;
       }
-      const ct = (resp.headers.get("content-type") || "").toLowerCase();
-      if (!ct.includes("application/json")) return;
-      const raw = await resp.json().catch(() => null);
-      const statusMap = this._unwrapResponseData(raw);
-      if (!statusMap || typeof statusMap !== "object") return;
+
+      const listCt = (listResp.headers.get("content-type") || "").toLowerCase();
+      const rawList = listCt.includes("application/json")
+        ? await listResp.json().catch(() => null)
+        : null;
+      const unwrapped = this._unwrapResponseData(rawList);
+      const sessionsArr = Array.isArray(unwrapped)
+        ? unwrapped
+        : Array.isArray(unwrapped?.sessions)
+          ? unwrapped.sessions
+          : [];
+      const sessionById = new Map();
+      for (const s of sessionsArr) {
+        const id = s?.id || s?.sessionID;
+        if (id) sessionById.set(id, s);
+      }
 
       const now = Date.now();
       for (const [sid, busyAgentId] of Array.from(this.busySessions.entries())) {
         this.busyPollFailCounts.delete(sid);
         const startedAt = this.busySessionStartedAt.get(sid) || 0;
-        if (now - startedAt < 2500) continue;
-        const st = statusMap[sid];
-        const stillBusy = st?.type === "busy" || st?.type === "running";
-        if (!stillBusy) {
-          await this.hydrateSessionHistory(sid, { force: true }).catch(() => []);
-          const turnErr = this._findLatestTurnErrorInLogs(sid, startedAt);
-          if (turnErr) {
-            if (!turnErr.existingEntry) {
-              this._appendSessionLogEntry(sid, {
-                kind: "error",
-                agentId: busyAgentId,
-                content: turnErr.message,
-                retryPayload: this._buildRetryPayload(sid, busyAgentId),
-                status: "error",
-              });
-            } else if (!turnErr.existingEntry.retryPayload) {
-              turnErr.existingEntry.retryPayload = this._buildRetryPayload(sid, busyAgentId);
-              this._emitSessionLog(sid);
-            }
-            this._releaseSessionNow(sid, busyAgentId, {
-              status: "failed",
-              label: turnErr.message.slice(0, 34),
-            });
-          } else {
-            this._releaseSessionNow(sid, busyAgentId, {
-              status: "passed",
-              label: "Tarea finalizada",
-            });
+        if (now - startedAt < 3000) continue;
+
+        let sessionMeta = sessionById.get(sid) || null;
+        if (!sessionMeta && /^ses/i.test(String(sid))) {
+          const oneResp = await fetch(
+            `${baseUrl}${this.apiPrefix}/session/${encodeURIComponent(sid)}`,
+            {
+              headers: {
+                Accept: "application/json",
+                ...this._buildAuthHeaders(),
+              },
+              signal: AbortSignal.timeout(3000),
+            },
+          ).catch(() => null);
+          if (oneResp?.ok) {
+            const oneRaw = await oneResp.json().catch(() => null);
+            sessionMeta = this._unwrapResponseData(oneRaw) || null;
           }
+        }
+
+        const rawStatus =
+          sessionMeta?.status?.type ||
+          (typeof sessionMeta?.status === "string" ? sessionMeta.status : null);
+        if (rawStatus === "busy" || rawStatus === "running") {
+          continue;
+        }
+        if (rawStatus === "idle" || rawStatus === "completed" || rawStatus === "error") {
+          await evaluateFinishedSession(sid, busyAgentId, startedAt);
+          continue;
+        }
+
+        // Si el listado de sesiones no expone campo `status`, inspeccionar los mensajes de la sesión válida (ses_...)
+        if (now - startedAt < 4500) continue;
+        const msgs = await this._fetchSessionMessagesRaw(sid).catch(() => null);
+        if (!Array.isArray(msgs) || msgs.length === 0) continue;
+
+        let latestAssistant = null;
+        for (let i = msgs.length - 1; i >= 0; i -= 1) {
+          const item = msgs[i];
+          const info = item?.info || item;
+          const role = info?.role || item?.role;
+          if (role !== "assistant") continue;
+          const createdMs = this._toEpochMs(
+            info?.time?.created ?? item?.createdAt ?? item?.timestamp,
+          );
+          if (createdMs && createdMs + 1500 < startedAt) break;
+          latestAssistant = { info, item };
+          break;
+        }
+
+        if (!latestAssistant) continue;
+        const { info, item } = latestAssistant;
+        const hasError = Boolean(info?.error || item?.error);
+        const completedMs = this._toEpochMs(info?.time?.completed ?? item?.completedAt);
+        const finishReason = info?.finish || item?.finish || null;
+        const isTerminalFinish =
+          finishReason &&
+          finishReason !== "tool-calls" &&
+          finishReason !== "tool_calls";
+        const parts = Array.isArray(item?.parts) ? item.parts : [];
+        const hasRunningTool = parts.some(
+          (p) =>
+            p?.type === "tool" &&
+            (p?.state?.status === "running" || p?.state?.status === "pending"),
+        );
+
+        if (hasError || (completedMs && !hasRunningTool && (isTerminalFinish || !finishReason))) {
+          await evaluateFinishedSession(sid, busyAgentId, startedAt);
         }
       }
     } catch (err) {
@@ -4698,7 +4822,7 @@ export class OpenCodeBridgeClient {
       discoveredFrom: "defaults",
       createSessionSchema: null,
       activeSessionPath: null,
-      sessionStatusPath: `${this.apiPrefix}/session/status`,
+      sessionStatusPath: null,
       sessionAgentEndpoints: [],
       promptPaths: [
         `${this.apiPrefix}/session/{sessionID}/prompt`,
@@ -5476,6 +5600,51 @@ export class OpenCodeBridgeClient {
     this.sessionLogsById.set(sid, merged);
     this._emitSessionLog(sid);
     return merged;
+  }
+
+  _toEpochMs(value) {
+    if (value === null || value === undefined || value === "") return 0;
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value < 1e12 ? Math.round(value * 1000) : Math.round(value);
+    }
+    const parsed = Date.parse(String(value));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  async _fetchSessionMessagesRaw(sessionId) {
+    if (!sessionId) return [];
+    const baseUrl = this.getActiveBaseUrl();
+    const caps =
+      this.capabilities || (await this._discoverOpenApiCapabilities(baseUrl));
+    const headers = {
+      Accept: "application/json",
+      ...this._buildAuthHeaders(),
+    };
+    const templates =
+      caps?.messageListPaths?.length > 0
+        ? caps.messageListPaths
+        : [`${this.apiPrefix}/session/{sessionID}/message`];
+
+    for (const template of templates) {
+      const path = this._fillEndpointTemplate(template, {
+        sessionID: sessionId,
+      });
+      const resp = await fetch(`${baseUrl}${path}`, {
+        headers,
+        signal: AbortSignal.timeout(4000),
+      }).catch(() => null);
+      if (!resp || resp.status === 404 || resp.status === 405) continue;
+      const ct = (resp.headers.get("content-type") || "").toLowerCase();
+      if (!resp.ok || !ct.includes("application/json")) continue;
+      const raw = await resp.json().catch(() => null);
+      const data = this._unwrapResponseData(raw);
+      return Array.isArray(data)
+        ? data
+        : Array.isArray(data?.messages)
+          ? data.messages
+          : [];
+    }
+    return [];
   }
 
   async hydrateSessionHistory(sessionId, { force = false } = {}) {

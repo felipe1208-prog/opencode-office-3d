@@ -19,6 +19,7 @@ import { SpatialAwarenessService } from "./SpatialAwarenessService.js";
 import { MaterialPool, batchStaticZones } from "../utils/SceneOptimizer.js";
 import { officeEventBus, OFFICE_EVENTS } from "../../events/OfficeEventBus.js";
 import { agentProfileManager } from "../../state/officeWorkspace.js";
+import { checkpointManager } from "../interaction/CheckpointManager.js";
 
 const INTERACTIVE_PROP_SPECS = [
   {
@@ -168,6 +169,8 @@ export class World {
     this.director = new SimulationDirector(this.characters, {
       onDirectorChange,
       monitorSystem: this.monitorSystem,
+      pingPongArea: this.pingPong,
+      coffeeArea: this.coffeeArea,
     });
 
     // 4. Servicio ligero de conciencia espacial (<= 2 Hz, fuera del bucle rAF)
@@ -234,6 +237,8 @@ export class World {
 
   update(delta) {
     if (this.supervisor) this.supervisor.update(delta);
+    if (this.pingPong) this.pingPong.update(delta);
+    if (this.coffeeArea) this.coffeeArea.update(delta);
     if (this.director) this.director.update(delta);
     if (this.characters) this.characters.update(delta);
   }
@@ -248,8 +253,12 @@ export class World {
     this.spatialService?.destroy();
     this.director?.destroy();
     this.characters?.destroy();
+    this.supervisor?.dispose?.();
+    this.pingPong?.dispose?.();
+    this.coffeeArea?.dispose?.();
     this.monitorSystem?.dispose();
     this.nightRig?.dispose();
     this.materialPool?.dispose();
+    checkpointManager.reset();
   }
 }

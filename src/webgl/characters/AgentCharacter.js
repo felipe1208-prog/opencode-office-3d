@@ -41,6 +41,8 @@ export class AgentCharacter {
     this.socialPartnerName = null;
     this.overrideRotY = null;
     this.desiredRotY = null;
+    this.settleTargetXZ = null;
+    this.gazeWorldTarget = null;
     this.pendingLiveArrival = null;
     this.pendingStationOnSeated = null;
     this.isTransitioningSeat = false;
@@ -48,8 +50,19 @@ export class AgentCharacter {
     this.hasPendingUserQuestion = false;
     this.contextualBubble = null;
     this._contextualBubbleTimer = null;
+    this._unsubTurnGranted = null;
 
     this.pendingTimers = new Set();
+
+    // Micro-saludo amistoso al cruzarse caminando por el pasillo
+    this.locomotion.onPassingPeer = (peer, sideSign) => {
+      if (this.state === "TRAVELING") {
+        this.animator.triggerPassingGreeting(sideSign);
+        if (peer?.state === "TRAVELING") {
+          peer.animator?.triggerPassingGreeting(-sideSign);
+        }
+      }
+    };
 
     this.animator.onClipChanged = (clipName) => {
       if (clipName === "typing" || clipName === "sittingIdle") {
@@ -59,7 +72,16 @@ export class AgentCharacter {
           this.state === "THINKING" ||
           this.state === "IDLE"
         ) {
-          this.propSockets.detachAll();
+          if (
+            this.currentActionKey !== "coffeeSipDesk" &&
+            this.currentActionKey !== "stretchBreak" &&
+            this.currentActionKey !== "takeNotes"
+          ) {
+            this.propSockets.detachAll();
+            this.animator.setProceduralMode(
+              clipName === "typing" ? "typingScan" : "idleSeated",
+            );
+          }
           if (this.socialMode !== "DESK_REVIEW" && this.state !== "THINKING") {
             this.taskAccentColor = null;
             if (!this.taskTitle) {
@@ -111,7 +133,8 @@ export class AgentCharacter {
   }
 
   bindEvents() {
-    checkpointManager.on("turn:granted", (data) => {
+    this._unsubTurnGranted?.();
+    this._unsubTurnGranted = checkpointManager.on("turn:granted", (data) => {
       if (data.agentId === this.config.id && this.state === "WAITING") {
         this.targetCheckpointId = data.checkpointId;
         this.leaveWaitingSeatAndProceedToTarget();
@@ -295,6 +318,25 @@ export class AgentCharacter {
     this.socialPartnerName = null;
     this.overrideRotY = null;
     this.desiredRotY = null;
+    this.gazeWorldTarget = null;
+    this.animator.setHeadGazeTarget(0, 0);
+    this.animator.setPingPongRallyState({ active: false });
+  }
+
+  setGazeWorldTarget(targetPos) {
+    this.gazeWorldTarget = targetPos || null;
+    if (!targetPos) {
+      this.animator.setHeadGazeTarget(0, 0);
+    }
+  }
+
+  isPhysicallyAtDesk() {
+    return (
+      this.currentCheckpointId === this.homeCheckpointId &&
+      this.isSeated &&
+      !this.isTransitioningSeat &&
+      this.state !== "TRAVELING"
+    );
   }
 
   lookAtWorldPosition(targetPos, { immediate = false } = {}) {
@@ -382,7 +424,11 @@ export class AgentCharacter {
 
     this.currentActionKey = actionKey;
     this.currentActionLabel = customLabel || profile.label;
-    this.propSockets.attach(profile.prop || null);
+    this.propSockets.attach(profile.prop || null, {
+      secondaryPropKey: profile.secondaryProp || null,
+      handOverride: profile.handOverride || null,
+    });
+    this.animator.setProceduralMode(profile.procedural || null);
     this.animator.play(animToPlay, 0.22);
     this.syncBubble();
     this.notifyStateChange();
@@ -414,10 +460,14 @@ export class AgentCharacter {
       if (socialPartnerName !== null) this.socialPartnerName = socialPartnerName;
       if (overrideRotY !== null) {
         this.overrideRotY = overrideRotY;
-        this.model.rotation.y = overrideRotY;
+        this.desiredRotY = overrideRotY;
       }
       if (overrideAction && this.currentActionKey !== overrideAction) {
-        this.applyActionProfile(overrideAction);
+        const nextAction =
+          this.isSeated && overrideAction === "texting"
+            ? "textingSeated"
+            : overrideAction;
+        this.applyActionProfile(nextAction);
       } else {
         this.syncBubble();
         this.notifyStateChange();
@@ -503,9 +553,14 @@ export class AgentCharacter {
   beginTravel(onReadyToWalk) {
     this.state = "TRAVELING";
     this.desiredRotY = null;
+    this.settleTargetXZ = null;
+    this.gazeWorldTarget = null;
     this.currentActionLabel = "Desplazándose por oficina";
     this.locomotion.setPath([]);
     this.propSockets.detachAll();
+    this.animator.setProceduralMode(null);
+    this.animator.setHeadGazeTarget(0, 0);
+    this.animator.setPingPongRallyState({ active: false });
 
     if (this.currentCheckpointId) {
       checkpointManager.release(this.currentCheckpointId, this.config.id);
@@ -519,14 +574,18 @@ export class AgentCharacter {
       this.isSeated = false;
       this.isTransitioningSeat = true;
       this.bubble?.setSeated(false);
-      this.targetY = FLOOR_Y;
       this.animator.play("sitToStand", 0.18);
+      // Sincronizar descenso de la raíz con la extensión de rodillas del clip
+      this.scheduleTimer(() => {
+        this.targetY = FLOOR_Y;
+      }, 220);
       this.scheduleTimer(() => {
         this.isTransitioningSeat = false;
+        this.targetY = FLOOR_Y;
         this.model.position.y = FLOOR_Y;
         this.animator.play("walking", 0.2);
         if (onReadyToWalk) onReadyToWalk();
-      }, 650);
+      }, 880);
     } else {
       this.isTransitioningSeat = false;
       this.targetY = FLOOR_Y;
@@ -545,9 +604,9 @@ export class AgentCharacter {
   arriveAtStation(cp, overrideAction = null) {
     this.currentCheckpointId = cp.id;
     this.targetCheckpointId = null;
-    this.desiredRotY = null;
-    this.model.position.set(cp.pos.x, this.model.position.y, cp.pos.z);
-    this.model.rotation.y =
+    // Asentamiento suave XZ y orientación suave en lugar de salto instantáneo
+    this.settleTargetXZ = { x: cp.pos.x, z: cp.pos.z };
+    this.desiredRotY =
       this.overrideRotY !== null ? this.overrideRotY : cp.rotY;
 
     const isSeatedStation =
@@ -555,22 +614,34 @@ export class AgentCharacter {
       cp.type === CHECKPOINT_TYPES.WAITING_SEAT ||
       cp.type === CHECKPOINT_TYPES.MEETING_SEAT;
 
-    const chosenAction =
+    const rawChosenAction =
       overrideAction ||
       (cp.actions && cp.actions[0]) ||
       (isSeatedStation ? "sittingIdle" : "standingIdle");
+
+    const chosenAction =
+      isSeatedStation && rawChosenAction === "texting"
+        ? "textingSeated"
+        : rawChosenAction;
 
     if (isSeatedStation) {
       const isHome = cp.id === this.homeCheckpointId;
       this.state = isHome ? "WORKING" : "INTERACTING";
       this.isSeated = true;
       this.isTransitioningSeat = true;
-      this.targetY = cp.pos.y;
+      this.animator.setProceduralMode(null);
       this.animator.play("standToSit", 0.2);
+
+      // Sincronizar ajuste vertical con la flexión de rodillas para que los pies no floten al inicio
+      this.scheduleTimer(() => {
+        this.targetY = cp.pos.y;
+      }, 240);
 
       this.scheduleTimer(() => {
         this.isTransitioningSeat = false;
-        this.model.position.y = cp.pos.y;
+        this.targetY = cp.pos.y;
+        this.model.position.set(cp.pos.x, cp.pos.y, cp.pos.z);
+        this.settleTargetXZ = null;
         const pending = isHome ? this.pendingLiveArrival : null;
         if (isHome) this.pendingLiveArrival = null;
 
@@ -585,12 +656,15 @@ export class AgentCharacter {
 
           if (pending.status === "passed") {
             this.currentActionKey = "sittingCheer";
+            this.animator.setProceduralMode("idleSeated");
             this.animator.play("sittingCheer", 0.2);
           } else if (pending.status === "failed") {
             this.currentActionKey = "sittingDisbelief";
+            this.animator.setProceduralMode("idleSeated");
             this.animator.play("sittingDisbelief", 0.2);
           } else {
             this.currentActionKey = "typing";
+            this.animator.setProceduralMode("typingScan");
             this.animator.play("sitToType", 0.2);
           }
 
@@ -601,6 +675,7 @@ export class AgentCharacter {
           this.currentActionKey = "typing";
           this.currentActionLabel = "Tecleando código";
           this.propSockets.detachAll();
+          this.animator.setProceduralMode("typingScan");
           this.animator.play("sitToType", 0.2);
           this.notifyStateChange();
         } else {
@@ -610,7 +685,7 @@ export class AgentCharacter {
         const stationCb = this.pendingStationOnSeated;
         this.pendingStationOnSeated = null;
         stationCb?.(this);
-      }, 620);
+      }, 860);
     } else {
       this.state = "INTERACTING";
       this.isSeated = false;
@@ -630,15 +705,23 @@ export class AgentCharacter {
     this.currentCheckpointId = seat.id;
     this.state = "WAITING";
     this.isSeated = true;
-    this.targetY = seat.pos.y;
-    this.model.position.set(seat.pos.x, this.model.position.y, seat.pos.z);
-    this.model.rotation.y = seat.rotY;
+    this.isTransitioningSeat = true;
+    this.settleTargetXZ = { x: seat.pos.x, z: seat.pos.z };
+    this.desiredRotY = seat.rotY;
+    this.animator.setProceduralMode(null);
     this.animator.play("standToSit", 0.2);
 
     this.scheduleTimer(() => {
-      this.model.position.y = seat.pos.y;
-      this.applyActionProfile("texting", { customLabel: "Esperando turno" });
-    }, 620);
+      this.targetY = seat.pos.y;
+    }, 240);
+
+    this.scheduleTimer(() => {
+      this.isTransitioningSeat = false;
+      this.targetY = seat.pos.y;
+      this.model.position.set(seat.pos.x, seat.pos.y, seat.pos.z);
+      this.settleTargetXZ = null;
+      this.applyActionProfile("textingSeated", { customLabel: "Esperando turno" });
+    }, 860);
 
     this.notifyStateChange();
   }
@@ -913,8 +996,30 @@ export class AgentCharacter {
   }
 
   update(delta, allCharacters = []) {
-    this.animator.update(delta);
-    this.bubble?.update(delta);
+    const dt = Math.min(delta, 0.05);
+
+    // Actualizar objetivo relativo de mirada procedural (cabeza/cuello) hacia compañero o pelota
+    if (this.gazeWorldTarget && this.model && this.state !== "TRAVELING") {
+      const dx = this.gazeWorldTarget.x - this.model.position.x;
+      const dz = this.gazeWorldTarget.z - this.model.position.z;
+      if (dx * dx + dz * dz > 0.01) {
+        const worldYaw = Math.atan2(dx, dz);
+        let relYaw = worldYaw - this.model.rotation.y;
+        while (relYaw < -Math.PI) relYaw += Math.PI * 2;
+        while (relYaw > Math.PI) relYaw -= Math.PI * 2;
+        const targetY =
+          typeof this.gazeWorldTarget.y === "number"
+            ? this.gazeWorldTarget.y
+            : this.model.position.y + 1.1;
+        const horizDist = Math.max(0.4, Math.hypot(dx, dz));
+        const eyeY = this.model.position.y + (this.isSeated ? 1.12 : 1.56);
+        const relPitch = -Math.atan2(targetY - eyeY, horizDist) * 0.55;
+        this.animator.setHeadGazeTarget(relYaw, relPitch);
+      }
+    }
+
+    this.animator.update(dt);
+    this.bubble?.update(dt);
 
     // Suavizado vertical para sentarse / levantarse sin saltos bruscos
     if (Math.abs(this.model.position.y - this.targetY) > 0.002) {
@@ -922,26 +1027,56 @@ export class AgentCharacter {
         this.model.position.y,
         this.targetY,
         12,
-        delta,
+        dt,
       );
+    } else if (this.model.position.y !== this.targetY) {
+      this.model.position.y = this.targetY;
     }
 
     if (this.state === "TRAVELING") {
       this.locomotion.updateProximity(allCharacters, this.config.id);
-      this.locomotion.update(delta);
-    } else if (this.desiredRotY !== null) {
-      let diff = this.desiredRotY - this.model.rotation.y;
-      while (diff < -Math.PI) diff += Math.PI * 2;
-      while (diff > Math.PI) diff -= Math.PI * 2;
-      if (Math.abs(diff) > 0.004) {
-        this.model.rotation.y += diff * Math.min(delta * 9.0, 1);
-      } else {
-        this.model.rotation.y = this.desiredRotY;
+      this.locomotion.update(dt);
+    } else {
+      // Asentamiento suave XZ al centro exacto de silla o estación (elimina pop de 20cm)
+      if (this.settleTargetXZ) {
+        const dx = this.settleTargetXZ.x - this.model.position.x;
+        const dz = this.settleTargetXZ.z - this.model.position.z;
+        if (dx * dx + dz * dz > 0.0002) {
+          this.model.position.x = THREE.MathUtils.damp(
+            this.model.position.x,
+            this.settleTargetXZ.x,
+            11,
+            dt,
+          );
+          this.model.position.z = THREE.MathUtils.damp(
+            this.model.position.z,
+            this.settleTargetXZ.z,
+            11,
+            dt,
+          );
+        } else {
+          this.model.position.x = this.settleTargetXZ.x;
+          this.model.position.z = this.settleTargetXZ.z;
+          this.settleTargetXZ = null;
+        }
+      }
+
+      if (this.desiredRotY !== null) {
+        let diff = this.desiredRotY - this.model.rotation.y;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        if (Math.abs(diff) > 0.004) {
+          this.model.rotation.y += diff * (1 - Math.exp(-10.0 * dt));
+        } else {
+          this.model.rotation.y = this.desiredRotY;
+        }
       }
     }
   }
 
   destroy() {
+    this._unsubTurnGranted?.();
+    this._unsubTurnGranted = null;
     if (this._contextualBubbleTimer) {
       clearTimeout(this._contextualBubbleTimer);
       this._contextualBubbleTimer = null;

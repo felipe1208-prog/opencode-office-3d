@@ -287,6 +287,7 @@ function resolveZoneFromCoords(x, z, checkpointId = null, ownerAgentId = null) {
       zoneId: "meeting-room",
       zoneName: "Sala de Reuniones",
       locationLabel:
+        checkpointId === "meeting-whiteboard-spot" ||
         checkpointId === "meeting-presenter"
           ? "Pizarra de Arquitectura (Sala de Reuniones)"
           : "Sala de Reuniones",
@@ -626,8 +627,8 @@ export class SpatialAwarenessService {
       norm === "pizarra-arquitectura"
     ) {
       return {
-        checkpointId: "meeting-presenter",
-        actionOverride: "presenting",
+        checkpointId: "meeting-whiteboard-spot",
+        actionOverride: "writeWhiteboard",
         bubbleText: "Yendo a la pizarra",
       };
     }
@@ -730,6 +731,14 @@ export class SpatialAwarenessService {
       };
     }
 
+    if (norm === "trofeos" || norm === "vitrina" || norm === "trophies") {
+      return {
+        checkpointId: "pingpong-trophy-case",
+        actionOverride: "inspectTrophies",
+        bubbleText: "Mirando los trofeos",
+      };
+    }
+
     if (norm === "librero" || norm === "libros" || norm === "documentacion") {
       return {
         checkpointId: "supervisor-bookcase",
@@ -748,7 +757,7 @@ export class SpatialAwarenessService {
       const peerNearHome =
         peer &&
         (peer.currentCheckpointId === peer.homeCheckpointId ||
-          peer.isPhysicallyAtDesk);
+          Boolean(peer.isPhysicallyAtDesk?.()));
 
       if (peerNearHome && PEER_REVIEW_CHECKPOINT[peerId]) {
         const reviewCp = PEER_REVIEW_CHECKPOINT[peerId];
@@ -826,7 +835,7 @@ export class SpatialAwarenessService {
         durationMs: 4200,
       });
 
-      this.director.sendAgentTo(agentId, "meeting-presenter", "presenting", {
+      this.director.sendAgentTo(agentId, "meeting-whiteboard-spot", "writeWhiteboard", {
         onSeated: () => {
           agent.setContextualBubble("Publicó en la pizarra", {
             color: agent.config?.color || "#FCD34D",

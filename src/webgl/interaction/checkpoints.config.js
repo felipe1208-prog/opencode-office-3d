@@ -11,12 +11,12 @@ export const CHECKPOINTS = {
   // ==========================================
   // 1. ZONA DESARROLLO (DevArea)
   // ==========================================
-  // Pod 2 (Bancada Central)
+  // Pod 2 (Bancada Central: sillas en z=4.26 y z=6.14, teclados en z=4.66 y z=5.74)
   "dev-pod2-nw": {
     id: "dev-pod2-nw",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.WORKSTATION,
-    pos: { x: -6.7, y: 0.035, z: 4.18 },
+    pos: { x: -6.7, y: -0.04, z: 4.22 },
     rotY: 0,
     actions: ["typing", "sittingIdle", "sitToType", "typeToSit"],
     isOccupied: false,
@@ -26,7 +26,7 @@ export const CHECKPOINTS = {
     id: "dev-pod2-ne",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.WORKSTATION,
-    pos: { x: -5.3, y: 0.035, z: 4.18 },
+    pos: { x: -5.3, y: -0.04, z: 4.22 },
     rotY: 0,
     actions: ["typing", "sittingIdle", "sitToType", "typeToSit"],
     isOccupied: false,
@@ -36,7 +36,7 @@ export const CHECKPOINTS = {
     id: "dev-pod2-sw",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.WORKSTATION,
-    pos: { x: -6.7, y: 0.035, z: 6.22 },
+    pos: { x: -6.7, y: -0.04, z: 6.18 },
     rotY: Math.PI,
     actions: ["typing", "sittingIdle", "sitToType", "typeToSit"],
     isOccupied: false,
@@ -46,7 +46,7 @@ export const CHECKPOINTS = {
     id: "dev-pod2-se",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.WORKSTATION,
-    pos: { x: -5.3, y: 0.035, z: 6.22 },
+    pos: { x: -5.3, y: -0.04, z: 6.18 },
     rotY: Math.PI,
     actions: ["typing", "sittingIdle", "sitToType", "typeToSit"],
     isOccupied: false,
@@ -58,7 +58,7 @@ export const CHECKPOINTS = {
     id: "dev-pod1-nw",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.WORKSTATION,
-    pos: { x: -10.3, y: 0.035, z: 4.18 },
+    pos: { x: -10.3, y: -0.04, z: 4.22 },
     rotY: 0,
     actions: ["typing", "sittingIdle"],
     isOccupied: false,
@@ -68,7 +68,7 @@ export const CHECKPOINTS = {
     id: "dev-pod1-ne",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.WORKSTATION,
-    pos: { x: -8.9, y: 0.035, z: 4.18 },
+    pos: { x: -8.9, y: -0.04, z: 4.22 },
     rotY: 0,
     actions: ["typing", "sittingIdle"],
     isOccupied: false,
@@ -78,7 +78,7 @@ export const CHECKPOINTS = {
     id: "dev-pod1-sw",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.WORKSTATION,
-    pos: { x: -10.3, y: 0.035, z: 6.22 },
+    pos: { x: -10.3, y: -0.04, z: 6.18 },
     rotY: Math.PI,
     actions: ["typing", "sittingIdle"],
     isOccupied: false,
@@ -88,19 +88,19 @@ export const CHECKPOINTS = {
     id: "dev-pod1-se",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.WORKSTATION,
-    pos: { x: -8.9, y: 0.035, z: 6.22 },
+    pos: { x: -8.9, y: -0.04, z: 6.18 },
     rotY: Math.PI,
     actions: ["typing", "sittingIdle"],
     isOccupied: false,
     reservedBy: null,
   },
 
-  // Pod 3 (Isla Norte)
+  // Pod 3 (Isla Norte: sillas en z=0.06 y z=1.94, teclados en z=0.46 y z=1.54)
   "dev-pod3-n": {
     id: "dev-pod3-n",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.WORKSTATION,
-    pos: { x: -7.8, y: 0.035, z: -0.02 },
+    pos: { x: -7.8, y: -0.04, z: 0.02 },
     rotY: 0,
     actions: ["typing", "sittingIdle", "sitToType", "typeToSit"],
     isOccupied: false,
@@ -110,7 +110,7 @@ export const CHECKPOINTS = {
     id: "dev-pod3-s",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.WORKSTATION,
-    pos: { x: -7.8, y: 0.035, z: 2.02 },
+    pos: { x: -7.8, y: -0.04, z: 1.98 },
     rotY: Math.PI,
     actions: ["typing", "sittingIdle", "sitToType", "typeToSit"],
     isOccupied: false,
@@ -120,13 +120,13 @@ export const CHECKPOINTS = {
   // ==========================================
   // 2. COCINA & COFFEE BAR (CoffeeArea)
   // ==========================================
-  // Estaciones de Acción (De pie)
+  // Estaciones de Acción (De pie: encimera frontal en x=-1.21, portafiltros en x=-1.28)
   "kitchen-espresso": {
     id: "kitchen-espresso",
     zone: "coffee-kitchen",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: -1.05, y: -0.34, z: 6.45 },
-    rotY: -Math.PI / 2, // Mira hacia la encimera al Oeste
+    pos: { x: -0.96, y: -0.34, z: 6.45 },
+    rotY: -Math.PI / 2,
     actions: ["makeCoffee", "standingIdle"],
     isOccupied: false,
     reservedBy: null,
@@ -135,7 +135,7 @@ export const CHECKPOINTS = {
     id: "kitchen-drip-coffee",
     zone: "coffee-kitchen",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: -1.05, y: -0.34, z: 5.75 },
+    pos: { x: -0.98, y: -0.34, z: 5.75 },
     rotY: -Math.PI / 2,
     actions: ["makeCoffee", "standingIdle"],
     isOccupied: false,
@@ -155,7 +155,7 @@ export const CHECKPOINTS = {
     id: "kitchen-fridge",
     zone: "coffee-kitchen",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: -1.05, y: -0.34, z: 7.38 },
+    pos: { x: -0.95, y: -0.34, z: 7.38 },
     rotY: -Math.PI / 2,
     actions: ["openFridge", "standingIdle"],
     isOccupied: false,
@@ -165,20 +165,20 @@ export const CHECKPOINTS = {
     id: "kitchen-sink",
     zone: "coffee-kitchen",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: -1.05, y: -0.34, z: 4.95 },
+    pos: { x: -0.98, y: -0.34, z: 4.95 },
     rotY: -Math.PI / 2,
     actions: ["washHands", "standingIdle"],
     isOccupied: false,
     reservedBy: null,
   },
 
-  // Asientos de Espera: Taburetes de la Barra[cite: 26]
+  // Asientos de Espera: Taburetes de la Barra (asiento real a y = 0.795)
   "barstool-1": {
     id: "barstool-1",
     zone: "coffee-kitchen",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 0.78, y: 0.22, z: 5.05 },
-    rotY: -Math.PI / 2, // Mirando al Oeste hacia la barra
+    pos: { x: 0.78, y: 0.3, z: 5.05 },
+    rotY: -Math.PI / 2,
     actions: ["sittingIdle", "drinkCoffee"],
     isOccupied: false,
     reservedBy: null,
@@ -187,7 +187,7 @@ export const CHECKPOINTS = {
     id: "barstool-2",
     zone: "coffee-kitchen",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 0.78, y: 0.22, z: 5.7 },
+    pos: { x: 0.78, y: 0.3, z: 5.7 },
     rotY: -Math.PI / 2,
     actions: ["sittingIdle", "drinkCoffee"],
     isOccupied: false,
@@ -197,7 +197,7 @@ export const CHECKPOINTS = {
     id: "barstool-3",
     zone: "coffee-kitchen",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 0.78, y: 0.22, z: 6.35 },
+    pos: { x: 0.78, y: 0.3, z: 6.35 },
     rotY: -Math.PI / 2,
     actions: ["sittingIdle", "drinkCoffee"],
     isOccupied: false,
@@ -207,7 +207,7 @@ export const CHECKPOINTS = {
     id: "barstool-4",
     zone: "coffee-kitchen",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 0.78, y: 0.22, z: 7.0 },
+    pos: { x: 0.78, y: 0.3, z: 7.0 },
     rotY: -Math.PI / 2,
     actions: ["sittingIdle", "drinkCoffee"],
     isOccupied: false,
@@ -215,15 +215,15 @@ export const CHECKPOINTS = {
   },
 
   // ==========================================
-  // 3. MULTIMEDIA LOUNGE (LoungeArea)[cite: 28]
+  // 3. MULTIMEDIA LOUNGE (LoungeArea)
   // ==========================================
-  // Sofá Sur (3 plazas)[cite: 28]
+  // Sofá Sur (3 plazas, cojín real a y = 0.298m -> pos.y = -0.14)
   "lounge-sofa-s1": {
     id: "lounge-sofa-s1",
     zone: "lounge-tv",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 7.4, y: 0.035, z: 5.65 },
-    rotY: Math.PI, // Mira al Norte hacia la TV
+    pos: { x: 7.4, y: -0.14, z: 5.68 },
+    rotY: Math.PI,
     actions: ["sittingIdle", "watchTV"],
     isOccupied: false,
     reservedBy: null,
@@ -232,9 +232,9 @@ export const CHECKPOINTS = {
     id: "lounge-sofa-s2",
     zone: "lounge-tv",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 8.0, y: 0.035, z: 5.65 },
+    pos: { x: 8.0, y: -0.14, z: 5.68 },
     rotY: Math.PI,
-    actions: ["sittingIdle", "watchTV"],
+    actions: ["sittingIdle", "watchTV", "textingSeated"],
     isOccupied: false,
     reservedBy: null,
   },
@@ -242,20 +242,20 @@ export const CHECKPOINTS = {
     id: "lounge-sofa-s3",
     zone: "lounge-tv",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 8.6, y: 0.035, z: 5.65 },
+    pos: { x: 8.6, y: -0.14, z: 5.68 },
     rotY: Math.PI,
     actions: ["sittingIdle", "watchTV"],
     isOccupied: false,
     reservedBy: null,
   },
 
-  // Sofá Oeste (2 plazas)[cite: 28]
+  // Sofá Oeste (2 plazas, cojín real a y = 0.234m -> pos.y = -0.19)
   "lounge-sofa-w1": {
     id: "lounge-sofa-w1",
     zone: "lounge-tv",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 5.95, y: 0.035, z: 3.8 },
-    rotY: Math.PI / 2, // Mira al Este hacia la mesa de centro
+    pos: { x: 5.92, y: -0.19, z: 3.8 },
+    rotY: Math.PI / 2,
     actions: ["sittingIdle"],
     isOccupied: false,
     reservedBy: null,
@@ -264,20 +264,20 @@ export const CHECKPOINTS = {
     id: "lounge-sofa-w2",
     zone: "lounge-tv",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 5.95, y: 0.035, z: 4.5 },
+    pos: { x: 5.92, y: -0.19, z: 4.5 },
     rotY: Math.PI / 2,
     actions: ["sittingIdle"],
     isOccupied: false,
     reservedBy: null,
   },
 
-  // Butacas individuales Este[cite: 28]
+  // Butacas individuales Este (cojín real a y = 0.203m -> pos.y = -0.21)
   "lounge-armchair-ne": {
     id: "lounge-armchair-ne",
     zone: "lounge-tv",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 10.05, y: 0.035, z: 3.35 },
-    rotY: -Math.PI / 2, // Mira al Oeste
+    pos: { x: 10.08, y: -0.21, z: 3.35 },
+    rotY: -Math.PI / 2,
     actions: ["sittingIdle"],
     isOccupied: false,
     reservedBy: null,
@@ -286,21 +286,21 @@ export const CHECKPOINTS = {
     id: "lounge-armchair-se",
     zone: "lounge-tv",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 10.05, y: 0.035, z: 4.95 },
+    pos: { x: 10.08, y: -0.21, z: 4.95 },
     rotY: -Math.PI / 2,
     actions: ["sittingIdle"],
     isOccupied: false,
     reservedBy: null,
   },
 
-  // Puffs contemporáneos[cite: 28]
+  // Puffs contemporáneos (altura cojín ~0.27m -> pos.y = -0.15)
   "lounge-puff-orange": {
     id: "lounge-puff-orange",
     zone: "lounge-tv",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
     pos: { x: 6.65, y: -0.15, z: 2.45 },
     rotY: 0,
-    actions: ["sittingIdle"],
+    actions: ["sittingIdle", "textingSeated"],
     isOccupied: false,
     reservedBy: null,
   },
@@ -310,20 +310,20 @@ export const CHECKPOINTS = {
     type: CHECKPOINT_TYPES.WAITING_SEAT,
     pos: { x: 9.35, y: -0.15, z: 5.75 },
     rotY: Math.PI,
-    actions: ["sittingIdle"],
+    actions: ["sittingIdle", "textingSeated"],
     isOccupied: false,
     reservedBy: null,
   },
 
   // ==========================================
-  // 4. ZONA PING-PONG & OCIO (PingPongArea)[cite: 24]
+  // 4. ZONA PING-PONG & OCIO (PingPongArea)
   // ==========================================
   "pingpong-player-north": {
     id: "pingpong-player-north",
     zone: "ping-pong",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: 7.5, y: -0.34, z: -6.2 },
-    rotY: 0, // Mira al Sur hacia la mesa
+    pos: { x: 7.5, y: -0.34, z: -6.32 },
+    rotY: 0,
     actions: ["playPingPong", "standingIdle"],
     isOccupied: false,
     reservedBy: null,
@@ -332,8 +332,8 @@ export const CHECKPOINTS = {
     id: "pingpong-player-south",
     zone: "ping-pong",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: 7.5, y: -0.34, z: -2.8 },
-    rotY: Math.PI, // Mira al Norte hacia la mesa
+    pos: { x: 7.5, y: -0.34, z: -2.68 },
+    rotY: Math.PI,
     actions: ["playPingPong", "standingIdle"],
     isOccupied: false,
     reservedBy: null,
@@ -342,8 +342,8 @@ export const CHECKPOINTS = {
     id: "arcade-machine",
     zone: "ping-pong",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: 6.2, y: -0.34, z: -0.85 },
-    rotY: Math.PI, // Mira hacia la pared sur donde está la recreativa
+    pos: { x: 6.2, y: -0.34, z: -0.86 },
+    rotY: 0, // Panel de joystick/botones en z = -0.58
     actions: ["playArcade", "standingIdle"],
     isOccupied: false,
     reservedBy: null,
@@ -352,8 +352,8 @@ export const CHECKPOINTS = {
     id: "vending-snacks",
     zone: "ping-pong",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: 9.2, y: -0.34, z: -0.85 },
-    rotY: Math.PI,
+    pos: { x: 8.86, y: -0.34, z: -0.95 },
+    rotY: 0, // Alineado con la botonera lateral izquierda de la máquina (x = 8.80, z = -0.59)
     actions: ["buyVending", "standingIdle"],
     isOccupied: false,
     reservedBy: null,
@@ -362,8 +362,8 @@ export const CHECKPOINTS = {
     id: "vending-drinks",
     zone: "ping-pong",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: 10.45, y: -0.34, z: -0.85 },
-    rotY: Math.PI,
+    pos: { x: 10.11, y: -0.34, z: -0.95 },
+    rotY: 0, // Alineado con la botonera lateral izquierda de la máquina (x = 10.05, z = -0.59)
     actions: ["buyVending", "standingIdle"],
     isOccupied: false,
     reservedBy: null,
@@ -372,19 +372,29 @@ export const CHECKPOINTS = {
     id: "pingpong-whiteboard",
     zone: "ping-pong",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: 4.85, y: -0.34, z: -4.5 },
-    rotY: -Math.PI / 2, // Mira a la mampara acristalada
+    pos: { x: 4.88, y: -0.34, z: -4.5 },
+    rotY: -Math.PI / 2,
     actions: ["viewTournament", "standingIdle"],
     isOccupied: false,
     reservedBy: null,
   },
+  "pingpong-trophy-case": {
+    id: "pingpong-trophy-case",
+    zone: "ping-pong",
+    type: CHECKPOINT_TYPES.ACTION_STATION,
+    pos: { x: 6.2, y: -0.34, z: -7.52 },
+    rotY: Math.PI,
+    actions: ["inspectTrophies", "standingIdle"],
+    isOccupied: false,
+    reservedBy: null,
+  },
 
-  // Asientos de Espectador Ping-Pong[cite: 24]
+  // Asientos de Espectador Ping-Pong
   "pingpong-bench": {
     id: "pingpong-bench",
     zone: "ping-pong",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 8.1, y: -0.12, z: -8.0 },
+    pos: { x: 8.1, y: -0.04, z: -8.14 },
     rotY: 0,
     actions: ["sittingIdle"],
     isOccupied: false,
@@ -394,7 +404,7 @@ export const CHECKPOINTS = {
     id: "pingpong-spectator-sofa",
     zone: "ping-pong",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: 10.95, y: 0.035, z: -4.5 },
+    pos: { x: 11.26, y: -0.16, z: -4.5 },
     rotY: -Math.PI / 2,
     actions: ["sittingIdle"],
     isOccupied: false,
@@ -402,25 +412,34 @@ export const CHECKPOINTS = {
   },
 
   // ==========================================
-  // 5. SALA DE REUNIONES (MeetingRoom)[cite: 23]
+  // 5. SALA DE REUNIONES (MeetingRoom)
   // ==========================================
-  // Puesto de presentación frente a pantalla / pizarra[cite: 23]
   "meeting-presenter": {
     id: "meeting-presenter",
     zone: "meeting-room",
     type: CHECKPOINT_TYPES.ACTION_STATION,
     pos: { x: 0.0, y: -0.34, z: -7.8 },
-    rotY: 0, // Mirando a la mesa y a los participantes
+    rotY: 0,
     actions: ["presenting", "standingIdle"],
     isOccupied: false,
     reservedBy: null,
   },
-  // Sillas de conferencia[cite: 23]
+  "meeting-whiteboard-spot": {
+    id: "meeting-whiteboard-spot",
+    zone: "meeting-room",
+    type: CHECKPOINT_TYPES.ACTION_STATION,
+    pos: { x: 1.85, y: -0.34, z: -8.35 },
+    rotY: Math.PI,
+    actions: ["writeWhiteboard", "standingIdle"],
+    isOccupied: false,
+    reservedBy: null,
+  },
+  // Sillas de conferencia (asiento real a y = 0.374m -> pos.y = -0.04)
   "meeting-chair-n1": {
     id: "meeting-chair-n1",
     zone: "meeting-room",
     type: CHECKPOINT_TYPES.MEETING_SEAT,
-    pos: { x: -1.35, y: 0.035, z: -6.95 },
+    pos: { x: -1.35, y: -0.04, z: -6.92 },
     rotY: 0,
     actions: ["sittingIdle", "listening"],
     isOccupied: false,
@@ -430,7 +449,7 @@ export const CHECKPOINTS = {
     id: "meeting-chair-n2",
     zone: "meeting-room",
     type: CHECKPOINT_TYPES.MEETING_SEAT,
-    pos: { x: 0.0, y: 0.035, z: -6.95 },
+    pos: { x: 0.0, y: -0.04, z: -6.92 },
     rotY: 0,
     actions: ["sittingIdle", "listening"],
     isOccupied: false,
@@ -440,7 +459,7 @@ export const CHECKPOINTS = {
     id: "meeting-chair-n3",
     zone: "meeting-room",
     type: CHECKPOINT_TYPES.MEETING_SEAT,
-    pos: { x: 1.35, y: 0.035, z: -6.95 },
+    pos: { x: 1.35, y: -0.04, z: -6.92 },
     rotY: 0,
     actions: ["sittingIdle", "listening"],
     isOccupied: false,
@@ -450,7 +469,7 @@ export const CHECKPOINTS = {
     id: "meeting-chair-s1",
     zone: "meeting-room",
     type: CHECKPOINT_TYPES.MEETING_SEAT,
-    pos: { x: -1.35, y: 0.035, z: -5.05 },
+    pos: { x: -1.35, y: -0.04, z: -5.08 },
     rotY: Math.PI,
     actions: ["sittingIdle", "listening"],
     isOccupied: false,
@@ -460,7 +479,7 @@ export const CHECKPOINTS = {
     id: "meeting-chair-s2",
     zone: "meeting-room",
     type: CHECKPOINT_TYPES.MEETING_SEAT,
-    pos: { x: 0.0, y: 0.035, z: -5.05 },
+    pos: { x: 0.0, y: -0.04, z: -5.08 },
     rotY: Math.PI,
     actions: ["sittingIdle", "listening"],
     isOccupied: false,
@@ -470,7 +489,7 @@ export const CHECKPOINTS = {
     id: "meeting-chair-s3",
     zone: "meeting-room",
     type: CHECKPOINT_TYPES.MEETING_SEAT,
-    pos: { x: 1.35, y: 0.035, z: -5.05 },
+    pos: { x: 1.35, y: -0.04, z: -5.08 },
     rotY: Math.PI,
     actions: ["sittingIdle", "listening"],
     isOccupied: false,
@@ -478,13 +497,13 @@ export const CHECKPOINTS = {
   },
 
   // ==========================================
-  // 6. OFICINA DE SUPERVISOR (SupervisorOffice)[cite: 25]
+  // 6. OFICINA DE SUPERVISOR (SupervisorOffice)
   // ==========================================
   "supervisor-desk": {
     id: "supervisor-desk",
     zone: "supervisor",
     type: CHECKPOINT_TYPES.WORKSTATION,
-    pos: { x: -8.4, y: 0.035, z: -6.5 },
+    pos: { x: -8.4, y: -0.02, z: -6.06 }, // Silla en z = -6.08, teclado ejecutivo en z = -5.58
     rotY: 0,
     actions: ["typing", "sittingIdle"],
     isOccupied: false,
@@ -494,7 +513,7 @@ export const CHECKPOINTS = {
     id: "supervisor-guest-l",
     zone: "supervisor",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: -9.1, y: 0.035, z: -4.6 },
+    pos: { x: -9.1, y: -0.05, z: -4.6 },
     rotY: Math.PI - 0.18,
     actions: ["sittingIdle"],
     isOccupied: false,
@@ -504,7 +523,7 @@ export const CHECKPOINTS = {
     id: "supervisor-guest-r",
     zone: "supervisor",
     type: CHECKPOINT_TYPES.WAITING_SEAT,
-    pos: { x: -7.7, y: 0.035, z: -4.6 },
+    pos: { x: -7.7, y: -0.05, z: -4.6 },
     rotY: Math.PI + 0.18,
     actions: ["sittingIdle"],
     isOccupied: false,
@@ -528,7 +547,7 @@ export const CHECKPOINTS = {
     id: "review-frontend",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: -7.25, y: -0.34, z: 3.62 },
+    pos: { x: -7.25, y: -0.34, z: 3.66 },
     rotY: Math.atan2(0.55, 1.38),
     actions: ["deskReview", "talking"],
     isOccupied: false,
@@ -538,7 +557,7 @@ export const CHECKPOINTS = {
     id: "review-qa",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: -4.75, y: -0.34, z: 3.62 },
+    pos: { x: -4.75, y: -0.34, z: 3.66 },
     rotY: Math.atan2(-0.55, 1.38),
     actions: ["deskReview", "talking"],
     isOccupied: false,
@@ -548,7 +567,7 @@ export const CHECKPOINTS = {
     id: "review-systems",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: -7.25, y: -0.34, z: 6.78 },
+    pos: { x: -7.25, y: -0.34, z: 6.74 },
     rotY: Math.atan2(0.55, -1.38),
     actions: ["deskReview", "talking"],
     isOccupied: false,
@@ -558,7 +577,7 @@ export const CHECKPOINTS = {
     id: "review-backend",
     zone: "dev-area",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: -4.75, y: -0.34, z: 6.78 },
+    pos: { x: -4.75, y: -0.34, z: 6.74 },
     rotY: Math.atan2(-0.55, -1.38),
     actions: ["deskReview", "talking"],
     isOccupied: false,
@@ -568,8 +587,8 @@ export const CHECKPOINTS = {
     id: "review-architect",
     zone: "supervisor",
     type: CHECKPOINT_TYPES.ACTION_STATION,
-    pos: { x: -7.55, y: -0.34, z: -6.35 },
-    rotY: Math.atan2(-0.85, 1.09),
+    pos: { x: -7.55, y: -0.34, z: -6.02 },
+    rotY: Math.atan2(-0.85, 0.96),
     actions: ["deskReview", "talking"],
     isOccupied: false,
     reservedBy: null,

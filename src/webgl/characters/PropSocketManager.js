@@ -183,6 +183,152 @@ export class PropSocketManager {
       return group;
     }
 
+    if (type === "openNotebook") {
+      const coverMat = new THREE.MeshStandardMaterial({
+        color: "#1E293B",
+        roughness: 0.65,
+        metalness: 0.1,
+      });
+      const pageMat = new THREE.MeshStandardMaterial({
+        color: "#FAF8F5",
+        roughness: 0.85,
+      });
+      const inkMat = new THREE.MeshStandardMaterial({
+        color: "#6366F1",
+        roughness: 0.6,
+      });
+      const ribbonMat = new THREE.MeshStandardMaterial({
+        color: "#E11D48",
+        roughness: 0.5,
+      });
+
+      // Tapas abiertas en ligero ángulo ergonómico
+      const leftCover = new THREE.Mesh(
+        new THREE.BoxGeometry(0.115, 0.175, 0.006),
+        coverMat,
+      );
+      leftCover.position.set(-0.056, 0, 0);
+      leftCover.rotation.y = 0.14;
+      leftCover.castShadow = true;
+
+      const rightCover = new THREE.Mesh(
+        new THREE.BoxGeometry(0.115, 0.175, 0.006),
+        coverMat,
+      );
+      rightCover.position.set(0.056, 0, 0);
+      rightCover.rotation.y = -0.14;
+      rightCover.castShadow = true;
+
+      const leftPage = new THREE.Mesh(
+        new THREE.BoxGeometry(0.106, 0.165, 0.005),
+        pageMat,
+      );
+      leftPage.position.set(-0.053, 0, 0.004);
+      leftPage.rotation.y = 0.14;
+
+      const rightPage = new THREE.Mesh(
+        new THREE.BoxGeometry(0.106, 0.165, 0.005),
+        pageMat,
+      );
+      rightPage.position.set(0.053, 0, 0.004);
+      rightPage.rotation.y = -0.14;
+
+      // Líneas de notas simuladas sobre las páginas
+      for (let i = 0; i < 4; i++) {
+        const line = new THREE.Mesh(
+          new THREE.BoxGeometry(0.075, 0.004, 0.002),
+          inkMat,
+        );
+        line.position.set(0.052, 0.045 - i * 0.024, 0.007);
+        line.rotation.y = -0.14;
+        group.add(line);
+      }
+
+      const ribbon = new THREE.Mesh(
+        new THREE.BoxGeometry(0.008, 0.19, 0.003),
+        ribbonMat,
+      );
+      ribbon.position.set(0, -0.01, 0.005);
+
+      group.add(leftCover, rightCover, leftPage, rightPage, ribbon);
+      return group;
+    }
+
+    if (type === "officePen") {
+      const barrel = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.005, 0.005, 0.13, 10),
+        new THREE.MeshStandardMaterial({
+          color: "#1E1B4B",
+          roughness: 0.28,
+          metalness: 0.65,
+        }),
+      );
+      barrel.position.y = 0.045;
+      barrel.castShadow = true;
+
+      const grip = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.0054, 0.0052, 0.032, 10),
+        new THREE.MeshStandardMaterial({
+          color: "#334155",
+          roughness: 0.65,
+        }),
+      );
+      grip.position.y = 0.088;
+
+      const tipCone = new THREE.Mesh(
+        new THREE.ConeGeometry(0.005, 0.018, 10),
+        new THREE.MeshStandardMaterial({
+          color: "#E2E8F0",
+          metalness: 0.9,
+          roughness: 0.2,
+        }),
+      );
+      tipCone.position.y = 0.118;
+
+      const clip = new THREE.Mesh(
+        new THREE.BoxGeometry(0.0025, 0.036, 0.004),
+        new THREE.MeshStandardMaterial({
+          color: "#F8FAFC",
+          metalness: 0.9,
+          roughness: 0.2,
+        }),
+      );
+      clip.position.set(0, 0.002, 0.006);
+
+      group.add(barrel, grip, tipCone, clip);
+      return group;
+    }
+
+    if (type === "whiteboardMarker") {
+      const barrel = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.009, 0.009, 0.12, 12),
+        new THREE.MeshStandardMaterial({ color: "#F8FAFC", roughness: 0.35 }),
+      );
+      barrel.position.y = 0.04;
+      barrel.castShadow = true;
+
+      const capEnd = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.0095, 0.0095, 0.026, 12),
+        new THREE.MeshStandardMaterial({ color: "#4F46E5", roughness: 0.32 }),
+      );
+      capEnd.position.y = -0.022;
+
+      const cone = new THREE.Mesh(
+        new THREE.ConeGeometry(0.0085, 0.02, 12),
+        new THREE.MeshStandardMaterial({ color: "#1E293B", roughness: 0.4 }),
+      );
+      cone.position.y = 0.11;
+
+      const nib = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.0025, 0.003, 0.012, 8),
+        new THREE.MeshStandardMaterial({ color: "#312E81", roughness: 0.5 }),
+      );
+      nib.position.y = 0.122;
+
+      group.add(barrel, capEnd, cone, nib);
+      return group;
+    }
+
     // Fallback taza simple
     const mug = new THREE.Mesh(
       new THREE.CylinderGeometry(0.034, 0.03, 0.08, 16),
@@ -193,16 +339,59 @@ export class PropSocketManager {
     return group;
   }
 
-  attach(propKey) {
-    if (this.activePropKey === propKey) return;
-    this.detachAll();
-    if (!propKey) return;
-
+  _mountPropOnHand(propKey, handOverride = null) {
+    if (!propKey) return false;
     const node = this.props.get(propKey);
-    if (node) {
-      node.visible = true;
+    const def = PROP_DEFS[propKey];
+    if (!node || !def) return false;
+
+    const targetHand = handOverride || def.hand || "right";
+    const targetSocket = this.sockets[targetHand];
+    if (targetSocket && node.parent !== targetSocket) {
+      targetSocket.add(node);
+    }
+
+    if (targetHand === "left" && def.leftOffset) {
+      node.position.set(...def.leftOffset);
+    } else if (def.offset) {
+      node.position.set(...def.offset);
+    }
+
+    if (targetHand === "left" && def.leftRotation) {
+      node.rotation.set(...def.leftRotation);
+    } else if (def.rotation) {
+      node.rotation.set(...def.rotation);
+    }
+
+    node.visible = true;
+    return true;
+  }
+
+  attach(propKey, { secondaryPropKey = null, handOverride = null } = {}) {
+    const signature = `${propKey || ""}:${handOverride || ""}+${secondaryPropKey || ""}`;
+    if (this._activeSignature === signature) return;
+    this.detachAll();
+    if (!propKey && !secondaryPropKey) return;
+
+    if (propKey && this._mountPropOnHand(propKey, handOverride)) {
       this.activePropKey = propKey;
     }
+
+    if (secondaryPropKey && secondaryPropKey !== propKey) {
+      const primaryDef = PROP_DEFS[propKey];
+      const primaryHand = handOverride || primaryDef?.hand || "right";
+      const secDef = PROP_DEFS[secondaryPropKey];
+      const secHand =
+        secDef?.hand && secDef.hand !== primaryHand
+          ? secDef.hand
+          : primaryHand === "right"
+            ? "left"
+            : "right";
+      this._mountPropOnHand(secondaryPropKey, secHand);
+      this.secondaryPropKey = secondaryPropKey;
+    }
+
+    this._activeSignature = signature;
   }
 
   detachAll() {
@@ -210,15 +399,35 @@ export class PropSocketManager {
       node.visible = false;
     }
     this.activePropKey = null;
+    this.secondaryPropKey = null;
+    this._activeSignature = null;
   }
 
   getActivePropLabel() {
     if (!this.activePropKey) return "Ninguno";
-    return PROP_DEFS[this.activePropKey]?.label || this.activePropKey;
+    const primaryLabel =
+      PROP_DEFS[this.activePropKey]?.label || this.activePropKey;
+    if (this.secondaryPropKey && PROP_DEFS[this.secondaryPropKey]) {
+      return `${primaryLabel} + ${PROP_DEFS[this.secondaryPropKey].label}`;
+    }
+    return primaryLabel;
   }
 
   dispose() {
     this.detachAll();
+    for (const node of this.props.values()) {
+      node.traverse((child) => {
+        if (child.isMesh) {
+          child.geometry?.dispose?.();
+          if (Array.isArray(child.material)) {
+            child.material.forEach((m) => m?.dispose?.());
+          } else {
+            child.material?.dispose?.();
+          }
+        }
+      });
+      if (node.parent) node.parent.remove(node);
+    }
     this.props.clear();
   }
 }

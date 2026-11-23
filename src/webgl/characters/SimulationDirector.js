@@ -8,16 +8,19 @@ const SOLO_DESTINATIONS = [
   { checkpointId: "kitchen-drip-coffee", action: "makeCoffee" },
   { checkpointId: "kitchen-water-cooler", action: "drinkWater" },
   { checkpointId: "kitchen-fridge", action: "openFridge" },
+  { checkpointId: "kitchen-sink", action: "washHands" },
   { checkpointId: "barstool-1", action: "drinkCoffee" },
   { checkpointId: "barstool-2", action: "drinkCoffee" },
   { checkpointId: "lounge-sofa-s1", action: "watchTV" },
-  { checkpointId: "lounge-sofa-s2", action: "texting" },
+  { checkpointId: "lounge-sofa-s2", action: "textingSeated" },
   { checkpointId: "lounge-armchair-ne", action: "sittingTalking" },
-  { checkpointId: "lounge-puff-orange", action: "texting" },
+  { checkpointId: "lounge-puff-orange", action: "textingSeated" },
   { checkpointId: "arcade-machine", action: "playArcade" },
   { checkpointId: "vending-snacks", action: "buyVending" },
   { checkpointId: "vending-drinks", action: "buyVending" },
   { checkpointId: "pingpong-whiteboard", action: "viewTournament" },
+  { checkpointId: "pingpong-trophy-case", action: "inspectTrophies" },
+  { checkpointId: "meeting-whiteboard-spot", action: "writeWhiteboard" },
   { checkpointId: "supervisor-bookcase", action: "browseBooks" },
 ];
 
@@ -25,8 +28,8 @@ const PAIR_CHAT_VENUES = [
   {
     venue: "coffee",
     spots: [
-      { checkpointId: "kitchen-espresso", action: "pairChat", rotY: -0.35 },
-      { checkpointId: "kitchen-drip-coffee", action: "pairChat", rotY: -Math.PI + 0.35 },
+      { checkpointId: "kitchen-espresso", action: "pairChat", rotY: Math.PI - 0.35 },
+      { checkpointId: "kitchen-drip-coffee", action: "pairChat", rotY: 0.35 },
     ],
   },
   {
@@ -80,11 +83,18 @@ const SAMPLE_TASKS = [
 export class SimulationDirector {
   constructor(
     characterManager,
-    { onDirectorChange = null, monitorSystem = null } = {},
+    {
+      onDirectorChange = null,
+      monitorSystem = null,
+      pingPongArea = null,
+      coffeeArea = null,
+    } = {},
   ) {
     this.characterManager = characterManager;
     this.onDirectorChange = onDirectorChange;
     this.monitorSystem = monitorSystem;
+    this.pingPongArea = pingPongArea;
+    this.coffeeArea = coffeeArea;
 
     this.paused = false;
     this.speedMultiplier = 1; // 1 | 1.5 | 2
@@ -251,6 +261,18 @@ export class SimulationDirector {
       if (a1 && a2) {
         a1.lookAtWorldPosition(a2.model.position);
         a2.lookAtWorldPosition(a1.model.position);
+        a1.setGazeWorldTarget(a2.model.position);
+        a2.setGazeWorldTarget(a1.model.position);
+      }
+      return;
+    }
+
+    if (barrier.kind === "ping_pong" && list.length === 2) {
+      const a1 = this.characterManager.getAgent(list[0].agentId);
+      const a2 = this.characterManager.getAgent(list[1].agentId);
+      if (a1 && a2) {
+        a1.lookAtWorldPosition(a2.model.position);
+        a2.lookAtWorldPosition(a1.model.position);
       }
       return;
     }
@@ -262,6 +284,9 @@ export class SimulationDirector {
       const revAgent = this.characterManager.getAgent(revP.agentId);
       if (hostAgent && revAgent) {
         revAgent.lookAtWorldPosition(hostAgent.model.position);
+        revAgent.setGazeWorldTarget(hostAgent.model.position);
+        // El anfitrión sentado gira la cabeza hacia su compañero sin levantarse de la silla
+        hostAgent.setGazeWorldTarget(revAgent.model.position);
       }
       return;
     }
@@ -276,6 +301,11 @@ export class SimulationDirector {
           : null;
         if (listenerAgent) {
           hostAgent.lookAtWorldPosition(listenerAgent.model.position);
+        }
+        for (const p of list) {
+          if (p.agentId === hostP.agentId) continue;
+          const listener = this.characterManager.getAgent(p.agentId);
+          listener?.setGazeWorldTarget(hostAgent.model.position);
         }
       }
     }
@@ -300,8 +330,23 @@ export class SimulationDirector {
         return;
       }
 
+      if (barrier.kind === "ping_pong") {
+        // Ambos jugadores mantienen rally activo sincronizado con la pelota 3D
+        if (agent.currentActionKey !== "playPingPong") {
+          agent.applyActionProfile("playPingPong", {
+            customLabel: `Ping-Pong · ${p.partnerName || "Partido"}`,
+          });
+        }
+        return;
+      }
+
       if (barrier.kind === "desk_review") {
+        const otherP = list.find((o) => o.agentId !== p.agentId);
+        const otherAgent = otherP
+          ? this.characterManager.getAgent(otherP.agentId)
+          : null;
         if (p.role === "host") {
+          agent.setGazeWorldTarget(isSpeaker ? otherAgent?.model?.position || null : null);
           agent.applyActionProfile(isSpeaker ? "sittingTalking" : "sittingIdle", {
             customLabel: `Revisando · ${p.partnerName || barrier.topic}`,
           });
@@ -320,7 +365,11 @@ export class SimulationDirector {
             customLabel: barrier.topic,
           });
         } else {
-          const action = isSpeaker ? "listening" : "sittingIdle";
+          const action = isSpeaker
+            ? "listening"
+            : idx % 2 === 0
+              ? "takeNotes"
+              : "sittingIdle";
           agent.applyActionProfile(action, {
             customLabel: barrier.topic,
           });
@@ -462,6 +511,8 @@ export class SimulationDirector {
                 : safeTopic,
             presenterName: hostAgent?.config.name || "Tech Lead",
           });
+        } else if (barrier.kind === "ping_pong") {
+          this.pingPongArea?.setRallyActive(true);
         } else if (barrier.kind === "desk_review") {
           const list = Array.from(barrier.participants.values());
           const hostP = list.find((p) => p.role === "host") || list[0];
@@ -488,10 +539,37 @@ export class SimulationDirector {
         if (barrier.kind === "delegation" || barrier.kind === "team_meeting") {
           this.monitorSystem?.setMeetingState({ active: false });
         }
+        let pingPongWinnerId = null;
+        if (barrier.kind === "ping_pong") {
+          this.pingPongArea?.setRallyActive(false);
+          const winnerPick =
+            dispatchedList[Math.floor(Math.random() * dispatchedList.length)];
+          if (winnerPick && !winnerPick.hasLiveWork) {
+            const winAgent = this.characterManager.getAgent(winnerPick.agentId);
+            if (winAgent) {
+              pingPongWinnerId = winnerPick.agentId;
+              winAgent.setContextualBubble("¡Buen punto!", {
+                color: "#34D399",
+                durationMs: 2200,
+              });
+              winAgent.applyActionProfile("cheerMatch");
+              winAgent.scheduleTimer(() => {
+                if (
+                  winAgent.currentActionKey === "cheerMatch" &&
+                  !this.isAgentLiveBusy(winAgent.config.id) &&
+                  !this.visualQueue.hasActiveBarrier(winAgent.config.id)
+                ) {
+                  winAgent.returnHome();
+                }
+              }, 1600);
+            }
+          }
+        }
 
         for (const { agentId, participant, hasLiveWork, step } of dispatchedList) {
           const agent = this.characterManager.getAgent(agentId);
           if (!agent) continue;
+          if (agentId === pingPongWinnerId && !hasLiveWork) continue;
 
           const returnSpeed = barrier.kind === "delegation" ? 1.85 : null;
 
@@ -560,6 +638,9 @@ export class SimulationDirector {
         }
         if (barrier.kind === "delegation" || barrier.kind === "team_meeting") {
           this.monitorSystem?.setMeetingState({ active: false });
+        }
+        if (barrier.kind === "ping_pong") {
+          this.pingPongArea?.setRallyActive(false);
         }
 
         for (const agentId of barrier.participants.keys()) {
@@ -929,7 +1010,7 @@ export class SimulationDirector {
       if (
         agent.taskAccentColor === "#E11D48" ||
         /esperando|fallo|permiso/i.test(String(agent.currentActionLabel || "")) ||
-        agent.pendingLiveTask
+        agent.pendingLiveArrival
       ) {
         agent.applyTaskFeedback({
           status: "passed",
@@ -984,9 +1065,12 @@ export class SimulationDirector {
         this.monitorSystem?.setAgentLiveActivity(payload.agentId, payload);
         if (payload.status === "error") {
           const agent = this.characterManager.getAgent(payload.agentId);
-          if (agent && typeof agent.showContextBubble === "function") {
+          if (agent && typeof agent.setContextualBubble === "function") {
             const label = payload.label || "Error en comando";
-            agent.showContextBubble(`${label} falló`, 4200);
+            agent.setContextualBubble(`${label} falló`, {
+              color: "#FB7185",
+              durationMs: 4200,
+            });
           }
         }
       }),
@@ -1146,7 +1230,7 @@ export class SimulationDirector {
       timer.waitCooldown = 12 + Math.random() * 5;
     }
 
-    if (!String(checkpointId).startsWith("meeting-")) {
+    if (!String(checkpointId).startsWith("meeting-") && !this.visualQueue.meeting) {
       this.monitorSystem?.setMeetingState({ active: false });
     }
     return agent.requestAction(checkpointId, { overrideAction, onSeated });
@@ -1189,16 +1273,51 @@ export class SimulationDirector {
     const southFree = checkpointManager.isAvailable("pingpong-player-south");
     if (!northFree || !southFree) return false;
 
-    this.sendAgentTo(
-      candidates[0].config.id,
-      "pingpong-player-north",
-      "playPingPong",
+    const pNorth = candidates[0];
+    const pSouth = candidates[1];
+    const nFirst = pNorth.config.name.split(" ")[0];
+    const sFirst = pSouth.config.name.split(" ")[0];
+
+    const res = this.visualQueue.startBarrier(
+      {
+        id: "ping_pong_match",
+        kind: "ping_pong",
+        topic: `Ping-Pong · ${nFirst} vs ${sFirst}`,
+        hostAgentId: pNorth.config.id,
+        allowPreempt: false,
+        engagedDurationMs: 13500,
+        participants: [
+          {
+            agentId: pNorth.config.id,
+            role: "host",
+            checkpointId: "pingpong-player-north",
+            actionKey: "playPingPong",
+            waitingActionKey: "standingIdle",
+            socialMode: "PAIR_CHAT",
+            partnerName: sFirst,
+            overrideRotY: 0,
+            seatedRequired: false,
+          },
+          {
+            agentId: pSouth.config.id,
+            role: "participant",
+            checkpointId: "pingpong-player-south",
+            actionKey: "playPingPong",
+            waitingActionKey: "standingIdle",
+            socialMode: "PAIR_CHAT",
+            partnerName: nFirst,
+            overrideRotY: Math.PI,
+            seatedRequired: false,
+          },
+        ],
+      },
+      this.queueHandlers,
     );
-    this.sendAgentTo(
-      candidates[1].config.id,
-      "pingpong-player-south",
-      "playPingPong",
-    );
+    if (!res) return false;
+
+    for (const p of res.barrier.participants.values()) {
+      this._sendBarrierParticipantToCheckpoint(res.barrier, p);
+    }
     return true;
   }
 
@@ -1496,6 +1615,7 @@ export class SimulationDirector {
   returnAllHome() {
     this.visualQueue.reset();
     this.activeDelegation = null;
+    this.pingPongArea?.setRallyActive(false);
     this.monitorSystem?.setMeetingState({ active: false });
     for (const agent of this.characterManager.characters) {
       const timer = this.agentTimers.get(agent.config.id);
@@ -1556,12 +1676,29 @@ export class SimulationDirector {
 
           if (this.isOpenCodeConnected) {
             // MODO LIVE REAL: nunca emitir tareas simuladas ni code reviews falsos.
-            // Los agentes libres descansan de forma natural en la oficina o permanecen disponibles.
+            // Los agentes libres hacen micro-pausas orgánicas o descansan por la oficina.
             const roll = Math.random();
-            if (roll < 0.54) {
+            if (roll < 0.42) {
               timer.workCooldown = 18 + Math.random() * 14;
+            } else if (roll < 0.56 && this._isAgentPhysicallyAtDesk(agent)) {
+              const microAction = Math.random() < 0.52 ? "stretchBreak" : "coffeeSipDesk";
+              agent.applyActionProfile(microAction);
+              agent.scheduleTimer(() => {
+                if (
+                  agent.currentActionKey === microAction &&
+                  this._isAgentPhysicallyAtDesk(agent) &&
+                  !this.isAgentLiveBusy(agentId)
+                ) {
+                  agent.applyActionProfile("typing", {
+                    customLabel: "Disponible",
+                  });
+                }
+              }, 5200);
+              timer.workCooldown = 16 + Math.random() * 10;
             } else if (roll < 0.68 && this.triggerPairChat(agentId)) {
               timer.workCooldown = 22 + Math.random() * 12;
+            } else if (roll < 0.74 && this.triggerPingPongMatch()) {
+              timer.workCooldown = 24 + Math.random() * 12;
             } else {
               const availablePool = SOLO_DESTINATIONS.filter((d) =>
                 checkpointManager.isAvailable(d.checkpointId),
@@ -1577,7 +1714,7 @@ export class SimulationDirector {
 
           // MODO DEMO OFFLINE: exhibición autónoma completa
           const roll = Math.random();
-          if (roll < 0.22) {
+          if (roll < 0.2) {
             const isSuccess = Math.random() < 0.65;
             const sample =
               SAMPLE_TASKS[Math.floor(Math.random() * SAMPLE_TASKS.length)];
@@ -1592,10 +1729,24 @@ export class SimulationDirector {
               "mock-director",
             );
             timer.workCooldown = 11 + Math.random() * 7;
-          } else if (roll < 0.4 && this.triggerPairChat(agentId)) {
+          } else if (roll < 0.3 && this._isAgentPhysicallyAtDesk(agent)) {
+            const microAction = Math.random() < 0.5 ? "stretchBreak" : "coffeeSipDesk";
+            agent.applyActionProfile(microAction);
+            agent.scheduleTimer(() => {
+              if (
+                agent.currentActionKey === microAction &&
+                this._isAgentPhysicallyAtDesk(agent)
+              ) {
+                agent.applyActionProfile("typing");
+              }
+            }, 5200);
+            timer.workCooldown = 12 + Math.random() * 8;
+          } else if (roll < 0.44 && this.triggerPairChat(agentId)) {
             timer.workCooldown = 14 + Math.random() * 8;
           } else if (roll < 0.54 && this.triggerDeskReview(agentId)) {
             timer.workCooldown = 15 + Math.random() * 8;
+          } else if (roll < 0.62 && this.triggerPingPongMatch()) {
+            timer.workCooldown = 18 + Math.random() * 8;
           } else {
             const availablePool = SOLO_DESTINATIONS.filter((d) =>
               checkpointManager.isAvailable(d.checkpointId),
@@ -1627,6 +1778,9 @@ export class SimulationDirector {
       }
     }
 
+    // Sincronizar props ambientales reactivos (pelota ping-pong, arcade, vapor de cafeteras)
+    this._syncInteractiveEnvironmentProps();
+
     if (this.isOpenCodeConnected) {
       this._liveTvSyncAccum += delta;
       if (this._liveTvSyncAccum >= 1.25) {
@@ -1634,6 +1788,50 @@ export class SimulationDirector {
         this._pushLiveTeamSnapshotToTV();
       }
     }
+  }
+
+  _syncInteractiveEnvironmentProps() {
+    let espressoActive = false;
+    let dripActive = false;
+    let sinkActive = false;
+    let arcadeActive = false;
+    const rallyState = this.pingPongArea?.getRallyState?.() || null;
+
+    for (const agent of this.characterManager.characters) {
+      const cpId = agent.currentCheckpointId;
+      const interacting = agent.state === "INTERACTING" && !agent.isTransitioningSeat;
+
+      if (interacting && cpId === "kitchen-espresso") espressoActive = true;
+      if (interacting && cpId === "kitchen-drip-coffee") dripActive = true;
+      if (interacting && cpId === "kitchen-sink") sinkActive = true;
+      if (interacting && cpId === "arcade-machine" && agent.currentActionKey === "playArcade") {
+        arcadeActive = true;
+      }
+
+      if (
+        rallyState?.active &&
+        interacting &&
+        agent.currentActionKey === "playPingPong" &&
+        (cpId === "pingpong-player-north" || cpId === "pingpong-player-south")
+      ) {
+        const side = cpId === "pingpong-player-north" ? "north" : "south";
+        agent.animator.setPingPongRallyState({
+          active: true,
+          phase: rallyState.phase,
+          side,
+        });
+        agent.setGazeWorldTarget(rallyState.ballPos);
+      } else if (agent.animator.rallyActive) {
+        agent.animator.setPingPongRallyState({ active: false });
+      }
+    }
+
+    this.coffeeArea?.setBrewingState?.({
+      espresso: espressoActive,
+      drip: dripActive,
+      sink: sinkActive,
+    });
+    this.pingPongArea?.setArcadeActive?.(arcadeActive);
   }
 
   _pushLiveTeamSnapshotToTV() {
